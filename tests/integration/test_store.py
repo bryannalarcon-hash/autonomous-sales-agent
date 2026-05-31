@@ -12,6 +12,11 @@ from pathlib import Path
 
 import pytest
 
+# Skip collection entirely if the DB driver isn't installed — this is a DB-dependent module the
+# orchestrator runs with Postgres+pgvector up; without asyncpg there is nothing to test here, and
+# guarding at import keeps a DB-free unit run (pytest tests/unit) from failing collection.
+pytest.importorskip("asyncpg", reason="asyncpg not installed — DB-dependent integration test")
+
 from src.memory.schema import (
     BeliefSnapshot,
     Episode,
