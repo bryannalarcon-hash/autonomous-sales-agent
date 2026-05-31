@@ -1,0 +1,34 @@
+{
+  "_meta": {
+    "title": "Programs",
+    "kb_version": "kb_v0",
+    "note": "Illustrative, domain-plausible DEMO data for a tutoring service (Nerdy / Varsity Tutors style). NOT real-world-true. Groundedness = consistency to this KB."
+  },
+  "sections": [
+    {
+      "id": "program_1to1_online",
+      "title": "1:1 online tutoring",
+      "text": "1:1 online tutoring pairs a student with a single vetted tutor for live, video-based sessions. Each session is one-on-one and personalized to the student's goals, pace, and current gaps. Tutors share an interactive whiteboard and screen, and every session is recorded so the student and parent can review it later. This is the core offering and the foundation of the ongoing membership."
+    },
+    {
+      "id": "program_small_group",
+      "title": "Small-group sessions",
+      "text": "Small-group sessions place 2 to 5 students of similar level with one tutor. They cost less per hour than 1:1 tutoring and add peer motivation and discussion, while still giving far more individual attention than a classroom. Small-group is a good fit for families who want a lower price point or for students who learn well alongside peers."
+    },
+    {
+      "id": "program_test_prep",
+      "title": "Test prep (SAT / ACT / AP)",
+      "text": "Test-prep programs target the SAT, ACT, and AP exams. They are structured around a diagnostic practice test, a study plan tied to the student's actual test date, official-style practice sections, and timing/strategy coaching. Test-prep packages are scoped to a target test date so the plan finishes before the exam."
+    },
+    {
+      "id": "program_subject_tutoring",
+      "title": "Subject tutoring (K-12 and college)",
+      "text": "Subject tutoring covers individual academic subjects for students from kindergarten through college, including math (elementary through calculus), the sciences, English and writing, foreign languages, and college-level coursework. Sessions can be ongoing weekly support or short-term help for a specific class, unit, or upcoming exam."
+    },
+    {
+      "id": "program_membership",
+      "title": "Ongoing membership",
+      "text": "The ongoing membership is the recommended way to use the service: a monthly subscription that bundles a set number of tutoring hours each month at a lower effective per-hour rate than paying session-by-session. Membership includes weekly progress tracking, the satisfaction guarantee with free tutor re-match, and the flexibility to use hours across 1:1, small-group, subject, or test-prep sessions. The membership is a recurring monthly commitment; value is framed per month, not per session."
+    }
+  ]
+}

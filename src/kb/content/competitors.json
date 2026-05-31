@@ -1,0 +1,24 @@
+{
+  "_meta": {
+    "title": "Competitor differentiators",
+    "kb_version": "kb_v0",
+    "note": "Illustrative, KB-grounded differentiators for competitive questions (plan AE7). The agent answers competitor questions using ONLY these points and invents no facts about competitors."
+  },
+  "sections": [
+    {
+      "id": "competitor_vs_marketplace",
+      "title": "Versus tutor marketplaces (e.g. Wyzant)",
+      "text": "Compared with open tutor marketplaces like Wyzant, where families browse and vet independent tutors themselves, this service does the matching for you: tutors are pre-vetted and the service pairs the student with a tutor based on subject, level, and learning style. It adds weekly progress tracking and a satisfaction guarantee with free re-match, so the family is not on their own to evaluate, manage, or replace a tutor. The differentiator is managed, vetted 1:1 matching plus progress tracking rather than a self-serve marketplace."
+    },
+    {
+      "id": "competitor_vs_content_libraries",
+      "title": "Versus content libraries (e.g. Khan Academy, Chegg)",
+      "text": "Compared with self-study content libraries like Khan Academy or Chegg, which offer videos, articles, and question banks the student works through alone, this service provides structured, live 1:1 instruction with a real tutor who adapts to the student in real time, holds them accountable, and personalizes the plan. Content libraries are a useful free or low-cost supplement, but they are passive and self-directed; the differentiator here is live human structure, accountability, and personalization on top of (not instead of) self-study."
+    },
+    {
+      "id": "competitor_vs_in_person_centers",
+      "title": "Versus in-person tutoring centers",
+      "text": "Compared with in-person tutoring centers, this service is online, so there is no commute and sessions fit around the family's schedule with more available time slots, including evenings and weekends. It is typically lower cost than a brick-and-mortar center because there is no facility overhead, and it gives access to a wider pool of specialized tutors than any single local center. The differentiators are flexibility, broader tutor selection, and cost versus a physical center."
+    }
+  ]
+}

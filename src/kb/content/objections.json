@@ -1,0 +1,74 @@
+{
+  "_meta": {
+    "title": "Objection rebuttals",
+    "kb_version": "kb_v0",
+    "note": "KB-grounded rebuttals for the FULL nine-objection tutoring taxonomy (plan R30). Each section carries an `objection` slug; all nine slugs are required to be present. Rebuttals are empathetic, low-pressure, and grounded in the programs/pricing/policies/competitor KB — they invent no facts not supported elsewhere in the KB."
+  },
+  "objection_taxonomy": [
+    "price",
+    "efficacy_doubt",
+    "diy_free",
+    "timing",
+    "decision_maker",
+    "scheduling",
+    "online_vs_in_person",
+    "student_resistance",
+    "trust_legitimacy"
+  ],
+  "sections": [
+    {
+      "id": "objection_price",
+      "objection": "price",
+      "title": "Price / affordability",
+      "text": "On price: the membership is a monthly commitment, so it helps to look at value per month rather than a lump sum. Bundled membership hours lower the effective per-hour rate below pay-as-you-go, and there are multiple tiers, so a family can start on a lighter tier and scale up only if they need more hours. Framed against the goal — a target grade or a test-date score lift — steady weekly support is an investment toward a concrete outcome, and the satisfaction guarantee plus the 14-day refund window remove the risk of paying for something that is not working."
+    },
+    {
+      "id": "objection_efficacy_doubt",
+      "objection": "efficacy_doubt",
+      "title": "Efficacy doubt (will it actually work?)",
+      "text": "On whether tutoring will actually help: tutors are vetted before they ever work with a student, the student is matched to a tutor by subject, level, and learning style, and progress is tracked weekly so improvement is visible rather than assumed. If a tutor is not the right fit, the free re-match guarantee means the family is never stuck — they get paired with a different tutor at no extra cost. The combination of a vetted, matched tutor plus weekly progress tracking plus a re-match guarantee is what makes the outcome dependable rather than a gamble."
+    },
+    {
+      "id": "objection_diy_free",
+      "objection": "diy_free",
+      "title": "DIY / free alternatives",
+      "text": "On using free resources instead: free content libraries like Khan Academy are genuinely useful, but they are passive and self-directed — the student has to find the right material, stay disciplined, and self-diagnose what they are getting wrong. Live 1:1 tutoring adds the three things free resources cannot: structure (a plan tied to the student's goal), accountability (a scheduled tutor expecting them each week), and personalization (a tutor adapting in real time to that student's gaps). Tutoring works well on top of free resources, not instead of them."
+    },
+    {
+      "id": "objection_timing",
+      "objection": "timing",
+      "title": "Timing (is now the right time?)",
+      "text": "On timing: the right time is usually tied to the deadline. If there is a test date — an SAT, ACT, or AP exam — a study plan needs enough weeks to finish before the exam, so starting earlier means a calmer, more effective plan rather than a last-minute cram; a typical test-prep package runs 8 to 12 weeks. For ongoing subjects, addressing a gap before it compounds into the next unit is easier than catching up later. There is no long-term contract and the membership can be paused over a break, so starting now does not lock the family into a commitment they cannot adjust."
+    },
+    {
+      "id": "objection_decision_maker",
+      "objection": "decision_maker",
+      "title": "Decision-maker (need to check with someone)",
+      "text": "On needing to check with a partner or the other parent: that makes complete sense — this is a family decision. The most useful next step is to gather the specifics they will want to see — which subject, the goal, the tier and monthly cost, and the schedule — so the conversation at home is easy. A no-pressure consultation or a low-commitment trial session can be booked first so the decision-maker has something concrete to react to, and because there is no long-term contract and a 14-day refund window, the family can start and still step back if the other decision-maker is not on board."
+    },
+    {
+      "id": "objection_scheduling",
+      "objection": "scheduling",
+      "title": "Scheduling (we are too busy)",
+      "text": "On a busy schedule: because tutoring is online there is no commute, and sessions are booked at times the family and tutor both choose, including evenings and weekends. A recurring weekly slot can be reserved with the same tutor so it becomes a fixed routine, and any session can be rescheduled at no charge up to 12 hours before it starts. Membership hours are flexible — they can be used in shorter or longer sessions across subjects — so the schedule flexes around the family rather than the other way around."
+    },
+    {
+      "id": "objection_online_vs_in_person",
+      "objection": "online_vs_in_person",
+      "title": "Online vs in-person skepticism",
+      "text": "On whether online tutoring is as good as in-person: online 1:1 sessions are live and video-based, with an interactive whiteboard and screen sharing, and every session is recorded so the student can review it afterward — which an in-person session does not give. Online also means no commute, more available time slots, and access to a wider pool of specialized tutors than any single local center. For most students the live, personalized attention matters far more than the room it happens in, and the recording and flexibility are added advantages over in-person."
+    },
+    {
+      "id": "objection_student_resistance",
+      "objection": "student_resistance",
+      "title": "Student resistance (my child does not want a tutor)",
+      "text": "On a student who is reluctant: that is common and the matching process is built for it — the student is paired with a tutor by learning style, not just subject, and the goal is a tutor the student actually connects with rather than one who feels like extra school. The free re-match guarantee means that if the first tutor does not click, the family can switch at no cost until the fit is right, and a low-commitment trial session lets the student try it before anything ongoing is decided. Sessions are collaborative and personalized, which usually feels very different to a student than a classroom."
+    },
+    {
+      "id": "objection_trust_legitimacy",
+      "objection": "trust_legitimacy",
+      "title": "Trust / legitimacy (is this a real, trustworthy service?)",
+      "text": "On trust and legitimacy: tutors are vetted before working with any student, progress is tracked weekly so the family can see what they are paying for, and the service stands behind the experience with a satisfaction guarantee, a free tutor re-match, and a 14-day full-refund window with no long-term contract. A family can start with a no-pressure consultation or a single trial session to see how it works before committing, so there is a low-risk way to verify the service is what it claims before any ongoing commitment."
+    }
+  ]
+}

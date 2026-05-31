@@ -1,0 +1,29 @@
+{
+  "_meta": {
+    "title": "Policies",
+    "kb_version": "kb_v0",
+    "note": "Illustrative demo policies for grounding (scheduling, cancellation, satisfaction guarantee, refunds). Not a real terms-of-service."
+  },
+  "sections": [
+    {
+      "id": "policy_scheduling",
+      "title": "Scheduling and rescheduling",
+      "text": "Sessions are booked through the member portal at times the family and tutor both choose. A session can be rescheduled at no charge up to 12 hours before its start time. Inside the 12-hour window a reschedule uses up the scheduled hour, except for documented emergencies. There is no limit on how far in advance sessions can be booked, and recurring weekly slots can be reserved with the same tutor."
+    },
+    {
+      "id": "policy_cancellation",
+      "title": "Cancellation terms",
+      "text": "The monthly membership can be cancelled at any time with no long-term contract and no cancellation fee. Cancelling stops the next monthly renewal; the current month's already-scheduled hours remain usable through the end of that billing period. Members can also pause the membership for one month instead of cancelling, for example over a school break."
+    },
+    {
+      "id": "policy_satisfaction_guarantee",
+      "title": "Satisfaction guarantee and tutor re-match",
+      "text": "Every membership includes a satisfaction guarantee. If a student is not a good fit with their tutor, the family can request a free tutor re-match at any time and be paired with a different vetted tutor at no extra cost. If the first session with a new member is unsatisfactory, that session is credited back. The guarantee is meant to remove the risk of being stuck with a tutor who is not working out."
+    },
+    {
+      "id": "policy_refund_window",
+      "title": "Refund window",
+      "text": "New members have a 14-day refund window from the first charge: if the service is not a fit within the first 14 days, the family can request a full refund of that month's membership fee. After the 14-day window, membership is non-refundable for the current month but can be cancelled to stop future renewals at any time."
+    }
+  ]
+}

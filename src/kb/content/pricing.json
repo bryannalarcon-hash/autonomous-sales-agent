@@ -1,0 +1,39 @@
+{
+  "_meta": {
+    "title": "Membership pricing",
+    "kb_version": "kb_v0",
+    "note": "ILLUSTRATIVE DEMO PRICING — not a real rate card. All figures are example monthly membership tiers for grounding only. The agent frames price as a recurring monthly commitment and value-per-month (plan R28)."
+  },
+  "sections": [
+    {
+      "id": "pricing_overview",
+      "title": "How pricing works",
+      "text": "Pricing is a monthly tiered membership, billed recurring each month. Each tier bundles a set number of tutoring hours per month at a lower effective per-hour rate than paying session-by-session. Hours can be used flexibly across 1:1, small-group, subject, or test-prep sessions. Members can change tiers month to month as their needs change. All prices below are illustrative demo figures, not a live rate card."
+    },
+    {
+      "id": "pricing_tier_essential",
+      "title": "Essential tier (illustrative)",
+      "text": "Essential tier: about $199 per month, recurring, bundling roughly 4 hours of tutoring per month (about $50 per hour effective). Best for light, steady support in a single subject. Illustrative demo pricing."
+    },
+    {
+      "id": "pricing_tier_core",
+      "title": "Core tier (illustrative)",
+      "text": "Core tier: about $349 per month, recurring, bundling roughly 8 hours of tutoring per month (about $44 per hour effective). The most popular tier; good for weekly support across one or two subjects or steady test-prep progress. Illustrative demo pricing."
+    },
+    {
+      "id": "pricing_tier_premier",
+      "title": "Premier tier (illustrative)",
+      "text": "Premier tier: about $599 per month, recurring, bundling roughly 16 hours of tutoring per month (about $37 per hour effective). Best for intensive test prep on a deadline or multi-subject support. Illustrative demo pricing."
+    },
+    {
+      "id": "pricing_per_hour_range",
+      "title": "Per-hour ranges by program (illustrative)",
+      "text": "Pay-as-you-go per-hour ranges (illustrative): 1:1 online tutoring runs roughly $55 to $75 per hour depending on subject and level; small-group sessions run roughly $30 to $45 per hour per student; test-prep is sold as a package tied to a test date rather than purely by the hour. Membership lowers the effective per-hour cost below these pay-as-you-go ranges."
+    },
+    {
+      "id": "pricing_test_prep_package",
+      "title": "Test-prep packages (illustrative)",
+      "text": "Test-prep is offered as a package scoped to the student's target test date rather than open-ended hours. A typical SAT/ACT package (illustrative) spans 8 to 12 weeks, includes a diagnostic, a study plan, and practice sections, and is priced as a flat package; members can apply membership hours toward it. Pricing is demo data."
+    }
+  ]
+}
