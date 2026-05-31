@@ -1,0 +1,32 @@
+# Secrets — never commit real keys
+.env
+*.local.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Node / web
+node_modules/
+web/.next/
+dist/
+build/
+
+# Claude Code worktrees (subagent isolation)
+.claude/worktrees/
+
+# Data / local artifacts
+data/
+*.sqlite
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

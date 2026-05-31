@@ -1,0 +1,15 @@
+# Local infra for development. Postgres with the pgvector extension backs episodes, per-lead
+# memory, version lineage, and KB embeddings (one store — see plan KTD3/KTD4).
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: sales
+      POSTGRES_PASSWORD: sales
+      POSTGRES_DB: sales_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+volumes:
+  dbdata:

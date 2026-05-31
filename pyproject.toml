@@ -1,0 +1,34 @@
+# Project metadata + dependencies for the autonomous sales agent (Python backend / core / loop).
+# The web dashboard lives under web/ with its own package.json. Versions are provisional and
+# pinned loosely; they get firmed up as each unit integrates the real library.
+[project]
+name = "autonomous-sales-agent"
+version = "0.0.0"
+description = "Autonomous voice AI sales agent for tutoring with a self-improving loop"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2",
+    "pyyaml>=6",
+    "asyncpg>=0.29",
+    "pgvector>=0.2",
+    "python-dotenv>=1",
+    "anthropic>=0.40",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+voice = ["livekit-agents", "livekit-plugins-deepgram", "livekit-plugins-elevenlabs"]
+sim = ["openai>=1.40"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.11"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

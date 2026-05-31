@@ -1,0 +1,15 @@
+{
+  "id": "session-1780233238772",
+  "startedAt": "2026-05-31T13:13:58.772Z",
+  "cwd": "/home/bryann/gauntlet/auto-sales-agent",
+  "context": {},
+  "metrics": {
+    "edits": 27,
+    "commands": 0,
+    "tasks": 0,
+    "errors": 0
+  },
+  "restoredAt": "2026-05-31T21:48:34.175Z",
+  "endedAt": "2026-05-31T21:48:54.630Z",
+  "duration": 30895875
+}

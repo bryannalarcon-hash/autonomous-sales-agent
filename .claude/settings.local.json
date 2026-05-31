@@ -1,0 +1,31 @@
+{
+  "enabledMcpjsonServers": [
+    "ruflo"
+  ],
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PROMPT_LOG_FILE=\"$CLAUDE_PROJECT_DIR/ai-logging/claude-planner-conversation.md\" python3 \"$CLAUDE_PROJECT_DIR/ai-logging/prompt_logger.py\" prompt",
+            "timeout": 15,
+            "statusMessage": "Logging prompt"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PROMPT_LOG_FILE=\"$CLAUDE_PROJECT_DIR/ai-logging/claude-planner-conversation.md\" python3 \"$CLAUDE_PROJECT_DIR/ai-logging/prompt_logger.py\" reply",
+            "timeout": 15,
+            "statusMessage": "Logging reply"
+          }
+        ]
+      }
+    ]
+  }
+}
