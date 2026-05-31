@@ -33,3 +33,6 @@ data/
 
 # Transient claude-flow session state
 .claude-flow/
+
+# Handoff docs (context-management; per-machine, not for the repo)
+handoff/

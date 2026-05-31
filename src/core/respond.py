@@ -1,0 +1,76 @@
+# The transport-agnostic brain core (plan KTD2 / U4 — THE load-bearing boundary). respond() ties
+# the whole brain together for ONE turn and is the single entry point both the headless text self-
+# play (loop/) and the live LiveKit voice adapter (voice/) call — so what is optimized in text is
+# exactly what ships in voice. Orchestration: dst.update(belief, last_agent_act, user_utterance) ->
+# policy.decide(...) [LLM proposes; deterministic gates already applied inside] -> nlg.realize(...).
+# Returns (Decision, reply_text, new_belief): the Decision for logging/decision-trace, the realized
+# reply, and the NEW BeliefState (the input is never mutated). NO LiveKit types cross this boundary.
+from __future__ import annotations
+
+from typing import Any, Optional, Sequence
+
+from src.config.settings import AgentConfig
+from src.core import dst
+from src.core.belief_state import BeliefState
+from src.core.llm import LLMClient
+from src.core.nlg import realize
+from src.core.policy import Decision, decide
+
+
+def _last_agent_act(history: Optional[Sequence[Any]]) -> Optional[str]:
+    """The most recent agent act in history — fed to the DST so driver deltas can condition on it."""
+    if not history:
+        return None
+    for turn in reversed(list(history)):
+        if isinstance(turn, dict) and turn.get("role") in ("assistant", "agent"):
+            act = turn.get("act")
+            return str(act) if act is not None else None
+    return None
+
+
+async def respond(
+    belief: BeliefState,
+    history: Sequence[Any],
+    user_utterance: str,
+    llm_client: LLMClient,
+    config: AgentConfig,
+    *,
+    retrieved_facts: Optional[Sequence[Any]] = None,
+    last_user_act: Optional[str] = None,
+) -> tuple[Decision, str, BeliefState]:
+    """Run one full agent turn and return (decision, reply_text, new_belief).
+
+    Steps (the per-turn flow both channels share):
+      1. DST update — fold the prospect's utterance into a NEW belief (slots + driver deltas +
+         derived trends + meta). The input `belief` is not mutated.
+      2. Policy decide — the LLM proposes a structured act; the deterministic gates filter/override
+         it (skip-known, must-clear-objection, trust-gated price, pushiness cap, escalation). The
+         returned Decision is the GATED one. Note gates may set new_belief.escalation_imminent.
+      3. NLG realize — phrase the gated decision into a persona-consistent, voice-shaped reply,
+         grounded in retrieved_facts when provided (U5).
+
+    retrieved_facts is the KB grounding the voice/text adapters retrieve concurrently (U5); it is
+    threaded straight to NLG. last_user_act, when the adapter has an NLU label, is recorded on the
+    new belief so the gates (e.g. price_gate's 'asked unprompted', escalation's human-request) see
+    it. NO LiveKit types appear in or cross this signature.
+    """
+    new_belief = await dst.update(
+        belief,
+        _last_agent_act(history),
+        user_utterance,
+        llm_client,
+        last_user_act=last_user_act,
+    )
+
+    decision = await decide(new_belief, history=history, config=config, llm_client=llm_client)
+
+    # Record the decision's confidence onto the belief for the decision-trace / low-confidence
+    # escalation streak (escalation_imminent is set inside the gates when an EXTREME trigger fires).
+    if decision.confidence is not None:
+        new_belief.decision_confidence = float(decision.confidence)
+
+    reply_text = await realize(
+        decision, new_belief, config, llm_client, retrieved_facts=retrieved_facts
+    )
+
+    return decision, reply_text, new_belief

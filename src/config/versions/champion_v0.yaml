@@ -27,6 +27,12 @@ playbooks:
 
 thresholds:
   # Cold-start priors (logged as guesses pending sim calibration — see belief-state-schema.md).
-  trust_gate_open_price: 0.5
-  pushiness_cap: 0.7
-  escalate_low_confidence_turns: 2
+  # Consumed by the deterministic gates (src/core/gates.py); gates fall back to safe defaults for
+  # any threshold omitted here, so adding/removing one never breaks a gate.
+  trust_gate_open_price: 0.5        # trust level that opens price/budget talk (price_gate)
+  pushiness_cap: 0.7                # bail_risk level above which further pressure is forbidden
+  pushiness_pressure_count_cap: 2   # consecutive pressure acts before backing off (pushiness_cap)
+  escalate_low_confidence_turns: 2  # consecutive low-confidence turns -> escalate
+  low_confidence_level: 0.4         # decision_confidence below this counts as a low-confidence turn
+  max_concession_band: 0.15         # discount fraction beyond which a concession is EXTREME -> escalate
+  discovery_slots_required: 4       # non-budget discovery slots filled that also opens the price gate
