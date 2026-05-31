@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: sales
       POSTGRES_DB: sales_agent
     ports:
-      - "5432:5432"
+      - "5434:5432"
     volumes:
       - dbdata:/var/lib/postgresql/data
 volumes:

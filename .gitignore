@@ -30,3 +30,6 @@ data/
 .DS_Store
 .idea/
 .vscode/
+
+# Transient claude-flow session state
+.claude-flow/
