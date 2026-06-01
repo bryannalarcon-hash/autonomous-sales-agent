@@ -144,6 +144,45 @@ async def get_episode(episode_id: str) -> Optional[Episode]:
     return _row_to_episode(row)
 
 
+async def list_episodes(
+    *,
+    version: Optional[str] = None,
+    cohort: Optional[str] = None,
+    outcome: Optional[str] = None,
+    escalated: Optional[bool] = None,
+    limit: int = 200,
+) -> list[Episode]:
+    """List episodes newest-first for the dashboard Calls list (P3) + KPI aggregation (P4).
+
+    The dashboard's hot filters (version / cohort / outcome, plus an escalated-only toggle) are
+    pushed down to scalar columns so the index stays cheap; all are optional and AND together.
+    Ordered created_at DESC so the most recent call leads the list; `limit` caps the page. Returns
+    full Episode objects (turns + belief trajectory included) — the same shape get_episode returns,
+    so callers can render summary rows or drill into one without a second fetch shape.
+    """
+    pool = await get_pool()
+    clauses: list[str] = []
+    args: list[Any] = []
+    if version is not None:
+        args.append(version)
+        clauses.append(f"version = ${len(args)}")
+    if cohort is not None:
+        args.append(cohort)
+        clauses.append(f"cohort = ${len(args)}")
+    if outcome is not None:
+        args.append(outcome)
+        clauses.append(f"outcome = ${len(args)}")
+    if escalated is not None:
+        args.append(escalated)
+        clauses.append(f"escalated = ${len(args)}")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    args.append(limit)
+    sql = f"SELECT * FROM episode{where} ORDER BY created_at DESC LIMIT ${len(args)}"
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *args)
+    return [_row_to_episode(r) for r in rows]
+
+
 def _row_to_episode(row: asyncpg.Record) -> Episode:
     d = dict(row)
     # turns/metrics come back as parsed JSON via the codec.

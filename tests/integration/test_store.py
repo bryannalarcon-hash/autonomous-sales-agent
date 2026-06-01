@@ -253,3 +253,45 @@ async def test_version_lineage_and_champion():
     chal_node = await store.get_lineage(chal)
     assert chal_node.parent_version == base
     assert chal_node.kpi["ladder"] == pytest.approx(0.51)
+
+
+async def test_list_episodes_filters_by_version_cohort_outcome():
+    """list_episodes (dashboard P3/P4 feeder) filters by version / cohort / outcome / escalated and
+    returns full episodes newest-first. The hot filters AND together; an unmatched filter is empty."""
+    tag = uuid.uuid4().hex[:8]  # isolate this test's rows from any others in the table
+    v_a, v_b = f"vA-{tag}", f"vB-{tag}"
+    coh = f"coh-{tag}"
+
+    def _ep(version: str, cohort: str, outcome: str, escalated: bool = False) -> Episode:
+        ep = _make_episode("sim", phash=None)
+        ep.version = version
+        ep.cohort = cohort
+        ep.outcome = outcome
+        ep.escalated = escalated
+        return ep
+
+    rows = [
+        _ep(v_a, coh, "enrolled"),
+        _ep(v_a, coh, "released"),
+        _ep(v_a, "other", "enrolled"),
+        _ep(v_b, coh, "enrolled", escalated=True),
+    ]
+    for ep in rows:
+        await store.save_episode(ep)
+
+    # version + cohort AND together
+    by_vc = await store.list_episodes(version=v_a, cohort=coh)
+    assert {e.version for e in by_vc} == {v_a}
+    assert {e.cohort for e in by_vc} == {coh}
+    assert len(by_vc) == 2
+
+    # outcome filter
+    enrolled = await store.list_episodes(version=v_a, outcome="enrolled")
+    assert len(enrolled) == 2 and all(e.outcome == "enrolled" for e in enrolled)
+
+    # escalated-only filter
+    esc = await store.list_episodes(version=v_b, escalated=True)
+    assert len(esc) == 1 and esc[0].escalated is True
+
+    # unmatched filter -> empty (graceful, not error)
+    assert await store.list_episodes(version=f"nope-{tag}") == []

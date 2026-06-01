@@ -1,12 +1,15 @@
-# The thin FastAPI demo API (plan U13; R1/R3/R33/R40/R41/R42). Exposes the transport-agnostic
-# brain (src.core.respond via src.voice.session.VoiceSession) and the compliance core
-# (src.voice.consent) to the browser front-end over an EXACT, frozen JSON contract the Next.js
-# demo depends on. Holds an in-memory per-session store (dict keyed by session_id) for the demo —
-# no DB required. The LLM client is INJECTABLE (llm_client_factory) so tests pass a MockLLMClient
-# and never hit the network. Consent gates /api/chat (409 until satisfied) and /api/livekit/token
-# (503 when LiveKit creds are absent, never a crash, never printing secrets). PII is scrubbed inside
-# the VoiceSession before any transcript body is stored; the lead key is the phone-hash (raw phone
-# is never persisted). CORS is open for local dev only.
+# The thin FastAPI demo API (plan U13; R1/R3/R33/R40/R41/R42) PLUS the operator-dashboard read API
+# (plan U15 — Operate mode). Exposes the transport-agnostic brain (src.core.respond via
+# src.voice.session.VoiceSession) and the compliance core (src.voice.consent) to the browser
+# front-end over an EXACT, frozen JSON contract the Next.js demo depends on, and mounts the Operate
+# read router (src.api.operate: /api/episodes, /api/kpis, /api/escalations, /api/live) the dashboard
+# consumes. Holds an in-memory per-session store (dict keyed by session_id) for the demo — no DB
+# required. The LLM client is INJECTABLE (llm_client_factory) and so is the dashboard's read data
+# layer (read_store) so tests pass a MockLLMClient + a seeded in-memory store and never hit the
+# network or Postgres. Consent gates /api/chat (409 until satisfied) and /api/livekit/token (503 when
+# LiveKit creds are absent, never a crash, never printing secrets). PII is scrubbed inside the
+# VoiceSession before any transcript body is stored; the lead key is the phone-hash (raw phone is
+# never persisted). CORS is open for local dev only.
 from __future__ import annotations
 
 import os
@@ -18,6 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from src.api.operate import ReadStore, create_operate_router
 from src.config.settings import AgentConfig, load_config
 from src.core.llm import LLMClient
 from src.kb.embeddings import EmbeddingModel, FakeEmbedder
@@ -126,15 +130,19 @@ def create_app(
     refusal_policy: RefusalPolicy = RefusalPolicy.PROCEED_UNRECORDED,
     cors_origins: Optional[list[str]] = None,
     token_builder: Optional[TokenBuilder] = None,
+    read_store: Optional[ReadStore] = None,
 ) -> FastAPI:
-    """Build the demo API app. Everything network/DB-bound is injectable so tests run offline.
+    """Build the demo + operator API app. Everything network/DB-bound is injectable so tests run
+    offline.
 
     llm_client_factory builds a fresh LLMClient per session (prod: OpenRouterClient from env; tests:
     a MockLLMClient factory). embedder/retrieve_hook wire RAG (defaults: FakeEmbedder, no retrieve).
-    lead_voice_lookup reuses a returning caller's stored sticky voice (U6 hydrate). The app keeps an
-    in-memory session store; consent gates /api/chat and /api/livekit/token.
+    lead_voice_lookup reuses a returning caller's stored sticky voice (U6 hydrate). read_store is the
+    dashboard's READ data layer (U15 Operate pages): defaults to the Postgres-backed src.memory.store,
+    tests pass a seeded in-memory fake so the read endpoints run DB-free. The app keeps an in-memory
+    session store; consent gates /api/chat and /api/livekit/token.
     """
-    app = FastAPI(title="auto-sales-agent demo API", version="0.1.0")
+    app = FastAPI(title="auto-sales-agent demo + operator API", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins or ["*"],  # local dev demo only
@@ -307,6 +315,10 @@ def create_app(
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    # Operate-mode read endpoints (U15 dashboard): /api/episodes, /api/episodes/{id}, /api/kpis,
+    # /api/escalations, /api/live. The read_store is injected here (default Postgres; tests fake it).
+    app.include_router(create_operate_router(read_store=read_store))
 
     return app
 
