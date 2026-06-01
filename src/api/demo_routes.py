@@ -80,6 +80,10 @@ class RespondRequest(BaseModel):
 
 
 class RespondResponse(BaseModel):
+    # session_id is ECHOED so the client has the live session id without threading its own state — the
+    # /demo page reads it to unlock chat + voice. Omitting it left the page with sessionId=undefined,
+    # so Send and "Start voice call" stayed permanently disabled after consent (the demo blocker).
+    session_id: str
     state: str  # "ready" | "unrecorded" | "ended" | "need_parental"
     message: str
 
@@ -338,6 +342,7 @@ def create_demo_router(
                 gate.deny_parental()
 
         return RespondResponse(
+            session_id=sess.session_id,
             state=gate.state,
             message=_OK_STATE_MESSAGES.get(gate.state, gate.state),
         )

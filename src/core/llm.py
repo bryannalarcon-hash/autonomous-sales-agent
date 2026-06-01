@@ -22,6 +22,11 @@ Message = dict[str, str]
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _DEFAULT_TIMEOUT_S = 60.0
+# The agent model used when neither a constructor `model=` nor env AGENT_MODEL is set. MUST be a real
+# slug: a previous empty-string default made OpenRouterClient() POST `"model": ""`, which OpenRouter
+# rejects with 400 on EVERY call — silently degrading the whole brain (DST/policy/NLG) to fallbacks
+# (the /api/chat path gave the same canned line for every question). Kept in sync with src.voice.agent.
+DEFAULT_AGENT_MODEL = "anthropic/claude-sonnet-4.5"
 
 # Bounded retry policy for transient OpenRouter failures (FINDING 2). A 429 (rate limit) or any 5xx
 # server error, and transport-level errors (timeout/connection), are retried with a DETERMINISTIC
@@ -131,7 +136,9 @@ class OpenRouterClient(_JsonHelperMixin):
             raise ValueError(
                 "OpenRouterClient requires an API key: pass api_key= or set OPENROUTER_API_KEY"
             )
-        self.model = model or os.environ.get("AGENT_MODEL", "")
+        # Resolve the model: explicit arg > env AGENT_MODEL > DEFAULT_AGENT_MODEL. NEVER "" — an empty
+        # model makes OpenRouter 400 every request, silently breaking the brain (see DEFAULT_AGENT_MODEL).
+        self.model = (model or os.environ.get("AGENT_MODEL") or DEFAULT_AGENT_MODEL).strip()
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.extra_headers = dict(extra_headers or {})

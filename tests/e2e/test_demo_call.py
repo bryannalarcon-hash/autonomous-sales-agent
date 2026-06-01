@@ -107,6 +107,9 @@ def test_chat_is_refused_until_consent_then_proceeds():
     })
     assert r.status_code == 200, r.text
     assert r.json()["state"] == "ready"
+    # REGRESSION: respond MUST echo session_id — the /demo page reads res.session_id to unlock chat +
+    # voice; omitting it left sessionId=undefined and both controls stayed permanently disabled.
+    assert r.json()["session_id"] == sid
 
     # AFTER consent -> proceeds. The default mock acts `ask` (a non-terminal discovery turn), so the
     # call is NOT done (done is only True on a terminal act — see test_chat_done_flag_*).

@@ -167,6 +167,21 @@ async def test_openrouter_requires_api_key():
         OpenRouterClient(api_key="", model="m", _load_env=False)
 
 
+async def test_openrouter_never_defaults_to_empty_model(monkeypatch):
+    """REGRESSION: with no model= and no AGENT_MODEL env, the client must fall back to a REAL model,
+    never "". An empty model made OpenRouter 400 every request, silently degrading the whole brain
+    (DST/policy/NLG) to canned fallbacks — the /api/chat path answered every question identically."""
+    import src.core.llm as llm_mod
+
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    client = OpenRouterClient(api_key="sk-test-123", _load_env=False)
+    assert client.model == llm_mod.DEFAULT_AGENT_MODEL
+    assert client.model  # non-empty
+    # And env AGENT_MODEL still wins when present.
+    monkeypatch.setenv("AGENT_MODEL", "anthropic/claude-3.5-sonnet")
+    assert OpenRouterClient(api_key="sk-test-123", _load_env=False).model == "anthropic/claude-3.5-sonnet"
+
+
 async def test_openrouter_complete_json_parses(monkeypatch):
     """complete_json on the real client parses the assistant content as JSON (network faked)."""
     import src.core.llm as llm_mod
