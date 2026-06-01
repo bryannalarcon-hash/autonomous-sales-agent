@@ -25,10 +25,13 @@
 # politely ends. Once the gate reaches can_converse, subsequent turns route to the brain as normal —
 # so a phone call works end-to-end without deadlocking on a `pending` gate, while still fail-closed
 # (a turn before consent resolves never reaches the brain / is never recorded).
-# PERSISTENCE (U2/U15): at room close the finished VoiceSession is saved via
+# PERSISTENCE (U2/U15/Layer2): at room close the finished VoiceSession is saved via
 # src.api.persistence.persist_call_end (channel="voice") with the bound phone-hash, any escalations
 # captured DURING the call, and the last close tier — so voice calls flow into /operate exactly like
-# text calls.
+# text calls. LIVE PERSISTENCE (Layer 2): a stable live_episode_id is generated at call start; after
+# each committed agent turn _upsert_live_voice writes an in_progress Episode via persist_call_live
+# using that stable id so the Live monitor can query voice calls mid-call; _register_persistence
+# finalizes with the same id so no orphan row is created.
 #
 # HEAVY-IMPORT ISOLATION: the livekit-agents CORE imports are import-guarded (so this module imports
 # cleanly in the livekit-FREE test suite/CI, with Agent aliased to object and WorkerVoiceAgent still
@@ -48,6 +51,8 @@ import json
 import logging
 import os
 import re
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -250,6 +255,10 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
         self.last_close_tier: Optional[str] = None
         # In-flight async escalation-handling tasks, awaited at shutdown before persisting.
         self._escalation_tasks: list[Any] = []
+        # Stable live-persistence identifiers (Layer 2): generated ONCE at construction and reused on
+        # every in_progress upsert AND the final _register_persistence call so both target the same row.
+        self.live_episode_id: str = f"ep-{uuid.uuid4().hex}"
+        self.live_created_at: datetime = datetime.now(timezone.utc)
 
     # --- SIP spoken-consent sub-flow (the no-browser phone path) --------------------------------
 
@@ -585,7 +594,9 @@ def _capture_post_commit(agent: WorkerVoiceAgent, committed: Any, speech_id: str
         a coroutine, so we schedule it with a no-op store_hook (no mid-call DB write) and track the
         task so the shutdown callback can await it before persisting.
       - act == "attempt_close": track the close tier (the schema Turn carries no tier; persist needs
-        it to map the outcome to the right ladder rung)."""
+        it to map the outcome to the right ladder rung).
+      - ALWAYS: schedule a live in_progress upsert (Layer 2) so the Live monitor can query the call
+        mid-call. Failures are swallowed inside _upsert_live_voice."""
     if committed is None:
         return
     decision = committed.decision
@@ -595,6 +606,8 @@ def _capture_post_commit(agent: WorkerVoiceAgent, committed: Any, speech_id: str
         )))
     elif decision.act == "attempt_close":
         agent.last_close_tier = decision.tier
+    # Live in-progress upsert after every committed turn (Layer 2).
+    asyncio.ensure_future(_upsert_live_voice(agent, config))
 
 
 async def _handle_escalation_async(agent: WorkerVoiceAgent, committed: Any, speech_id: str,
@@ -628,6 +641,27 @@ async def _handle_escalation_async(agent: WorkerVoiceAgent, committed: Any, spee
         logger.warning("escalation capture failed on turn %s: %s", speech_id, type(exc).__name__)
 
 
+async def _upsert_live_voice(agent: WorkerVoiceAgent, config: AgentConfig) -> None:
+    """Upsert an in_progress Episode after each committed agent turn (Layer 2 live persistence).
+
+    Calls persist_call_live with the agent's stable live_episode_id + live_created_at so every
+    upsert AND the final _register_persistence call target the same DB row. Imported lazily so the
+    asyncpg/store deps only load on a live call. Failures are swallowed — a hiccup must never
+    interrupt the voice call path."""
+    try:
+        from src.api.persistence import persist_call_live
+
+        await persist_call_live(
+            agent.voice_session,
+            config=config,
+            channel="voice",
+            created_at=agent.live_created_at,
+            episode_id=agent.live_episode_id,
+        )
+    except Exception as exc:  # pragma: no cover - prod-only path (needs a real call + DB)
+        logger.warning("voice live upsert failed (call continues): %s", type(exc).__name__)
+
+
 def _register_persistence(ctx: Any, agent: WorkerVoiceAgent, config: AgentConfig,
                           *, phone_hash_value: Optional[str], raw_phone: Optional[str]) -> None:
     """At room close, persist the finished call via the SAME path the text demo uses (U2/U15).
@@ -649,6 +683,8 @@ def _register_persistence(ctx: Any, agent: WorkerVoiceAgent, config: AgentConfig
 
             from src.api.persistence import persist_call_end
 
+            # Pass live_episode_id so the final save upserts the same row as all in_progress
+            # live upserts (no orphan in_progress row, no duplicate episode).
             episode = await persist_call_end(
                 agent.voice_session,
                 config=config,
@@ -657,6 +693,7 @@ def _register_persistence(ctx: Any, agent: WorkerVoiceAgent, config: AgentConfig
                 raw_phone=raw_phone,
                 escalation_logs=list(agent.escalations),
                 last_tier=agent.last_close_tier,
+                episode_id=agent.live_episode_id,
             )
             logger.info("persisted voice episode %s (outcome=%s)", episode.episode_id, episode.outcome)
         except Exception as exc:  # pragma: no cover - prod-only path (needs a real call + DB)

@@ -5,8 +5,9 @@
 # 5 Operate pages depend on: /api/episodes filters by version+cohort+outcome+escalated; /api/kpis
 # carries the weighted-ladder headline AND a DISTINCT enrollment_rate (and a compare arm); the
 # escalation queue lists by lifecycle with counts; Call Review returns the decision trace + belief
-# trajectory; /api/live hoists the prioritized belief IA. Also guards empty data + verifies NO raw
-# internal index (ladder int alone, driver slug) leaks into operator-facing labels.
+# trajectory; /api/live hoists the prioritized belief IA; /api/live/active lists all non-stale
+# active calls; /api/live/sample returns the newest completed call. Also guards empty data +
+# verifies NO raw internal index (ladder int alone, driver slug) leaks into operator-facing labels.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -108,10 +109,17 @@ def _episode(
     # turn_count lets a test seed a still-connecting (0-turn) or barely-started episode — the
     # in-progress/0-turn shapes the completed Calls list must EXCLUDE and Live/Review must handle.
     turns = all_turns[:turn_count]
+    metrics: dict = {"duration_ms": 348000, "talk_listen": [44, 56]}
+    # A live call stamps metrics['live_heartbeat'] (last activity) every upsert; _is_active gates on
+    # its freshness. Mirror that for unfinished-outcome fixtures by beating at `created` — so a fixture's
+    # liveness tracks its `minutes_ago` exactly as before (fresh => active, stale => abandoned), while a
+    # completed call (or a row with no heartbeat) is correctly never "live".
+    if outcome in (None, "", "in_progress"):
+        metrics["live_heartbeat"] = created.isoformat()
     return Episode(
         episode_id=eid, turns=turns, outcome=outcome, ladder_tier=tier, qualified=qualified,
         version=version, kb_version="kb-37", channel="voice", persona=persona, cohort=cohort,
-        escalated=escalated, metrics={"duration_ms": 348000, "talk_listen": [44, 56]}, created_at=created,
+        escalated=escalated, metrics=metrics, created_at=created,
     )
 
 
@@ -379,7 +387,7 @@ def test_live_zero_turn_active_call_is_connecting_not_dashes():
 
 
 def test_live_no_active_call_when_most_recent_is_completed():
-    # only completed calls -> active False, but still hands back the most recent for context.
+    # only completed calls -> active False, episode is NULL (no completed-fallback in new contract).
     eps = [
         _episode("CALL-1", outcome="enrolled", tier=4, version="v12", cohort="live",
                  persona="Warm Champion", qualified=True, minutes_ago=5),
@@ -388,7 +396,7 @@ def test_live_no_active_call_when_most_recent_is_completed():
     client = TestClient(app)
     snap = client.get("/api/live").json()
     assert snap["active"] is False
-    assert snap["episode"]["episode_id"] == "CALL-1"
+    assert snap["episode"] is None  # new: no completed-episode fallback; use /api/live/sample instead
 
 
 def test_live_empty_store():
@@ -430,10 +438,17 @@ def test_live_snapshot_stale_zero_turn_in_progress_is_not_active():
                      persona="anxious_parent", qualified=False, minutes_ago=0, turn_count=0)
     assert live_snapshot(fresh)["active"] is True
 
-    # An in-progress call that HAS turns is genuinely live regardless of age.
-    started = _episode("CALL-LIVE", outcome="in_progress", tier=0, version="v", cohort="live",
-                       persona="anxious_parent", qualified=False, minutes_ago=120, turn_count=2)
-    assert live_snapshot(started)["active"] is True
+    # Liveness is judged by LAST ACTIVITY (the heartbeat), NOT by "has turns". An in-progress call with
+    # turns whose heartbeat has gone stale is an abandoned/never-finalized partial — NOT live (this is
+    # the seed-cruft case that otherwise lingers in /api/live/active forever).
+    abandoned = _episode("CALL-ABANDONED", outcome="in_progress", tier=0, version="v", cohort="live",
+                         persona="anxious_parent", qualified=False, minutes_ago=120, turn_count=2)
+    assert live_snapshot(abandoned) == {"active": False, "episode": None}
+
+    # A call mid-conversation that is STILL beating (fresh heartbeat) is live regardless of turn count.
+    live = _episode("CALL-LIVE", outcome="in_progress", tier=0, version="v", cohort="live",
+                    persona="anxious_parent", qualified=False, minutes_ago=0, turn_count=2)
+    assert live_snapshot(live)["active"] is True
 
 
 def test_escalation_lifecycle_update_advances_state():
@@ -449,3 +464,185 @@ def test_escalation_lifecycle_update_advances_state():
     assert any(e["escalation_id"] == "ESC-204" for e in rev["escalations"])
     assert client.post("/api/escalations/ESC-204/lifecycle", json={"lifecycle": "bogus"}).status_code == 400
     assert client.post("/api/escalations/NOPE/lifecycle", json={"lifecycle": "resolved"}).status_code == 404
+
+
+# =============================== P1 — LIVE: NEW CONTRACT (dummy-kill + sub-routes) ===============
+
+
+def test_live_get_active_call_by_episode_id():
+    """`GET /api/live?episode_id=<id>` returns live_snapshot for that specific episode.
+    This lets the page watch a selected queued call. 404 when the id is unknown."""
+    client = _seeded_client()
+    # CALL-4821 is in_progress — fetch it explicitly by id.
+    r = client.get("/api/live", params={"episode_id": "CALL-4821"})
+    assert r.status_code == 200, r.text
+    snap = r.json()
+    assert snap["episode"]["episode_id"] == "CALL-4821"
+    # active is determined by outcome, not by query param
+    assert snap["active"] is True
+
+    # A completed episode can also be fetched by id (its active flag is False).
+    r2 = client.get("/api/live", params={"episode_id": "CALL-4820"})
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["episode"]["episode_id"] == "CALL-4820"
+    assert r2.json()["active"] is False
+
+    # Unknown id -> 404.
+    r3 = client.get("/api/live", params={"episode_id": "NOPE-9999"})
+    assert r3.status_code == 404, r3.text
+
+
+def test_live_no_params_returns_active_not_completed_fallback():
+    """`GET /api/live` (no params) returns the newest ACTIVE call, not the newest overall.
+    When the store has mixed active+completed rows, the completed ones must never pollute
+    the no-param live feed (the dummy-kill: completed episodes were leaking to P1 before)."""
+    client = _seeded_client()
+    snap = client.get("/api/live").json()
+    # The seeded store has CALL-4821 (in_progress, 0 turns, 0 min ago) as the newest active call.
+    assert snap["active"] is True
+    assert snap["episode"]["episode_id"] == "CALL-4821"
+
+
+def test_live_active_list_returns_all_non_stale_active_calls():
+    """`GET /api/live/active` returns ALL non-stale active calls in newest-first order, with the
+    required summary fields: episode_id, channel, persona_label, stage, trust, bail_risk,
+    turn_count, escalation_imminent, started_at. persona_label must be humanized (no raw slug).
+    No raw cohort/version slugs in any returned field."""
+    client = _seeded_client()
+    r = client.get("/api/live/active")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "count" in body and "calls" in body
+    # Two active non-stale calls in the seeded store: CALL-4821 (in_progress, 0 min) and
+    # CALL-4822 (outcome=None, 0 turns, 1 min ago — also active and non-stale).
+    assert body["count"] == 2
+    ids = {c["episode_id"] for c in body["calls"]}
+    assert ids == {"CALL-4821", "CALL-4822"}
+
+    # Required fields present on each call row.
+    for call in body["calls"]:
+        assert "episode_id" in call
+        assert "channel" in call
+        assert "persona_label" in call          # humanized — never a raw persona key
+        assert "stage" in call
+        assert "trust" in call
+        assert "bail_risk" in call
+        assert "turn_count" in call
+        assert "escalation_imminent" in call
+        assert "started_at" in call
+
+    # Persona label must be human-readable: no raw internal key like "anxious_parent".
+    # (The seeded personas are already human-readable strings like "Skeptical Analyzer"; the point
+    # is that the field is persona_label, not the raw persona slug from the config.)
+    for call in body["calls"]:
+        # No raw cohort slug in any returned field (cohort is an internal tag, not displayed).
+        assert "cohort" not in call
+        # No version slug in the call row.
+        assert "version" not in call
+
+    # Newest-first: CALL-4821 (0 min ago) before CALL-4822 (1 min ago).
+    assert body["calls"][0]["episode_id"] == "CALL-4821"
+
+
+def test_live_active_list_excludes_completed_and_stale():
+    """`/api/live/active` must never include completed episodes or stale 0-turn in-progress rows."""
+    from src.api.operate import _LIVE_STALE_SECONDS
+
+    stale_ep = _episode(
+        "CALL-STALE-A", outcome="in_progress", tier=0, version="v", cohort="live",
+        persona="Skeptical Analyzer", qualified=False,
+        minutes_ago=int(_LIVE_STALE_SECONDS / 60) + 5, turn_count=0,
+    )
+    completed_ep = _episode(
+        "CALL-DONE", outcome="enrolled", tier=4, version="v", cohort="live",
+        persona="Warm Champion", qualified=True, minutes_ago=2,
+    )
+    fresh_active_ep = _episode(
+        "CALL-FRESH-A", outcome="in_progress", tier=0, version="v", cohort="live",
+        persona="Busy Decider", qualified=False, minutes_ago=1, turn_count=1,
+    )
+    app = create_app(read_store=FakeReadStore([stale_ep, completed_ep, fresh_active_ep], []))
+    client = TestClient(app)
+    r = client.get("/api/live/active")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    ids = {c["episode_id"] for c in body["calls"]}
+    assert "CALL-STALE-A" not in ids   # stale 0-turn in-progress
+    assert "CALL-DONE" not in ids      # completed
+    assert "CALL-FRESH-A" in ids       # fresh active
+
+
+def test_live_active_list_empty_when_no_active_calls():
+    """`/api/live/active` returns count=0 and an empty calls list when no active calls exist."""
+    eps = [
+        _episode("CALL-DONE-1", outcome="enrolled", tier=4, version="v", cohort="c",
+                 persona="Warm Champion", qualified=True, minutes_ago=10),
+        _episode("CALL-DONE-2", outcome="disqualified", tier=0, version="v", cohort="c",
+                 persona="Price Hawk", qualified=False, minutes_ago=20),
+    ]
+    app = create_app(read_store=FakeReadStore(eps, []))
+    client = TestClient(app)
+    r = client.get("/api/live/active")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 0
+    assert body["calls"] == []
+
+
+def test_live_sample_returns_newest_completed_with_sample_flag():
+    """`GET /api/live/sample` returns live_snapshot of the newest COMPLETED episode with
+    `"sample": true` and `active: false`. The page's "Show sample call" toggle hits this to
+    give operators a reference call to orient the monitor when nothing is live."""
+    client = _seeded_client()
+    r = client.get("/api/live/sample")
+    assert r.status_code == 200, r.text
+    snap = r.json()
+    # sample: true must be present and active must be false.
+    assert snap.get("sample") is True
+    assert snap["active"] is False
+    # Must be a real completed episode (not the in-progress CALL-4821/CALL-4822).
+    assert snap["episode"] is not None
+    ep_id = snap["episode"]["episode_id"]
+    assert ep_id not in {"CALL-4821", "CALL-4822"}
+    # The newest completed episode in the seeded store is CALL-4820 (enrolled, 6 min ago).
+    assert ep_id == "CALL-4820"
+
+
+def test_live_sample_empty_when_no_completed_calls():
+    """`/api/live/sample` returns the null-payload with sample:true when there are no completed
+    episodes (e.g. fresh store or all-active store)."""
+    eps = [
+        _episode("CALL-ACTIVE", outcome="in_progress", tier=0, version="v", cohort="c",
+                 persona="Skeptical Analyzer", qualified=False, minutes_ago=0, turn_count=1),
+    ]
+    app = create_app(read_store=FakeReadStore(eps, []))
+    client = TestClient(app)
+    r = client.get("/api/live/sample")
+    assert r.status_code == 200, r.text
+    snap = r.json()
+    assert snap == {"active": False, "episode": None, "sample": True}
+
+
+def test_live_active_uses_same_predicate_as_live_snapshot():
+    """The active+stale predicate in /api/live/active must be consistent with live_snapshot's
+    active determination — a call active in live_snapshot is active in /api/live/active and
+    vice versa. Regression guard so the two code paths can't silently drift."""
+    from src.api.operate import _is_active
+
+    now = datetime.now(timezone.utc)
+    # fresh in_progress with turns -> active
+    ep_fresh = _episode("EP-F", outcome="in_progress", tier=0, version="v", cohort="c",
+                        persona="Busy Decider", qualified=False, minutes_ago=1, turn_count=2)
+    assert _is_active(ep_fresh, now=now) is True
+
+    # completed -> not active
+    ep_done = _episode("EP-D", outcome="enrolled", tier=4, version="v", cohort="c",
+                       persona="Warm Champion", qualified=True, minutes_ago=5)
+    assert _is_active(ep_done, now=now) is False
+
+    # stale 0-turn in_progress -> not active
+    from src.api.operate import _LIVE_STALE_SECONDS
+    ep_stale = _episode("EP-S", outcome="in_progress", tier=0, version="v", cohort="c",
+                        persona="Skeptical Analyzer", qualified=False,
+                        minutes_ago=int(_LIVE_STALE_SECONDS / 60) + 10, turn_count=0)
+    assert _is_active(ep_stale, now=now) is False

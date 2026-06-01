@@ -1,9 +1,12 @@
 // Operator-dashboard (Operate mode, U15) API contract — mirrors the JSON the FastAPI Operate read
 // router (src/api/operate.py) returns for /api/episodes, /api/episodes/{id}, /api/kpis,
-// /api/escalations, /api/live. Keep in lockstep with that module. The backend has already translated
-// every internal index (ladder tier ints, driver enum slugs, stage/act slugs, escalation reasons)
-// into human-readable *_label fields; the raw *_key fields are internal-only and MUST NOT render in
-// operator-facing text — the UI shows the labels. lib/operate-api.ts types against these.
+// /api/escalations, /api/live, /api/live/active, and /api/live/sample. Keep in lockstep with that
+// module. The backend has already translated every internal index (ladder tier ints, driver enum
+// slugs, stage/act slugs, escalation reasons) into human-readable *_label fields; the raw *_key
+// fields are internal-only and MUST NOT render in operator-facing text — the UI shows the labels.
+// Additions (U16 live-monitor): LiveSnapshot gains optional `sample` flag; ActiveCallSummary +
+// ActiveCallsResponse support the queue-rail of concurrent in-progress calls (/api/live/active).
+// lib/operate-api.ts types against these.
 
 /** One belief-state driver signal at a turn, already labeled (e.g. "Walk-away risk"). */
 export interface DriverSignal {
@@ -80,6 +83,9 @@ export interface EpisodeListResponse {
 /** The P1 Live monitor snapshot: the most-recent call + the hoisted prioritized belief IA. */
 export interface LiveSnapshot {
   active: boolean;
+  /** True when this snapshot was synthesized from a completed call as a preview/demo; the monitor
+   *  must display a "SAMPLE" badge and suppress all LIVE/recording affordances. */
+  sample?: boolean;
   episode: EpisodeDetail | null;
   priority?: {
     trust: number | null;
@@ -88,6 +94,28 @@ export interface LiveSnapshot {
     last_act_label: string | null;
     escalation_imminent: boolean;
   };
+}
+
+/** One entry in the active-calls queue — enough to populate the queue rail without the full
+ *  transcript. Humanized labels come from the backend; persona_label is already human-readable. */
+export interface ActiveCallSummary {
+  episode_id: string;
+  channel: 'voice' | 'text';
+  /** Pre-humanized persona archetype label, or null if the call has no persona yet. */
+  persona_label: string | null;
+  /** Current conversation stage (already labeled), or null if not yet established. */
+  stage: string | null;
+  trust: number | null;
+  bail_risk: number | null;
+  turn_count: number;
+  escalation_imminent: boolean;
+  started_at: string | null;
+}
+
+/** Response from GET /api/live/active — the full set of currently in-progress calls. */
+export interface ActiveCallsResponse {
+  count: number;
+  calls: ActiveCallSummary[];
 }
 
 export interface LadderDistRow {

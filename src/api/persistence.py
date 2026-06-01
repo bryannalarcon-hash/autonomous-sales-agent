@@ -1,11 +1,15 @@
 # Demo-call persistence bridge (plan U2/U13/U14/U15) — turns a finished in-memory VoiceSession into
 # the durable rows the Operate dashboard reads, so a live /api/chat call STOPS vanishing. Pure
 # mapping + store calls, kept out of src.api.server so the FastAPI module stays thin and this stays
-# unit-testable. Three jobs:
+# unit-testable. Four jobs:
 #   - episode_from_session(session, ...) builds a unified Episode from the committed turns + belief
 #     trajectory, deriving the terminal OUTCOME + commitment-LADDER tier from the last committed agent
 #     decision, stamping version+kb_version, persona, channel, lead_phone_hash, and
 #     metrics["recorded"]; pure (no DB) so it is trivially testable.
+#   - persist_call_live(session, ...) upserts an in_progress Episode per turn so the Live monitor
+#     can query calls WHILE they are happening. Uses a stable episode_id + created_at passed by the
+#     caller (both must stay constant across upserts). Anonymous (lead_phone_hash=None). Swallows DB
+#     errors so a persistence hiccup never crashes the call path.
 #   - persist_call_end(session, ...) saves it via the store in FK-safe order (lead -> episode ->
 #     escalations) and persists per-lead memory (persist_lead_after_call, phone-hash only). The lead
 #     key is SINGLE-SOURCED server-side: raw_phone -> schema.phone_hash(raw_phone); a bound-hash call
@@ -16,11 +20,15 @@
 # .schema, src.voice.session.VoiceSession, src.config.settings. NO LiveKit imports.
 from __future__ import annotations
 
+import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from src.config.settings import AgentConfig
 from src.memory.schema import Episode, Turn
+
+logger = logging.getLogger(__name__)
 
 # Last-committed agent decision act -> (terminal outcome label, commitment-ladder tier int). Mirrors
 # src.api.labels' tier scale (0 none < 1 callback < 2 consult < 3 trial < 4 enrollment) and the
@@ -108,6 +116,58 @@ def episode_from_session(
     )
 
 
+async def persist_call_live(
+    session: Any,
+    *,
+    config: AgentConfig,
+    channel: str,
+    created_at: datetime,
+    episode_id: str,
+) -> Optional[Episode]:
+    """Upsert an in_progress Episode each turn so the Live monitor can query calls mid-call.
+
+    Builds an Episode with outcome="in_progress", lead_phone_hash=None (anonymous — avoids the lead
+    FK requirement AND any PII during the call), cohort="live", and the SAME episode_id + created_at
+    passed on every call (so consecutive upserts land on the same row via save_episode's ON CONFLICT).
+    Accumulated turns (with belief snapshots) and turn_count reflect the state AFTER the current turn.
+    The store is imported lazily so this module stays DB-free at import time. Swallows/logs DB errors
+    like persist_call_end does — a persistence hiccup must NEVER crash the live call path. Returns the
+    Episode on success or None on error.
+    """
+    try:
+        from src.memory import store
+
+        state = session.state
+        turns: list[Turn] = list(state.turns)
+        stamp = config.stamp()
+        persona_name = getattr(getattr(config, "persona", None), "name", None)
+
+        episode = Episode(
+            episode_id=episode_id,
+            turns=turns,
+            outcome="in_progress",
+            ladder_tier=0,
+            qualified=False,
+            version=stamp.get("version", ""),
+            kb_version=stamp.get("kb_version", ""),
+            channel=channel,
+            lead_phone_hash=None,
+            persona=persona_name,
+            cohort="live",
+            escalated=False,
+            # live_heartbeat = the moment of THIS upsert (last activity). _is_active (operate.py) reads
+            # it to keep a call "live" only while fresh — so a real call stays live for its whole run
+            # (the beat advances every turn) while an abandoned partial goes stale and drops out.
+            metrics={"turn_count": len(turns), "live_heartbeat": datetime.now(timezone.utc).isoformat()},
+            created_at=created_at,
+        )
+        await store.save_episode(episode)
+        return episode
+    except Exception as exc:
+        logger.warning("persist_call_live failed (call continues): %s", type(exc).__name__)
+        return None
+
+
 async def persist_call_end(
     session: Any,
     *,
@@ -118,6 +178,7 @@ async def persist_call_end(
     cohort: str = "live",
     escalation_logs: Optional[list[Any]] = None,
     last_tier: Optional[str] = None,
+    episode_id: Optional[str] = None,
 ) -> Episode:
     """Persist a finished demo call: lead -> episode -> escalations, plus per-lead memory (U2/U14/U15).
 
@@ -131,7 +192,9 @@ async def persist_call_end(
         target exists, then key the episode by it (a bound-hash call no longer dangles -> no FK error).
       - neither -> lead_phone_hash is None (anonymous call), no lead written.
     Order (FK-safe): lead first (the episode's FK target), then save_episode (the escalations' FK
-    target), then the buffered escalation_logs re-pointed onto this episode_id. Returns the saved
+    target), then the buffered escalation_logs re-pointed onto this episode_id. episode_id, when
+    supplied, is the stable live_episode_id stamped at session creation — passing it makes the final
+    save upsert the same row as all in_progress live upserts (no orphan/duplicate). Returns the saved
     Episode. The store is imported lazily so DB-free imports don't drag in asyncpg.
     """
     from src.memory import store
@@ -171,6 +234,7 @@ async def persist_call_end(
         phone_hash=effective_hash,
         cohort=cohort,
         last_tier=last_tier,
+        episode_id=episode_id,
     )
     # 2. Episode (the FK target for escalations).
     await store.save_episode(episode)

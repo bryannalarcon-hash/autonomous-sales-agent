@@ -7,8 +7,10 @@
 # is translated through src.api.labels so NO raw internal index (ladder int, driver slug, P-id) ever
 # renders. Episodes/escalations are serialized to flat display DTOs the Next.js client types against.
 # The /api/episodes Calls list is the COMPLETED history: in-progress / unset-outcome / 0-turn calls
-# are EXCLUDED here (see _is_completed) so an active call never leaks in as a finished row — those
-# live/unfinished calls surface only on /api/live (KPI aggregation is intentionally left untouched).
+# are EXCLUDED here (see _is_completed) so an active call never leaks in as a finished row. Live-call
+# endpoints: GET /api/live (newest active call or null), GET /api/live?episode_id=<id> (specific ep),
+# GET /api/live/active (all non-stale active calls with summary fields), GET /api/live/sample
+# (newest completed call with sample:true, for the page's "Show sample call" toggle).
 from __future__ import annotations
 
 import os
@@ -34,9 +36,8 @@ class _LifecycleUpdate(BaseModel):
 
 
 class ReadStore(Protocol):
-    """The read surface the Operate pages need. The default impl forwards to src.memory.store
-    (Postgres); tests pass a seeded in-memory fake so the endpoints run DB-free, mirroring how the
-    demo API injects llm_client_factory. All methods are async (the store is asyncpg-backed)."""
+    """Async read surface for the Operate pages. Default impl: src.memory.store (Postgres).
+    Tests inject a seeded in-memory fake — no Postgres on the test path."""
 
     async def list_episodes(
         self,
@@ -58,10 +59,8 @@ class ReadStore(Protocol):
 
 
 class _StoreBackedReadStore:
-    """Default ReadStore that forwards to the module-level async functions in src.memory.store.
-
-    Imported lazily inside __init__ so merely building the demo app (which doesn't touch the store)
-    never drags asyncpg onto an import path that doesn't need it."""
+    """Forwards to src.memory.store; imported lazily to avoid dragging asyncpg onto import paths
+    that don't need it (e.g. the demo app)."""
 
     def __init__(self) -> None:
         from src.memory import store
@@ -85,36 +84,49 @@ class _StoreBackedReadStore:
 # Serializers — Episode/Turn/Escalation -> flat display DTOs (labels applied)
 # ---------------------------------------------------------------------------
 
-# Drivers the Live monitor (P1) treats as PRIMARY, always-visible, in priority order. Trust +
-# walk-away risk lead per the IA spec; everything else is secondary (the "full belief state").
-_PRIMARY_DRIVERS = ("trust", "bail_risk")
-
-# Outcome keys that mean "not finished yet" — an unset/empty outcome or an explicit in-progress one.
-# These (and any 0-turn episode) are LIVE/unfinished calls, surfaced on /api/live, never on the
-# COMPLETED Calls list (P3).
-_UNFINISHED_OUTCOMES = frozenset({None, "", "in_progress"})
-
-
-# The completed-list filter runs after the store query, so we over-fetch to still fill a page when
-# unfinished calls are interleaved newest-first. The multiple covers a heavy minority of live/0-turn
-# rows; _MAX_FETCH caps the over-fetch so a huge `limit` can't ask the store for an unbounded scan.
-_COMPLETED_OVERFETCH = 3
+_PRIMARY_DRIVERS = ("trust", "bail_risk")  # P1 Live monitor foremost signals
+_UNFINISHED_OUTCOMES = frozenset({None, "", "in_progress"})  # not-yet-terminal outcomes
+_COMPLETED_OVERFETCH = 3   # over-fetch multiplier for P3 completed-list scan
 _MAX_FETCH = 10000
 
 
 def _is_completed(ep: Episode) -> bool:
-    """A genuinely COMPLETED call for the P3 Calls list: it reached a terminal outcome AND has at
-    least one logged turn. In-progress / unset-outcome / 0-turn episodes are the live, still-running
-    (or never-started) calls — they belong on /api/live, not in the completed history."""
+    """Terminal outcome + at least one turn. Excludes active/0-turn episodes from the P3 list."""
     if ep.outcome in _UNFINISHED_OUTCOMES:
         return False
     return len(ep.turns) > 0
 
 
+def _is_active(ep: Episode, *, now: Optional[datetime] = None) -> bool:
+    """True when a call is GENUINELY live. Shared predicate for /api/live and /api/live/active so
+    they can't drift.
+
+    A live call upserts its in_progress row every turn (persistence.persist_call_live), stamping
+    metrics['live_heartbeat'] with the moment of last activity. We treat the call as active ONLY while
+    that heartbeat is fresh (within _LIVE_STALE_SECONDS). This is what separates a real call — which
+    keeps beating no matter how many turns or minutes it runs — from an abandoned / never-finalized
+    partial or an old seed row, which has NO heartbeat (or a stale one). created_at is the call START
+    and is held STABLE across upserts, so it CANNOT measure freshness (a long real call would wrongly
+    expire); the heartbeat is the only valid last-activity signal. No/garbled heartbeat => not live,
+    so legacy in_progress rows written before heartbeat tracking never masquerade as live calls."""
+    if ep.outcome not in _UNFINISHED_OUTCOMES:
+        return False
+    hb = (ep.metrics or {}).get("live_heartbeat")
+    if not hb:
+        return False
+    _now = now or datetime.now(timezone.utc)
+    try:
+        beat = datetime.fromisoformat(str(hb))
+    except (TypeError, ValueError):
+        return False
+    if beat.tzinfo is None:
+        beat = beat.replace(tzinfo=timezone.utc)
+    return (_now - beat).total_seconds() <= _LIVE_STALE_SECONDS
+
+
 def _belief_to_dict(belief: Optional[BeliefSnapshot]) -> Optional[dict[str, Any]]:
-    """Serialize a belief snapshot with display labels. Splits drivers into the prioritized primary
-    pair (trust, walk-away risk) and the rest (secondary), and surfaces stage + escalation_imminent —
-    exactly the IA the Live monitor prioritizes. Slot/driver values pass through as floats 0..1."""
+    """Serialize a belief snapshot with display labels: primary drivers (trust, bail_risk),
+    secondary drivers, slots, stage, escalation_imminent. All values 0..1 floats."""
     if belief is None:
         return None
     drivers = belief.drivers or {}
@@ -150,8 +162,7 @@ def _belief_to_dict(belief: Optional[BeliefSnapshot]) -> Optional[dict[str, Any]
 
 
 def _turn_to_dict(turn: Turn) -> dict[str, Any]:
-    """Serialize one turn for the transcript + decision trace (P1/P2). The agent's decision slug is
-    translated to a readable act label; the raw decision is NOT included in operator-facing fields."""
+    """Serialize one turn: transcript text, labeled act (agent turns), rationale, belief."""
     return {
         "turn_id": turn.turn_id,
         "speaker": turn.speaker,
@@ -171,7 +182,7 @@ def _last_belief(ep: Episode) -> Optional[BeliefSnapshot]:
 
 
 def episode_summary(ep: Episode) -> dict[str, Any]:
-    """The flat row the Calls list (P3) + Live tile read — no transcript body, all labels applied."""
+    """Flat summary row for P3/Live tile — no transcript body, all labels applied."""
     metrics = ep.metrics or {}
     return {
         "episode_id": ep.episode_id,
@@ -193,8 +204,7 @@ def episode_summary(ep: Episode) -> dict[str, Any]:
 
 
 def episode_detail(ep: Episode) -> dict[str, Any]:
-    """The full Call Review payload (P2): the summary + the per-turn transcript/decision-trace and the
-    belief trajectory (each turn's belief snapshot, in order) the scrubber replays."""
+    """Full Call Review payload (P2): summary + per-turn trace + belief trajectory."""
     detail = episode_summary(ep)
     detail["turns"] = [_turn_to_dict(t) for t in ep.turns]
     detail["belief_trajectory"] = [_belief_to_dict(t.belief) for t in ep.turns]
@@ -203,45 +213,58 @@ def episode_detail(ep: Episode) -> dict[str, Any]:
     return detail
 
 
-# A 0-turn in-progress call older than this is an ABANDONED/never-started call (e.g. a dropped dial),
-# not a live one — surfacing it would strand the monitor on a perpetual "Connecting…". Overridable.
+# 0-turn in-progress calls older than this are abandoned dials, not live. Overridable.
 _LIVE_STALE_SECONDS = float(os.environ.get("LIVE_STALE_SECONDS", "600"))
 
 
-def live_snapshot(ep: Optional[Episode], *, now: Optional[datetime] = None) -> dict[str, Any]:
-    """P1 Live monitor payload. There is no realtime infra in this build, so "live" = the most recent
-    episode; the page polls this. When the most recent call is still in progress (outcome unset /
-    'in_progress') we mark it active; otherwise we hand back the most-recent COMPLETED call and flag
-    active=False so the page can show its "no active call" affordance. A 0-turn in-progress call that
-    has gone STALE (older than _LIVE_STALE_SECONDS) is treated as no-active-call so the monitor never
-    hangs on "Connecting…" for an abandoned dial. The PRIORITIZED belief IA — trust, walk-away risk,
-    current stage + last act, escalation-imminent — is hoisted to the top."""
+def live_snapshot(
+    ep: Optional[Episode],
+    *,
+    now: Optional[datetime] = None,
+    sample: bool = False,
+) -> dict[str, Any]:
+    """P1 Live monitor payload: active flag, episode detail, hoisted priority signals.
+    `sample=True` adds the sample key so the page distinguishes a reference from a live feed."""
     if ep is None:
-        return {"active": False, "episode": None}
-    active = ep.outcome in (None, "", "in_progress")
-    if active and len(ep.turns) == 0 and ep.created_at is not None:
-        now = now or datetime.now(timezone.utc)
-        if (now - ep.created_at).total_seconds() > _LIVE_STALE_SECONDS:
-            return {"active": False, "episode": None}  # abandoned/never-started — not live
+        base: dict[str, Any] = {"active": False, "episode": None}
+        if sample:
+            base["sample"] = True
+        return base
+    active = _is_active(ep, now=now)
+    if not active and ep.outcome in _UNFINISHED_OUTCOMES:
+        # Stale 0-turn abandoned dial: treat as no-active-call.
+        base = {"active": False, "episode": None}
+        if sample:
+            base["sample"] = True
+        return base
     belief = _last_belief(ep)
     last_agent = next((t for t in reversed(ep.turns) if t.speaker == "agent"), None)
     bd = _belief_to_dict(belief)
-    return {
+    payload: dict[str, Any] = {
         "active": active,
         "episode": episode_detail(ep),
         # The four FOREMOST signals, lifted out so the client never has to dig for them.
         "priority": {
-            "trust": next((d["value"] for d in (bd or {}).get("primary_drivers", []) if d["key"] == "trust"), None),
-            "bail_risk": next((d["value"] for d in (bd or {}).get("primary_drivers", []) if d["key"] == "bail_risk"), None),
+            "trust": next(
+                (d["value"] for d in (bd or {}).get("primary_drivers", []) if d["key"] == "trust"),
+                None,
+            ),
+            "bail_risk": next(
+                (d["value"] for d in (bd or {}).get("primary_drivers", []) if d["key"] == "bail_risk"),
+                None,
+            ),
             "stage": (bd or {}).get("stage"),
             "last_act_label": labels.act_label(last_agent.decision) if last_agent else None,
             "escalation_imminent": (bd or {}).get("escalation_imminent", False),
         },
     }
+    if sample:
+        payload["sample"] = True
+    return payload
 
 
 def escalation_to_dict(esc: EscalationLog) -> dict[str, Any]:
-    """Serialize one escalation for the queue (P5), reason + lifecycle translated to labels."""
+    """P5 queue row: reason + lifecycle translated to labels."""
     return {
         "escalation_id": esc.escalation_id,
         "episode_id": esc.episode_id,
@@ -259,17 +282,14 @@ def escalation_to_dict(esc: EscalationLog) -> dict[str, Any]:
 # KPI aggregation (reuses src.loop.grading — never reimplemented)
 # ---------------------------------------------------------------------------
 
-# Outcome keys that count as a same-call enrollment for the DISTINCT enrollment-rate headline. This
-# rate is deliberately SEPARATE from the weighted-ladder score: the ladder rewards moving up ANY rung
-# (grading.kpi_score), while the enrollment rate is the share of calls that closed at full enrollment.
+# Outcomes that count as same-call enrollment for the enrollment-rate headline (distinct from
+# the weighted-ladder score — a config can lift the ladder without lifting enrollment).
 _ENROLLED_OUTCOMES = frozenset({"enrolled"})
-# Max ladder tier — used to normalize the weighted ladder mean onto a 0..MAX headline scale.
-_LADDER_MAX = 4
+_LADDER_MAX = 4  # max ladder tier for the 0..MAX headline scale
 
 
 def _enrollment_rate(episodes: Sequence[Episode]) -> float:
-    """Same-call enrollment rate = fraction of episodes whose outcome is a full enrollment. Computed
-    from Episode.outcome, NOT from ladder_tier, so it stays a distinct number from the ladder score."""
+    """Same-call enrollment rate from Episode.outcome — distinct from the ladder score."""
     if not episodes:
         return 0.0
     enrolled = sum(1 for ep in episodes if (ep.outcome or "") in _ENROLLED_OUTCOMES)
@@ -277,9 +297,7 @@ def _enrollment_rate(episodes: Sequence[Episode]) -> float:
 
 
 def _qualification_accuracy(episodes: Sequence[Episode]) -> float:
-    """Share of episodes the agent qualified correctly. Best-effort from the stored qualified flag:
-    an episode that reached a booking/enrollment outcome SHOULD be qualified; one that disqualified
-    SHOULD NOT be. Returns 1.0 for an empty set (nothing to be wrong about)."""
+    """Share of episodes qualified correctly (reached tier≥2 ↔ qualified=True). 1.0 for empty."""
     if not episodes:
         return 1.0
     correct = 0
@@ -296,21 +314,11 @@ def compute_kpis(
     *,
     compare_episodes: Optional[Sequence[Episode]] = None,
 ) -> dict[str, Any]:
-    """The P4 KPI payload for a (filtered) set of episodes.
-
-    HEADLINE (primary): the weighted commitment-ladder score (grading.kpi_score — the mean ladder
-    rung, the meaningful KPI) AND, as a DISTINCT number, the same-call enrollment_rate (share of
-    calls that closed at enrollment). Keeping them separate is the whole point of P4: a config can
-    lift the ladder without lifting enrollment, and the operator must see both.
-
-    When compare_episodes is given (the baseline arm), grading.compare_versions ranks the two on the
-    ladder KPI with bootstrap CIs and the over-claim-resistant decision rule — surfaced as `compare`.
-    Ladder-tier distribution + per-archetype conversion are derived for the secondary panels.
-    """
+    """P4 KPI payload: weighted-ladder headline + DISTINCT enrollment_rate, ladder-tier distribution,
+    per-archetype conversion. `compare_episodes` adds a baseline arm via grading.compare_versions."""
     ladder_score = grading.kpi_score(episodes)
     enrollment_rate = _enrollment_rate(episodes)
 
-    # Ladder-tier distribution (share of calls at each rung), labeled.
     dist_counts: dict[int, int] = {}
     for ep in episodes:
         dist_counts[int(ep.ladder_tier)] = dist_counts.get(int(ep.ladder_tier), 0) + 1
@@ -325,7 +333,6 @@ def compute_kpis(
         for tier in sorted(set(list(dist_counts.keys()) + list(range(_LADDER_MAX + 1))), reverse=True)
     ]
 
-    # Per-archetype (persona) conversion = enrollment rate within each persona group.
     by_persona: dict[str, list[Episode]] = {}
     for ep in episodes:
         by_persona.setdefault(ep.persona or "Unknown", []).append(ep)
@@ -336,7 +343,6 @@ def compute_kpis(
 
     payload: dict[str, Any] = {
         "n": len(episodes),
-        # The two DISTINCT headline numbers, each on its own scale.
         "weighted_ladder_score": round(ladder_score, 3),
         "ladder_max": _LADDER_MAX,
         "enrollment_rate": round(enrollment_rate, 4),
@@ -370,9 +376,9 @@ def compute_kpis(
 
 
 def create_operate_router(read_store: Optional[ReadStore] = None) -> APIRouter:
-    """Build the /api Operate read router. `read_store` is injectable: defaults to the Postgres-backed
-    store, tests pass a seeded in-memory fake. All endpoints are async, return JSON the Next.js client
-    types against, and guard empty data gracefully (empty list / null episode, never a 500)."""
+    """Build the /api Operate read router. `read_store` is injectable (defaults to the Postgres
+    store; tests pass a seeded in-memory fake). All endpoints are async, return labeled JSON, and
+    guard empty data gracefully (empty list / null episode, never a 500)."""
     rs: ReadStore = read_store if read_store is not None else _StoreBackedReadStore()
     router = APIRouter()
 
@@ -384,17 +390,9 @@ def create_operate_router(read_store: Optional[ReadStore] = None) -> APIRouter:
         escalated: Optional[bool] = None,
         limit: int = 200,
     ) -> dict[str, Any]:
-        """P3 Calls list — the COMPLETED-calls history. Filters (version / cohort / outcome /
-        escalated) AND together; returns summary rows newest-first. `outcome` is the raw outcome key
-        (the UI maps its labeled filter back to the key before calling).
-
-        Honest contract: still-in-progress / unset-outcome / 0-turn episodes are LIVE/unfinished
-        calls and are EXCLUDED here (they belong on /api/live), so an active call never leaks in as
-        the top row of the completed list. The filter runs AFTER the store query (store.py owns the
-        SQL and isn't ours to change), so we over-fetch a bounded multiple of `limit` first and then
-        trim back to `limit` — this keeps a full page of completed rows even when unfinished calls
-        are interleaved newest-first. An explicit unfinished `outcome` filter therefore yields an
-        empty completed list (correct: those calls aren't completed)."""
+        """P3 Calls list — COMPLETED-calls history; active/0-turn calls excluded. Filters AND
+        together; over-fetches then trims so completed rows fill the page even with interleaved
+        active calls. An in-progress `outcome` filter yields an empty completed list (correct)."""
         fetch_limit = min(limit * _COMPLETED_OVERFETCH, _MAX_FETCH)
         eps = await rs.list_episodes(
             version=version, cohort=cohort, outcome=outcome, escalated=escalated, limit=fetch_limit
@@ -416,9 +414,7 @@ def create_operate_router(read_store: Optional[ReadStore] = None) -> APIRouter:
         cohort: Optional[str] = None,
         compare_version: Optional[str] = None,
     ) -> dict[str, Any]:
-        """P4 KPI views. Aggregates the version/cohort-filtered episodes into the weighted-ladder
-        headline AND the DISTINCT enrollment rate. `compare_version` adds a baseline arm ranked via
-        grading.compare_versions. Empty data yields zeroed KPIs, never an error."""
+        """P4 KPI views: ladder headline + distinct enrollment rate; optional compare arm."""
         eps = await rs.list_episodes(version=version, cohort=cohort, limit=10000)
         compare_eps: Optional[list[Episode]] = None
         if compare_version is not None:
@@ -433,8 +429,7 @@ def create_operate_router(read_store: Optional[ReadStore] = None) -> APIRouter:
     async def escalations_ep(
         lifecycle: Optional[str] = None, limit: int = 100
     ) -> dict[str, Any]:
-        """P5 Escalation queue. Lists by lifecycle (unreviewed / reviewed / resolved); also returns
-        per-lifecycle counts so the segmented control shows badges. Empty -> empty list + zero counts."""
+        """P5 Escalation queue: list by lifecycle with per-state badge counts."""
         rows = await rs.list_escalations(lifecycle=lifecycle, limit=limit)
         all_rows = await rs.list_escalations(lifecycle=None, limit=10000)
         counts = {"unreviewed": 0, "reviewed": 0, "resolved": 0, "dismissed": 0}
@@ -448,8 +443,7 @@ def create_operate_router(read_store: Optional[ReadStore] = None) -> APIRouter:
 
     @router.post("/api/escalations/{escalation_id}/lifecycle")
     async def update_escalation_ep(escalation_id: str, req: _LifecycleUpdate) -> dict[str, Any]:
-        """P5 triage WRITE: advance one escalation's lifecycle (reviewed / resolved / dismissed) so the
-        operator can work the queue. 400 on an unknown lifecycle, 404 when the id doesn't exist."""
+        """P5 triage WRITE: advance lifecycle state. 400 invalid, 404 unknown id."""
         try:
             ok = await rs.update_escalation_lifecycle(escalation_id, req.lifecycle)
         except ValueError as exc:
@@ -458,11 +452,63 @@ def create_operate_router(read_store: Optional[ReadStore] = None) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"unknown escalation {escalation_id!r}")
         return {"escalation_id": escalation_id, "lifecycle": req.lifecycle}
 
+    _ACTIVE_FETCH_LIMIT = 50  # bounded scan for active/sample sub-routes
+
+    @router.get("/api/live/active")
+    async def live_active_ep() -> dict[str, Any]:
+        """All non-stale active calls, newest-first. Humanized row fields; no raw slugs."""
+        now = datetime.now(timezone.utc)
+        eps = await rs.list_episodes(limit=_ACTIVE_FETCH_LIMIT)
+        active_eps = [e for e in eps if _is_active(e, now=now)]
+        calls = []
+        for ep in active_eps:
+            belief = _last_belief(ep)
+            bd = _belief_to_dict(belief)
+            trust_val = next(
+                (d["value"] for d in (bd or {}).get("primary_drivers", []) if d["key"] == "trust"),
+                None,
+            )
+            bail_val = next(
+                (d["value"] for d in (bd or {}).get("primary_drivers", []) if d["key"] == "bail_risk"),
+                None,
+            )
+            calls.append({
+                "episode_id": ep.episode_id,
+                "channel": ep.channel,
+                # Humanize persona via labels — never emit a raw cohort/version slug or persona key.
+                "persona_label": labels._titleize(ep.persona) if ep.persona else None,
+                "stage": (bd or {}).get("stage") if bd else None,
+                "trust": trust_val,
+                "bail_risk": bail_val,
+                "turn_count": len(ep.turns),
+                "escalation_imminent": bool((bd or {}).get("escalation_imminent", False)) if bd else False,
+                "started_at": ep.created_at.isoformat() if ep.created_at else None,
+            })
+        return {"count": len(calls), "calls": calls}
+
+    @router.get("/api/live/sample")
+    async def live_sample_ep() -> dict[str, Any]:
+        """Newest completed episode with sample:true (page's 'Show sample call' toggle)."""
+        eps = await rs.list_episodes(limit=_ACTIVE_FETCH_LIMIT)
+        completed = [e for e in eps if _is_completed(e)]
+        newest_completed = completed[0] if completed else None
+        return live_snapshot(newest_completed, sample=True)
+
     @router.get("/api/live")
-    async def live_ep() -> dict[str, Any]:
-        """P1 Live monitor. No realtime infra here: returns the most-recent call as the "live" call
-        (active=True only if it's still in progress) with the prioritized belief IA hoisted up."""
-        eps = await rs.list_episodes(limit=1)
-        return live_snapshot(eps[0] if eps else None)
+    async def live_ep(episode_id: Optional[str] = None) -> dict[str, Any]:
+        """P1 Live monitor. No params: newest active call or null (never a completed fallback).
+        ?episode_id=<id>: snapshot for that specific episode; 404 if unknown."""
+        if episode_id is not None:
+            ep = await rs.get_episode(episode_id)
+            if ep is None:
+                raise HTTPException(status_code=404, detail=f"unknown episode {episode_id!r}")
+            return live_snapshot(ep)
+        # Find the newest active non-stale call from a bounded page of recent episodes.
+        now = datetime.now(timezone.utc)
+        eps = await rs.list_episodes(limit=_ACTIVE_FETCH_LIMIT)
+        for ep in eps:  # already newest-first
+            if _is_active(ep, now=now):
+                return live_snapshot(ep, now=now)
+        return {"active": False, "episode": None}
 
     return router

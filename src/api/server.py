@@ -7,12 +7,13 @@
 #   - the Improve router (src.api.improve): experiments/approvals/kb/playbook/versions — GATED behind
 #     require_operator (a write surface) at the include site, never inside the router.
 # Everything network/DB-bound is INJECTABLE (llm_client_factory, embedder, retrieve/hydrate/escalation/
-# call-end hooks, read_store/improve_store, token_builder) so tests run offline. LIVE GROUNDING (U5):
-# by default create_app builds a real embedder + a kb.live retrieve hook so /api/chat grounds in the
-# ingested KB; tests pass live_rag=False (or a FakeEmbedder + stub hook) to stay DB-free. LIVE
-# PERSISTENCE (U2/U14/U15): a finished call persists its Episode + escalations + per-lead memory at
-# /end so /demo calls flow into /operate. SECURITY/OPS: require_operator guards write endpoints
-# (env OPERATOR_TOKEN; unset -> ALLOW with a warning for local demo); CORS reads ALLOWED_ORIGINS (never
+# call-end/live-upsert hooks, read_store/improve_store, token_builder) so tests run offline. LIVE
+# GROUNDING (U5): by default create_app builds a real embedder + a kb.live retrieve hook so /api/chat
+# grounds in the ingested KB; tests pass live_rag=False (or a FakeEmbedder + stub hook) to stay
+# DB-free. LIVE PERSISTENCE (U2/U14/U15/Layer2): a finished call persists its Episode + escalations +
+# per-lead memory at /end; live_upsert_hook upserts an in_progress Episode after each turn so the Live
+# monitor can query calls mid-call. SECURITY/OPS: require_operator guards write endpoints (env
+# OPERATOR_TOKEN; unset -> ALLOW with a warning for local demo); CORS reads ALLOWED_ORIGINS (never
 # wildcard + credentials together); a lifespan warms the embedder when live_rag and closes the DB pool
 # on shutdown. PII is scrubbed before any transcript is stored; the lead key is the phone-hash.
 from __future__ import annotations
@@ -31,6 +32,7 @@ from src.api.demo_routes import (
     HydrateHook,
     LeadVoiceLookup,
     LLMClientFactory,
+    LiveUpsertHook,
     TokenBuilder,
     create_demo_router,
 )
@@ -101,6 +103,7 @@ def create_app(
     hydrate_hook: Optional[HydrateHook] = None,
     escalation_persist_hook: Optional[EscalationPersistHook] = None,
     call_end_persist_hook: Optional[CallEndPersistHook] = None,
+    live_upsert_hook: Optional[LiveUpsertHook] = None,
 ) -> FastAPI:
     """Assemble the demo + operator API app. Everything network/DB-bound is injectable so tests run
     offline.
@@ -113,10 +116,12 @@ def create_app(
     returning caller's stored sticky voice (U6). LIVE PERSISTENCE: hydrate_hook seeds a returning
     caller's slots at consent-start (default: src.memory.hydrate.hydrate_belief); escalation_persist_hook
     writes an `escalate` to the review queue (default: store.save_escalation); call_end_persist_hook saves
-    the Episode + escalations + lead at /end (default: src.api.persistence.persist_call_end). read_store /
-    improve_store are the dashboard READ layers (default Postgres; tests fake them). experiment_runner is
-    the Improve A/B (POST /api/experiments/run) self-play seam — tests inject a deterministic runner;
-    prod leaves it None so a run does REAL self-play with the injected LLM client (which SPENDS credit).
+    the Episode + escalations + lead at /end (default: src.api.persistence.persist_call_end);
+    live_upsert_hook upserts an in_progress Episode after each /api/chat turn so the Live monitor can
+    query calls mid-call (default: src.api.persistence.persist_call_live). read_store / improve_store are
+    the dashboard READ layers (default Postgres; tests fake them). experiment_runner is the Improve A/B
+    (POST /api/experiments/run) self-play seam — tests inject a deterministic runner; prod leaves it None
+    so a run does REAL self-play with the injected LLM client (which SPENDS credit).
     """
     cfg = config or load_config("champion_v0")
     # Embedder: a REAL SentenceTransformerEmbedder by default (lazy model load on first embed), unless
@@ -138,6 +143,23 @@ def create_app(
 
         active_retrieve_hook = build_live_retrieve_hook(emb, kb_version=cfg.kb_version)
     build_token = token_builder or _build_livekit_token
+
+    # Default live_upsert_hook: the real persist_call_live (lazy import keeps DB off the test path).
+    # Tests inject a no-op or capture hook; prod gets this default which upserts in_progress Episodes
+    # so the Live monitor can query calls mid-call. Only wired when no explicit hook is provided.
+    if live_upsert_hook is None and live_rag:
+        from src.api.persistence import persist_call_live
+
+        async def _default_live_upsert(session: Any, **kw: Any) -> Any:
+            return await persist_call_live(
+                session,
+                config=kw["config"],
+                channel=kw["channel"],
+                created_at=kw["created_at"],
+                episode_id=kw["episode_id"],
+            )
+
+        live_upsert_hook = _default_live_upsert
 
     def _make_llm() -> LLMClient:
         if llm_client_factory is not None:
@@ -194,6 +216,7 @@ def create_app(
             hydrate_hook=hydrate_hook,
             escalation_persist_hook=escalation_persist_hook,
             call_end_persist_hook=call_end_persist_hook,
+            live_upsert_hook=live_upsert_hook,
         )
     )
 

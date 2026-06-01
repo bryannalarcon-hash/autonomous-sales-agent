@@ -5,15 +5,19 @@
 # detect_minor run on available signals so a suspected minor is gated INDEPENDENT of a client
 # is_minor flag, R40); /api/chat (GATED 409 by consent) runs one brain turn via VoiceSession — it
 # detect_minors the user text first (a self-reported minor flips need_parental -> 409), buffers/persists
-# an escalation with a PII-scrubbed moment, and reports `done` for terminal acts; /api/livekit/token
-# (503 without creds) mints a token via the injected builder AND stamps the already-captured consent
-# onto the room metadata (consent_state/recording_granted/jurisdiction/phone_hash/conversable — no
-# secrets) so the live voice worker SEEDS its ConsentGate from it instead of deadlocking on a pending
-# gate waiting for spoken consent; /api/session/{id}/end persists the
-# Episode (+escalations+lead) FK-safely and EVICTS the session from the bounded LRU store (503 over
-# cap); GET /api/session/{id} + /api/health are introspection. Everything network/DB-bound is injected
-# from create_app (LLM factory, embedder, retrieve/hydrate/escalation/call-end hooks, token builder) so
-# tests run offline. PII is scrubbed in the VoiceSession before storage; the lead key is the phone-hash.
+# an escalation with a PII-scrubbed moment, and reports `done` for terminal acts; LIVE PERSISTENCE
+# (Layer 2): after each /api/chat turn the live_upsert_hook (default: persist_call_live) upserts an
+# in_progress Episode using a stable episode_id + created_at stamped at session creation, so the Live
+# monitor can query the call WHILE it is happening; /api/livekit/token (503 without creds) mints a
+# token via the injected builder AND stamps the already-captured consent onto the room metadata
+# (consent_state/recording_granted/jurisdiction/phone_hash/conversable — no secrets) so the live
+# voice worker SEEDS its ConsentGate from it instead of deadlocking on a pending gate waiting for
+# spoken consent; /api/session/{id}/end persists the Episode (+escalations+lead) FK-safely (using
+# the same episode_id so the final save upserts the in_progress row) and EVICTS the session from
+# the bounded LRU store (503 over cap); GET /api/session/{id} + /api/health are introspection.
+# Everything network/DB-bound is injected from create_app (LLM factory, embedder,
+# retrieve/hydrate/escalation/call-end/live-upsert hooks, token builder) so tests run offline. PII
+# is scrubbed in the VoiceSession before storage; the lead key is the phone-hash.
 from __future__ import annotations
 
 import json
@@ -21,6 +25,7 @@ import os
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -48,6 +53,11 @@ HydrateHook = Callable[..., Awaitable[Any]]
 EscalationPersistHook = Callable[..., Awaitable[Any]]
 # Optional call-end persist: builds + saves the Episode (+ escalations + lead) from a finished session.
 CallEndPersistHook = Callable[..., Awaitable[Any]]
+# Optional live upsert: called after each /api/chat turn to upsert an in_progress Episode so the
+# Live monitor can query calls mid-call. Receives the same kwargs shape as call_end_persist_hook
+# plus the stable episode_id and created_at (both stamped once at session creation). Default:
+# src.api.persistence.persist_call_live. Injecting a no-op or a capture keeps tests DB-free.
+LiveUpsertHook = Callable[..., Awaitable[Any]]
 
 # Hard cap on concurrently-tracked demo sessions. The store is a bounded LRU (OrderedDict): a /end
 # evicts its session, and a fresh /consent/start over the cap is refused with 503 rather than letting
@@ -126,8 +136,10 @@ class EndResponse(BaseModel):
 @dataclass
 class _Session:
     """One in-memory demo session: the consent gate, the brain session (built lazily once consent
-    permits conversation), the caller's phone-hash + assigned sticky voice, the channel, and the
-    escalation logs captured during the call (re-pointed onto the episode + persisted at call end)."""
+    permits conversation), the caller's phone-hash + assigned sticky voice, the channel, the
+    escalation logs captured during the call (re-pointed onto the episode + persisted at call end),
+    and the stable live-persistence identifiers (episode_id + created_at stamped once at session
+    creation so every in_progress upsert AND the final /end upsert land on the same DB row)."""
 
     session_id: str
     gate: ConsentGate
@@ -142,6 +154,10 @@ class _Session:
     hydrated_belief: Optional[Any] = None
     escalations: list[Any] = field(default_factory=list)
     _speech_counter: int = field(default=0)
+    # Stable live-persistence identifiers: stamped ONCE at session creation and reused on every
+    # in_progress upsert AND the final /end persist so both paths target the same episode row.
+    live_episode_id: str = field(default_factory=lambda: f"ep-{uuid.uuid4().hex}")
+    live_created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 _OK_STATE_MESSAGES = {
@@ -186,14 +202,17 @@ def create_demo_router(
     hydrate_hook: Optional[HydrateHook] = None,
     escalation_persist_hook: Optional[EscalationPersistHook] = None,
     call_end_persist_hook: Optional[CallEndPersistHook] = None,
+    live_upsert_hook: Optional[LiveUpsertHook] = None,
 ) -> APIRouter:
     """Build the /demo APIRouter with its own bounded in-memory session store.
 
     All network/DB seams are injected by create_app: make_llm builds a fresh LLMClient per session;
     active_retrieve_hook grounds /api/chat against the KB; hydrate_hook seeds a returning caller's slots
     at consent-start; escalation_persist_hook writes an `escalate` to the review queue;
-    call_end_persist_hook saves the Episode at /end (defaults to persist_call_end). The router owns a
-    bounded LRU `sessions` dict — /end evicts its session and a start over MAX_DEMO_SESSIONS returns 503.
+    call_end_persist_hook saves the Episode at /end (defaults to persist_call_end);
+    live_upsert_hook upserts an in_progress Episode after each /api/chat turn (defaults to
+    persist_call_live) so the Live monitor can query calls mid-call. The router owns a bounded LRU
+    `sessions` dict — /end evicts its session and a start over MAX_DEMO_SESSIONS returns 503.
     """
     router = APIRouter()
     sessions: "OrderedDict[str, _Session]" = OrderedDict()
@@ -273,6 +292,27 @@ def create_demo_router(
         that does not exist yet, so the write is deferred to call end (persist_call_end saves the
         episode first, then re-points + writes the buffered escalations)."""
         return None
+
+    async def _live_upsert(sess: "_Session") -> None:
+        """Upsert an in_progress Episode after each successful turn (Layer 2 live persistence).
+
+        Uses the session's stable live_episode_id + live_created_at so every upsert lands on the
+        same row. The final /end persist uses the same episode_id so it finalizes that same row.
+        Only fires when live_upsert_hook is set (mirrors the escalation_persist_hook pattern —
+        tests inject a capture hook; prod create_app wires persist_call_live). Skips silently when
+        no hook is provided so /api/chat stays DB-free when not opted in. Failures are swallowed."""
+        if sess.voice_session is None or live_upsert_hook is None:
+            return
+        try:
+            await live_upsert_hook(
+                sess.voice_session,
+                config=cfg,
+                channel=sess.channel,
+                episode_id=sess.live_episode_id,
+                created_at=sess.live_created_at,
+            )
+        except Exception:
+            pass  # swallow — persist_call_live already logs; never crash the call path
 
     # --- POST /api/consent/start ----------------------------------------------------------------
 
@@ -401,6 +441,11 @@ def create_demo_router(
         if committed is not None and committed.decision.act == "attempt_close":
             sess.last_close_tier = committed.decision.tier
 
+        # Live in-progress upsert (Layer 2): after each committed turn, upsert the in_progress
+        # Episode so the Live monitor can query this call while it is happening. The stable
+        # live_episode_id ensures all upserts + the final /end persist target the same row.
+        await _live_upsert(sess)
+
         done = pending.decision.act in ("disqualify", "escalate") or (
             pending.decision.act == "attempt_close" and pending.decision.tier == "enrollment"
         )
@@ -470,7 +515,8 @@ def create_demo_router(
             return result
         # Persist the episode BEFORE ending the gate: session.recorded reads the gate's can_record,
         # which flips False once ENDED — so metrics["recorded"] must be captured while the gate still
-        # reflects the call's recording status.
+        # reflects the call's recording status. Pass live_episode_id so the final save UPSERTS the
+        # same row as all the in_progress live upserts (no duplicate, no orphan in_progress row).
         if call_end_persist_hook is not None:
             episode = await call_end_persist_hook(
                 sess.voice_session,
@@ -480,6 +526,7 @@ def create_demo_router(
                 raw_phone=raw_phone,
                 escalation_logs=list(sess.escalations),
                 last_tier=sess.last_close_tier,
+                episode_id=sess.live_episode_id,
             )
         else:
             from src.api.persistence import persist_call_end
@@ -492,6 +539,7 @@ def create_demo_router(
                 raw_phone=raw_phone,
                 escalation_logs=list(sess.escalations),
                 last_tier=sess.last_close_tier,
+                episode_id=sess.live_episode_id,
             )
         # Now end the gate (recorded already captured into the episode metrics above).
         sess.gate.end()

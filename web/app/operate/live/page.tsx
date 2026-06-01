@@ -1,25 +1,21 @@
-// P1 — Live Call Monitor (U15). Watches the live (or most-recent) call and, per the IA spec,
-// PRIORITIZES the belief-state signals: Trust + Walk-away risk + current stage/last act +
-// escalation-imminent are FOREMOST (the two gauges, the stage box, the amber escalation strip, and
-// the current-decision card sit at the top of the belief column); the full slot table + latent
-// drivers are the secondary "Full belief state" expander below. No realtime infra — it polls
-// /api/live every few seconds and shows the most-recent call, with a clear "no active call" empty
-// state AND a "Connecting…" state for an active call that has no turns yet (so a just-started call
-// never renders as a wall of dashes). Belief/stage/act labels are pre-translated by the backend; the
-// raw persona archetype + version slugs are humanized client-side via @/lib/labels (archetypeLabel/
-// versionLabel) and the raw cohort id (`coh-…`) is dropped — no internal index reaches the operator.
-// N3 FIX: every "LIVE" affordance (transcript-card pill, footer
-// recording dot, and the shell top-title pill the layout renders statically) is now gated on the
-// REAL snap.active flag — when a COMPLETED call is shown (active:false) the surface reads "Most
-// recent call" with no live/recording treatment, instead of contradicting the not-live footer.
+// P1 — Live Call Monitor (U15/U16). Polls /api/live/active every 5 s to maintain a QUEUE of
+// in-progress calls. When ≥1 real call is active: renders a queue rail (newest-first) that lets
+// the operator switch which call the detailed monitor shows; the detail snapshot is fetched via
+// /api/live?episode_id=<selected>. When no calls are active: shows the "No active call" empty
+// state with a "Show sample call" toggle; toggling ON fetches /api/live/sample and renders the
+// monitor with a SAMPLE badge (no LIVE pill, no recording dot — cannot be mistaken for a real
+// call). Preserves the "Connecting…" state for a live 0-turn call. Belief/stage/act labels are
+// pre-translated by the backend; raw persona slug is humanized via @/lib/labels (archetypeLabel).
+// N3 invariant: LIVE pill + recording dot are ONLY shown when snap.active is true AND snap.sample
+// is NOT true. Internal episode IDs never render as primary labels; persona_label is used.
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
-import { fetchLive, fmtDuration, initials } from '@/lib/operate-api';
+import { fetchActiveCalls, fetchLive, fetchSampleCall, fmtDuration, initials } from '@/lib/operate-api';
 import { archetypeLabel, versionLabel } from '@/lib/labels';
-import type { BeliefSnapshot, LiveSnapshot, Turn } from '@/lib/operate-types';
+import type { ActiveCallSummary, ActiveCallsResponse, BeliefSnapshot, LiveSnapshot, Turn } from '@/lib/operate-types';
 
 const POLL_MS = 5000;
 
@@ -60,7 +56,7 @@ function TranscriptTurn({ turn }: { turn: Turn }) {
           {latency ? <span className="lv-lat">{latency}</span> : null}
         </div>
       ) : null}
-      {isAgent && turn.rationale ? <div className="lv-rat">{`“${turn.rationale}”`}</div> : null}
+      {isAgent && turn.rationale ? <div className="lv-rat">{`"${turn.rationale}"`}</div> : null}
     </div>
   );
 }
@@ -172,100 +168,75 @@ function BeliefColumn({ belief, escalationImminent }: { belief: BeliefSnapshot |
   );
 }
 
-export default function LivePage() {
-  const router = useRouter();
-  const [snap, setSnap] = useState<LiveSnapshot | null>(null);
-  const [error, setError] = useState<string | null>(null);
+/** Risk indicator bar shown in the queue rail — dual trust/bail-risk mini-bars. */
+function QueueRiskBar({ trust, bailRisk }: { trust: number | null; bailRisk: number | null }) {
+  const t = trust ?? 0;
+  const b = bailRisk ?? 0;
+  return (
+    <div className="lv-qrisk" title={`Trust ${fmtPct(trust)} · Walk-away ${fmtPct(bailRisk)}`}>
+      <span className="bar" style={{ flex: 1 }}>
+        <i style={{ width: `${Math.round(t * 100)}%`, background: 'var(--ok)' }} />
+      </span>
+      <span className="bar" style={{ flex: 1 }}>
+        <i style={{ width: `${Math.round(b * 100)}%`, background: 'var(--warn)' }} />
+      </span>
+    </div>
+  );
+}
 
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const s = await fetchLive();
-        if (!cancelled) {
-          setSnap(s);
-          setError(null);
-        }
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load the live call.');
-      }
-    };
-    void load();
-    const id = setInterval(load, POLL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, []);
-
-  // The shared shell (DashboardShell) renders a STATIC "LIVE" pill in the top-title for this route,
-  // independent of whether a call is actually on the line — which contradicts the not-live footer
-  // when a COMPLETED call is shown. The shell keys the pill off static nav config (not our snapshot),
-  // so we reconcile it here from the page that owns the real signal: hide the title pill whenever
-  // we're not genuinely active, and restore it (and the shell on unmount) otherwise. Toggling
-  // visibility is layout-preserving and reversible; we never remove the node.
-  const titleActive = snap?.active === true;
-  useEffect(() => {
-    const pill = document.querySelector<HTMLElement>('.top-title .live-pill');
-    if (pill) pill.style.display = titleActive ? '' : 'none';
-    return () => {
-      // Leaving the page: restore the shell's pill to its default so other routes are unaffected.
-      const p = document.querySelector<HTMLElement>('.top-title .live-pill');
-      if (p) p.style.display = '';
-    };
-  }, [titleActive]);
-
-  if (error && !snap) {
-    return (
-      <div className="page">
-        <div className="empty" style={{ margin: 'auto' }}>
-          <div className="ico">
-            <Icon name="broadcast" size={28} />
-          </div>
-          <h3>Can&apos;t reach the call feed</h3>
-          <p>{error}</p>
+/** One row in the active-calls queue rail. */
+function QueueEntry({
+  call,
+  selected,
+  onSelect,
+}: {
+  call: ActiveCallSummary;
+  selected: boolean;
+  onSelect: (id: string) => void;
+}) {
+  const label = call.persona_label ?? 'Caller';
+  const stage = call.stage ?? '—';
+  return (
+    <button
+      className={`lv-qrow${selected ? ' sel' : ''}`}
+      onClick={() => onSelect(call.episode_id)}
+      title={`Switch to this call (${label})`}
+    >
+      <div className="lv-qleft">
+        <div className="lv-qav">{initials(label)}</div>
+        <div className="lv-qmeta">
+          <div className="lv-qlabel">{label}</div>
+          <div className="lv-qstage">{stage}</div>
         </div>
       </div>
-    );
-  }
-
-  if (!snap || !snap.episode) {
-    return (
-      <div className="page">
-        <div className="empty" style={{ margin: 'auto' }}>
-          <div className="ico">
-            <Icon name="broadcast" size={28} />
-          </div>
-          <h3>No active call</h3>
-          <p>Nothing is on the line right now. The monitor will light up the moment a call starts.</p>
-        </div>
+      <div className="lv-qright">
+        <QueueRiskBar trust={call.trust} bailRisk={call.bail_risk} />
+        <div className="lv-qturns">{call.turn_count}t</div>
+        {/* Pulsing LIVE dot — always shown in the queue since all entries are active calls */}
+        <span className="live-dot" />
+        {call.escalation_imminent ? (
+          <Icon name="alert" size={13} style={{ color: 'var(--warn-strong)', flexShrink: 0 }} />
+        ) : null}
       </div>
-    );
-  }
+    </button>
+  );
+}
 
-  // A live call that hasn't produced a turn yet is CONNECTING — show a clean connecting state
-  // instead of the full monitor rendered as a wall of "—" (no transcript, no belief yet).
-  if (snap.active && snap.episode.turns.length === 0) {
-    return (
-      <div className="page">
-        <div className="empty" style={{ margin: 'auto' }}>
-          <div className="ico">
-            <span className="live-pill">
-              <i />
-              LIVE
-            </span>
-          </div>
-          <h3>Connecting…</h3>
-          <p>A call just started. The transcript and belief state will appear here the moment the first turn lands.</p>
-        </div>
-      </div>
-    );
-  }
-
-  const ep = snap.episode;
+/** The detailed call monitor (transcript + belief column). Shared between real-live and sample. */
+function CallMonitor({
+  snap,
+  onOpenReview,
+}: {
+  snap: LiveSnapshot;
+  onOpenReview: (id: string) => void;
+}) {
+  const ep = snap.episode!;
   const lastBelief = [...ep.turns].reverse().find((t) => t.belief)?.belief ?? null;
   const escalationImminent = snap.priority?.escalation_imminent ?? lastBelief?.escalation_imminent ?? false;
   const lastAct = snap.priority?.last_act_label ?? null;
+  // "Genuinely live" — active AND not a sample preview. Controls all LIVE affordances (pill, dot).
+  const isLive = snap.active === true && snap.sample !== true;
+  const isSample = snap.sample === true;
 
   return (
     <div className="lv">
@@ -278,10 +249,16 @@ export default function LivePage() {
               <div className="lv-pname">{ep.episode_id}</div>
               <div className="lv-pco">{ep.channel === 'voice' ? 'Web-voice' : 'Text'}</div>
               <div className="row gap6" style={{ marginTop: 8 }}>
-                {/* Humanize the persona archetype; the raw cohort id (`coh-…`) is an internal grouping
-                    index with no human label, so it's dropped from the operator-facing chips. */}
+                {/* Humanize the persona archetype; the raw cohort id (`coh-…`) is an internal
+                    grouping index with no human label, so it's dropped from operator-facing chips. */}
                 {ep.persona ? <span className="tag accent">{archetypeLabel(ep.persona)}</span> : null}
                 <span className="tag">{ep.channel === 'voice' ? 'Web-voice' : 'Text'}</span>
+                {/* SAMPLE badge — rendered when this is a preview call, never an episode id */}
+                {isSample ? (
+                  <span className="tag warn" style={{ fontWeight: 700, letterSpacing: '0.04em' }}>
+                    SAMPLE
+                  </span>
+                ) : null}
               </div>
             </div>
             <div className="lv-pright">
@@ -295,12 +272,16 @@ export default function LivePage() {
           <div className="card lv-tcard">
             <div className="card-head">
               <h3>Transcript</h3>
-              {/* LIVE pill ONLY when the call is genuinely on the line; otherwise a neutral
-                  "Most recent call" tag so a COMPLETED call never wears a live treatment (N3). */}
-              {snap.active ? (
+              {/* LIVE pill ONLY when genuinely on the line; SAMPLE tag when preview; neutral tag
+                  when showing a completed call — never contradicts the footer (N3). */}
+              {isLive ? (
                 <span className="live-pill" style={{ marginLeft: 10 }}>
                   <i />
                   LIVE
+                </span>
+              ) : isSample ? (
+                <span className="tag warn" style={{ marginLeft: 10, fontWeight: 700, letterSpacing: '0.04em' }}>
+                  SAMPLE
                 </span>
               ) : (
                 <span className="tag" style={{ marginLeft: 10 }}>
@@ -321,7 +302,7 @@ export default function LivePage() {
               {ep.turns.map((t) => (
                 <TranscriptTurn key={t.turn_id} turn={t} />
               ))}
-              {snap.active ? (
+              {isLive ? (
                 <div className="lv-turn a">
                   <div className="lv-th">
                     Alex (agent)<span>·</span>now
@@ -347,26 +328,29 @@ export default function LivePage() {
       {/* ACTION BAR */}
       <div className="lv-actions">
         <span className="lv-rec">
-          {/* Pulsing red recording dot ONLY while active; a static neutral dot when showing a
-              completed call, so the footer dot doesn't read as "recording now" off-air (N3). */}
+          {/* Pulsing red recording dot ONLY while genuinely active (not sample); static neutral dot
+              otherwise, so the footer never reads "recording now" when it isn't (N3). */}
           <span
             className="rd"
-            style={snap.active ? undefined : { background: 'var(--text-3)', animation: 'none' }}
+            style={isLive ? undefined : { background: 'var(--text-3)', animation: 'none' }}
           />
-          {snap.active ? `Recording · Turn ${ep.turn_count}` : 'Most recent call (not live)'}
+          {isLive
+            ? `Recording · Turn ${ep.turn_count}`
+            : isSample
+              ? 'Sample call (not live)'
+              : 'Most recent call (not live)'}
         </span>
         <div className="lv-tl">
           <span style={{ fontSize: 11, fontWeight: 650, color: 'var(--text-3)' }}>Last act</span>
           <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-2)' }}>{lastAct ?? '—'}</span>
         </div>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
-          <button className="btn btn-ghost" onClick={() => router.push(`/operate/review/${ep.episode_id}`)}>
+          <button className="btn btn-ghost" onClick={() => onOpenReview(ep.episode_id)}>
             <Icon name="eye" size={16} />
             Open review
           </button>
           {/* Operator live-takeover (barging into the live LiveKit room as a human) isn't wired in
-              this build, so the control is honestly disabled rather than a click-that-does-nothing —
-              the monitor is observe-only; interact via /demo or the phone. */}
+              this build, so the control is honestly disabled rather than a click-that-does-nothing. */}
           <button
             className="btn btn-primary btn-lg"
             disabled
@@ -376,6 +360,290 @@ export default function LivePage() {
             Take over
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+export default function LivePage() {
+  const router = useRouter();
+  // Queue state: full list from /api/live/active
+  const [activeCalls, setActiveCalls] = useState<ActiveCallsResponse | null>(null);
+  // The episode the operator has selected to watch in detail; defaults to calls[0].episode_id
+  const [selectedEpisodeId, setSelectedEpisodeId] = useState<string | null>(null);
+  // The detailed snapshot for the selected call (or empty-state / sample)
+  const [snap, setSnap] = useState<LiveSnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // Sample toggle state — only active when no real calls
+  const [showSample, setShowSample] = useState(false);
+  const [sampleSnap, setSampleSnap] = useState<LiveSnapshot | null>(null);
+  const [sampleLoading, setSampleLoading] = useState(false);
+
+  // Keep a ref so the detail-polling interval always sees the current selectedEpisodeId
+  const selectedRef = useRef<string | null>(null);
+  selectedRef.current = selectedEpisodeId;
+
+  // Load the sample snapshot when toggle is turned on
+  const loadSample = useCallback(async () => {
+    if (sampleSnap) return; // already loaded
+    setSampleLoading(true);
+    try {
+      const s = await fetchSampleCall();
+      setSampleSnap(s);
+    } catch {
+      // /api/live/sample not available yet (404) or transient error — swallow; the toggle will
+      // leave the empty state in place which is safe.
+    } finally {
+      setSampleLoading(false);
+    }
+  }, [sampleSnap]);
+
+  const handleToggleSample = useCallback(() => {
+    setShowSample((prev) => {
+      const next = !prev;
+      if (next) void loadSample();
+      return next;
+    });
+  }, [loadSample]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const pollQueue = async () => {
+      try {
+        const q = await fetchActiveCalls();
+        if (cancelled) return;
+        setActiveCalls(q);
+        setError(null);
+
+        // Auto-select the first call if nothing is selected (or selected call left the queue)
+        if (q.count > 0) {
+          const ids = q.calls.map((c) => c.episode_id);
+          setSelectedEpisodeId((prev) => {
+            if (prev && ids.includes(prev)) return prev;
+            return ids[0];
+          });
+        } else {
+          setSelectedEpisodeId(null);
+        }
+      } catch {
+        // /api/live/active not available yet (404) or transient network error — treat as no active
+        // calls so the page degrades gracefully while the backend endpoint is being built.
+        if (!cancelled) setActiveCalls({ count: 0, calls: [] });
+      }
+    };
+
+    const pollDetail = async () => {
+      const epId = selectedRef.current;
+      // If no calls are active, clear the detail snap (show empty state / sample)
+      if (!epId) {
+        setSnap(null);
+        return;
+      }
+      try {
+        const s = await fetchLive(epId);
+        if (!cancelled) {
+          setSnap(s);
+          setError(null);
+        }
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load the live call.');
+      }
+    };
+
+    void pollQueue();
+    void pollDetail();
+
+    const queueId = setInterval(pollQueue, POLL_MS);
+    const detailId = setInterval(pollDetail, POLL_MS);
+
+    return () => {
+      cancelled = true;
+      clearInterval(queueId);
+      clearInterval(detailId);
+    };
+  }, []);
+
+  // Also re-fetch the detail immediately whenever the selected episode changes
+  useEffect(() => {
+    if (!selectedEpisodeId) return;
+    let cancelled = false;
+    void fetchLive(selectedEpisodeId).then((s) => {
+      if (!cancelled) setSnap(s);
+    }).catch(() => {/* ignore */});
+    return () => { cancelled = true; };
+  }, [selectedEpisodeId]);
+
+  // N3: gate the shell's top-title LIVE pill on whether we're genuinely active (not sample)
+  const titleActive = snap?.active === true && snap.sample !== true;
+  useEffect(() => {
+    const pill = document.querySelector<HTMLElement>('.top-title .live-pill');
+    if (pill) pill.style.display = titleActive ? '' : 'none';
+    return () => {
+      const p = document.querySelector<HTMLElement>('.top-title .live-pill');
+      if (p) p.style.display = '';
+    };
+  }, [titleActive]);
+
+  const hasActiveCalls = (activeCalls?.count ?? 0) > 0;
+
+  // --- ERROR STATE — only if the detail-polling also failed AND we have no queue info at all ---
+  if (error && !snap && activeCalls === null) {
+    return (
+      <div className="page">
+        <div className="empty" style={{ margin: 'auto' }}>
+          <div className="ico">
+            <Icon name="broadcast" size={28} />
+          </div>
+          <h3>Can&apos;t reach the call feed</h3>
+          <p>{error}</p>
+        </div>
+      </div>
+    );
+  }
+
+  // --- EMPTY STATE (no active calls) ---
+  if (!hasActiveCalls) {
+    // If toggle is ON and sample is loaded, show the sample monitor
+    if (showSample && sampleSnap?.episode) {
+      return (
+        <div className="page" style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+          {/* Sample toggle banner */}
+          <div className="lv-sample-banner">
+            <span className="tag warn" style={{ fontWeight: 700, letterSpacing: '0.04em' }}>
+              SAMPLE
+            </span>
+            <span style={{ fontSize: 12.5, color: 'var(--text-3)' }}>
+              Showing a sample call for preview — not a live call
+            </span>
+            <button
+              className="btn btn-ghost btn-sm"
+              onClick={handleToggleSample}
+              style={{ marginLeft: 'auto' }}
+            >
+              Hide sample
+            </button>
+          </div>
+          <CallMonitor snap={sampleSnap} onOpenReview={(id) => router.push(`/operate/review/${id}`)} />
+        </div>
+      );
+    }
+
+    return (
+      <div className="page">
+        <div className="empty" style={{ margin: 'auto' }}>
+          <div className="ico">
+            <Icon name="broadcast" size={28} />
+          </div>
+          <h3>No active call</h3>
+          <p>Nothing is on the line right now. The monitor will light up the moment a call starts.</p>
+          {/* "Show sample call" toggle — lets operators preview the monitor with real data */}
+          <div className="lv-sample-toggle" data-testid="sample-toggle">
+            <span style={{ fontSize: 13, color: 'var(--text-2)', fontWeight: 550 }}>
+              Show sample call
+            </span>
+            <button
+              className={`toggle${showSample ? ' on' : ''}`}
+              onClick={handleToggleSample}
+              aria-label="Toggle sample call preview"
+            >
+              <i />
+            </button>
+            {sampleLoading ? (
+              <span style={{ fontSize: 12, color: 'var(--text-3)' }}>Loading…</span>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // --- CONNECTING STATE (active 0-turn call, no detail yet) ---
+  if (snap?.active && snap.episode && snap.episode.turns.length === 0) {
+    return (
+      <div className="page" style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        {activeCalls && activeCalls.count > 1 ? (
+          <QueueRail
+            calls={activeCalls.calls}
+            selectedId={selectedEpisodeId}
+            onSelect={setSelectedEpisodeId}
+          />
+        ) : null}
+        <div className="empty" style={{ margin: 'auto' }}>
+          <div className="ico">
+            <span className="live-pill">
+              <i />
+              LIVE
+            </span>
+          </div>
+          <h3>Connecting…</h3>
+          <p>A call just started. The transcript and belief state will appear here the moment the first turn lands.</p>
+        </div>
+      </div>
+    );
+  }
+
+  // --- FULL MONITOR (active call with turns, or snap still loading) ---
+  if (!snap?.episode) {
+    // Queue says active but detail not loaded yet — brief loading interstitial
+    return (
+      <div className="page">
+        <div className="empty" style={{ margin: 'auto' }}>
+          <div className="ico">
+            <span className="live-pill">
+              <i />
+              LIVE
+            </span>
+          </div>
+          <h3>Connecting…</h3>
+          <p>Loading call detail…</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="page" style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      {/* Queue rail — shown when ≥2 calls are active so the operator can switch */}
+      {activeCalls && activeCalls.count > 1 ? (
+        <QueueRail
+          calls={activeCalls.calls}
+          selectedId={selectedEpisodeId}
+          onSelect={setSelectedEpisodeId}
+        />
+      ) : null}
+      <CallMonitor snap={snap} onOpenReview={(id) => router.push(`/operate/review/${id}`)} />
+    </div>
+  );
+}
+
+/** Horizontal queue rail of active calls. Shown when ≥2 calls are simultaneously active. */
+function QueueRail({
+  calls,
+  selectedId,
+  onSelect,
+}: {
+  calls: ActiveCallSummary[];
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+}) {
+  return (
+    <div className="lv-queue-rail" data-testid="queue-rail">
+      <div className="lv-qhead">
+        <span className="live-dot" style={{ marginRight: 4 }} />
+        <span style={{ fontSize: 11.5, fontWeight: 700, color: 'var(--text-2)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+          {calls.length} Active {calls.length === 1 ? 'call' : 'calls'}
+        </span>
+      </div>
+      <div className="lv-qlist scroll">
+        {calls.map((c) => (
+          <QueueEntry
+            key={c.episode_id}
+            call={c}
+            selected={c.episode_id === selectedId}
+            onSelect={onSelect}
+          />
+        ))}
       </div>
     </div>
   );

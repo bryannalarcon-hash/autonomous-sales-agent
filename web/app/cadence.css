@@ -354,6 +354,28 @@
 .cadence .lv-tlbar .ag { background: var(--accent); }
 .cadence .lv-tlbar .pr { background: var(--ok); }
 
+/* ---- Live queue rail (≥2 simultaneous active calls) ---- */
+.cadence .lv-queue-rail { flex: 0 0 auto; border-bottom: 1px solid var(--border); background: var(--panel-2); display: flex; align-items: stretch; gap: 0; min-height: 0; }
+.cadence .lv-qhead { display: flex; align-items: center; gap: 6px; padding: 0 16px; flex: 0 0 auto; border-right: 1px solid var(--border); min-width: 120px; }
+.cadence .lv-qlist { display: flex; flex-direction: row; gap: 4px; padding: 8px 12px; overflow-x: auto; flex: 1; align-items: stretch; }
+.cadence .lv-qrow { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); cursor: pointer; transition: .13s; min-width: 200px; max-width: 260px; font: inherit; color: var(--text-2); text-align: left; }
+.cadence .lv-qrow:hover { background: var(--surface-2); border-color: var(--surface-3); }
+.cadence .lv-qrow.sel { background: var(--accent-soft); border-color: var(--accent-border); color: var(--text); box-shadow: 0 0 0 3px var(--accent-soft); }
+.cadence .lv-qleft { display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; }
+.cadence .lv-qav { width: 30px; height: 30px; border-radius: 9px; background: var(--surface-2); color: var(--text-2); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 11px; flex: 0 0 auto; }
+.cadence .lv-qrow.sel .lv-qav { background: var(--accent-strong-bg); color: var(--accent-strong); }
+.cadence .lv-qmeta { min-width: 0; flex: 1; }
+.cadence .lv-qlabel { font-size: 12.5px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+.cadence .lv-qstage { font-size: 11px; color: var(--text-3); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cadence .lv-qright { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.cadence .lv-qrisk { display: flex; flex-direction: column; gap: 3px; width: 40px; }
+.cadence .lv-qturns { font-size: 10px; font-weight: 700; color: var(--text-3); font-variant-numeric: tabular-nums; min-width: 18px; text-align: right; }
+
+/* ---- Sample call toggle (empty-state widget) ---- */
+.cadence .lv-sample-toggle { display: flex; align-items: center; gap: 10px; margin-top: 10px; padding: 10px 16px; border-radius: 12px; background: var(--surface-2); border: 1px solid var(--border); }
+/* ---- Sample banner (shown above the monitor when sample preview is active) ---- */
+.cadence .lv-sample-banner { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 8px 18px; background: var(--warn-soft); border-bottom: 1px solid var(--warn-border); font-size: 12.5px; }
+
 /* ===================== CALL REVIEW ===================== */
 .cadence .rv { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 416px); grid-template-rows: auto minmax(0, 1fr); }
 .cadence .rv-strip { grid-column: 1 / -1; display: flex; align-items: center; gap: 16px; padding: 13px 20px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }

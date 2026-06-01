@@ -1,12 +1,15 @@
-// Typed fetch client + small display helpers for the Operate dashboard (U15). One thin wrapper per
-// read endpoint (episodes list/detail, KPIs, escalations, live snapshot) returning the typed
-// contract from lib/operate-types. Reuses the same ApiError + NEXT_PUBLIC_API_BASE convention as
-// lib/api.ts (never embeds secrets). The display helpers (duration / time-ago / initials) format
-// raw numeric backend fields for the glass UI; all SEMANTIC labels come pre-translated from the
-// backend, so nothing here re-derives a human label from an internal index. The lone WRITE here is
-// updateEscalationLifecycle (POST /api/escalations/{id}/lifecycle) — the escalation triage action.
+// Typed fetch client + small display helpers for the Operate dashboard (U15/U16). One thin wrapper
+// per read endpoint (episodes list/detail, KPIs, escalations, live snapshot, active-calls queue,
+// sample call) returning the typed contract from lib/operate-types. Reuses the same ApiError +
+// NEXT_PUBLIC_API_BASE convention as lib/api.ts (never embeds secrets). Display helpers (duration /
+// time-ago / initials) format raw numeric backend fields for the glass UI; all SEMANTIC labels come
+// pre-translated from the backend, so nothing here re-derives a human label from an internal index.
+// The lone WRITE is updateEscalationLifecycle (POST /api/escalations/{id}/lifecycle). U16 adds:
+// fetchActiveCalls (/api/live/active), fetchLive now accepts an optional episodeId param, and
+// fetchSampleCall (/api/live/sample) for the "Show sample call" toggle in the empty state.
 import { ApiError, API_BASE } from './api';
 import type {
+  ActiveCallsResponse,
   Escalation,
   EpisodeDetail,
   EpisodeListResponse,
@@ -124,8 +127,24 @@ export function updateEscalationLifecycle(
   );
 }
 
-export function fetchLive(): Promise<LiveSnapshot> {
-  return getJson<LiveSnapshot>('/api/live');
+/** Fetch the live snapshot. When episodeId is given, fetches that specific call via
+ *  /api/live?episode_id=<id> (for the queue "watch this call" action); otherwise fetches the
+ *  newest active call from /api/live. */
+export function fetchLive(episodeId?: string): Promise<LiveSnapshot> {
+  return getJson<LiveSnapshot>('/api/live', episodeId ? { episode_id: episodeId } : undefined);
+}
+
+/** Fetch the queue of all currently active (in-progress) calls, newest-first.
+ *  Returns ActiveCallsResponse with count + calls[]. An empty calls array means no calls active. */
+export function fetchActiveCalls(): Promise<ActiveCallsResponse> {
+  return getJson<ActiveCallsResponse>('/api/live/active');
+}
+
+/** Fetch a sample call snapshot for the "Show sample call" preview toggle.
+ *  The returned LiveSnapshot has sample:true and active:false — the monitor renders it with a
+ *  SAMPLE badge and no live/recording affordances. */
+export function fetchSampleCall(): Promise<LiveSnapshot> {
+  return getJson<LiveSnapshot>('/api/live/sample');
 }
 
 // --- display helpers (formatting only — no semantic-label derivation) ---------------------------
