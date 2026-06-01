@@ -18,14 +18,17 @@ import { fetchEpisodes, fmtDuration, fmtTimeAgo } from '@/lib/operate-api';
 import { archetypeLabel, versionLabel } from '@/lib/labels';
 import type { EpisodeSummary } from '@/lib/operate-types';
 
-// Outcome filter options: the displayed label + the internal key it maps to ('' = no filter).
+// Outcome filter options: the displayed label + the internal outcome KEY it maps to ('' = no filter).
+// The key MUST equal a real `episode.outcome` value (the API filters `WHERE outcome = $key`); the
+// labels mirror src/api/labels.outcome_label. The previous keys booked/disqualified/no_interest did
+// not exist in the data, so those chips always returned 0 — replaced with the real outcomes.
 const OUTCOME_OPTIONS: { label: string; key: string }[] = [
   { label: 'All', key: '' },
   { label: 'Enrolled', key: 'enrolled' },
-  { label: 'Booked', key: 'booked' },
+  { label: 'Consultation booked', key: 'consult_booked' },
   { label: 'Escalated', key: 'escalated' },
-  { label: 'Disqualified', key: 'disqualified' },
-  { label: 'No interest', key: 'no_interest' },
+  { label: 'Released', key: 'released' },
+  { label: 'Walked away', key: 'walked' },
 ];
 
 // Outcome key -> dot-tag color class (status semantics), for the table + drawer.
