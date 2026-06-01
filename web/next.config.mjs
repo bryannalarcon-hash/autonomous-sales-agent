@@ -1,11 +1,10 @@
-// Next.js config for the auto-sales-agent web console (U13 demo + later U15/U16 operator UI).
-// Minimal by design: strict React mode + a redirect so the bare "/" lands on the demo console.
+// Next.js config for the auto-sales-agent web console (U13 demo + U15/U16 operator UI).
+// Minimal by design: strict React mode only. The bare "/" now renders a real landing page
+// (web/app/page.tsx) that orients a visitor and routes them to the demo or the operator dashboard —
+// it is NO LONGER redirected to /demo.
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  async redirects() {
-    return [{ source: '/', destination: '/demo', permanent: false }];
-  },
 };
 
 export default nextConfig;

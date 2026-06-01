@@ -31,10 +31,17 @@ class FakeImproveStore:
     returns the seeded tree newest-first so P9 renders without a Postgres list-all."""
 
     def __init__(
-        self, experiments: list[ExperimentRecord], lineage: list[VersionLineage]
+        self,
+        experiments: list[ExperimentRecord],
+        lineage: list[VersionLineage],
+        kb_chunks: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         self._experiments = {e.experiment_id: e for e in experiments}
         self._lineage = {n.version: n for n in lineage}
+        # The REAL grounded corpus (kb_chunk rows) keyed by kb_version, mirroring the Postgres table:
+        # each entry is {"source": "<section>#<id>", "text": ...}. Lets /api/kb return real grouped
+        # sections DB-free (the default fakes pass None -> the empty-corpus path).
+        self._kb_chunks = kb_chunks or []
 
     async def list_experiments(
         self, *, state: Optional[str] = None, limit: int = 200
@@ -69,6 +76,14 @@ class FakeImproveStore:
         rows = list(self._lineage.values())
         rows.sort(key=lambda n: n.created_at, reverse=True)
         return rows[:limit]
+
+    async def list_kb_chunks(self, *, kb_version: str) -> list[dict[str, Any]]:
+        # Mirror the Postgres impl: only the rows for the requested kb_version, ordered by source.
+        rows = [c for c in self._kb_chunks if c.get("kb_version", kb_version) == kb_version]
+        return sorted(
+            ({"source": c["source"], "text": c["text"]} for c in rows),
+            key=lambda c: c["source"],
+        )
 
 
 def _exp(
@@ -624,6 +639,58 @@ def test_playbook_save_creates_draft_without_mutating_champion():
     # the draft IS queryable in the lab (it was persisted as a running experiment).
     lab = client.get("/api/experiments", params={"state": "running"}).json()
     assert any(e["experiment_id"] == draft["experiment_id"] for e in lab["experiments"])
+
+
+def _kb_client(kb_chunks: list[dict[str, Any]]) -> TestClient:
+    """A TestClient whose injected store also serves a REAL grounded corpus (kb_chunk rows), so the
+    /api/kb browse contract is exercised DB-free."""
+    app = create_app(
+        improve_store=FakeImproveStore([], [], kb_chunks=kb_chunks),
+        config=load_config("champion_v0"),
+    )
+    return TestClient(app)
+
+
+def test_kb_returns_real_corpus_grouped_by_section():
+    """P8 browse contract (bug fix): GET /api/kb returns the REAL kb_chunk corpus grouped by section —
+    NOT placeholder rebuttal strings — with counts that match the rows actually shown, and a derived
+    title + full body per chunk so the panel can render each section's real grounding content."""
+    chunks = [
+        {"source": "objections#objection_price", "text": "Price / affordability. The membership is a monthly commitment, so framing matters."},
+        {"source": "objections#objection_timing", "text": "Timing (is now the right time?). The right time ties to the goal."},
+        {"source": "pricing#pricing_tier_core", "text": "Core tier (illustrative). About $349 per month, recurring."},
+        {"source": "competitors#competitor_vs_marketplace", "text": "Versus tutor marketplaces (e.g. Wyzant). We vet and match tutors centrally."},
+    ]
+    client = _kb_client(chunks)
+    body = client.get("/api/kb").json()
+    assert body["kb_version"] == "kb_v0"
+    assert body["total_chunks"] == 4
+    sections = {s["id"]: s for s in body["sections"]}
+    # three real sections, each with a count that equals the chunks it actually carries.
+    assert sections["objections"]["count"] == 2
+    assert sections["pricing"]["count"] == 1
+    assert sections["competitors"]["count"] == 1
+    assert sum(s["count"] for s in body["sections"]) == 4
+    # the operator-facing label is human, never the raw slug; chunks carry a short title + full body.
+    assert sections["objections"]["label"] == "Objection rebuttals"
+    price = next(c for c in sections["objections"]["chunks"] if c["id"] == "objection_price")
+    assert price["title"] == "Price / affordability"  # leading sentence, not the whole paragraph
+    assert "monthly commitment" in price["text"]  # full real body preserved
+    # the e.g. abbreviation inside a parenthetical does NOT prematurely cut the title.
+    vs = next(iter(sections["competitors"]["chunks"]))
+    assert vs["title"] == "Versus tutor marketplaces (e.g. Wyzant)"
+    # NO placeholder text leaks into the browsed corpus.
+    assert "PLACEHOLDER" not in client.get("/api/kb").text
+
+
+def test_kb_empty_corpus_degrades_to_empty_sections():
+    """A store with no kb_chunk rows (or one lacking list_kb_chunks) yields an empty corpus instead of
+    failing — the page shows an empty-state."""
+    body = _kb_client([]).get("/api/kb").json()
+    assert body["sections"] == []
+    assert body["total_chunks"] == 0
+    # the legacy seeded client (FakeImproveStore without seeded chunks) also degrades cleanly.
+    assert _seeded_client().get("/api/kb").json()["sections"] == []
 
 
 def test_kb_save_creates_draft_without_mutating_champion():

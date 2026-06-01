@@ -4,7 +4,9 @@
 // the current-decision card sit at the top of the belief column); the full slot table + latent
 // drivers are the secondary "Full belief state" expander below. No realtime infra — it polls
 // /api/live every few seconds and shows the most-recent call, with a clear "no active call" empty
-// state. All operator-facing text uses the backend's pre-translated labels (no driver slug / P-id).
+// state AND a "Connecting…" state for an active call that has no turns yet (so a just-started call
+// never renders as a wall of dashes). All operator-facing text uses the backend's pre-translated
+// labels (no driver slug / P-id).
 'use client';
 
 import { useEffect, useState } from 'react';
@@ -38,7 +40,7 @@ function TranscriptTurn({ turn }: { turn: Turn }) {
   return (
     <div className={`lv-turn ${isAgent ? 'a' : 'p'}`}>
       <div className="lv-th">
-        {isAgent ? 'Ava (agent)' : 'Prospect'}
+        {isAgent ? 'Alex (agent)' : 'Prospect'}
         <span>·</span>
         {`turn ${turn.turn_id + 1}`}
       </div>
@@ -218,6 +220,25 @@ export default function LivePage() {
     );
   }
 
+  // A live call that hasn't produced a turn yet is CONNECTING — show a clean connecting state
+  // instead of the full monitor rendered as a wall of "—" (no transcript, no belief yet).
+  if (snap.active && snap.episode.turns.length === 0) {
+    return (
+      <div className="page">
+        <div className="empty" style={{ margin: 'auto' }}>
+          <div className="ico">
+            <span className="live-pill">
+              <i />
+              LIVE
+            </span>
+          </div>
+          <h3>Connecting…</h3>
+          <p>A call just started. The transcript and belief state will appear here the moment the first turn lands.</p>
+        </div>
+      </div>
+    );
+  }
+
   const ep = snap.episode;
   const lastBelief = [...ep.turns].reverse().find((t) => t.belief)?.belief ?? null;
   const escalationImminent = snap.priority?.escalation_imminent ?? lastBelief?.escalation_imminent ?? false;
@@ -267,7 +288,7 @@ export default function LivePage() {
               {snap.active ? (
                 <div className="lv-turn a">
                   <div className="lv-th">
-                    Ava (agent)<span>·</span>now
+                    Alex (agent)<span>·</span>now
                   </div>
                   <div className="lv-bub lv-speak">
                     <i />

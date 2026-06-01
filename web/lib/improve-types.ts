@@ -75,11 +75,33 @@ export interface DecisionResponse {
   champion_version?: string;
 }
 
-/** The current champion KB reference (P8 left tree / draft banner). */
+/** One grounded fact/rebuttal the agent retrieves on — a kb_chunk row, ready to render. `id` and
+ *  `source` are internal slugs ("<section>#<id>") kept for client keys/logic only and MUST NOT render
+ *  as text; the UI shows `title` (a short derived label) + `text` (the full real body). */
+export interface KbChunk {
+  id: string; // internal chunk slug — never rendered as operator text
+  source: string; // "<section>#<id>" — internal, never rendered
+  title: string; // short human title derived from the body — what the panel header shows
+  text: string; // the full real grounding content — what the panel body shows
+}
+
+/** One section of the grounded corpus (P8 left tree node). `id` is the raw section slug for keys/logic
+ *  only; `label` is the operator-facing name; `count` matches `chunks.length` (the tree count never
+ *  lies about what's shown). */
+export interface KbSection {
+  id: string; // raw section slug — for React keys / selection logic only, never rendered
+  label: string; // human section name — what the tree shows
+  count: number; // == chunks.length
+  chunks: KbChunk[];
+}
+
+/** The REAL grounded corpus the agent retrieves on, grouped by section (P8 KB browser). Replaces the
+ *  former placeholder `rebuttals` map — the operator browses actual facts, not PLACEHOLDER strings. */
 export interface KbResponse {
   kb_version: string;
   version: string;
-  rebuttals: Record<string, unknown>;
+  sections: KbSection[];
+  total_chunks: number;
 }
 
 /** The current champion playbook (P8 editor view). */

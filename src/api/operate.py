@@ -6,6 +6,9 @@
 # (kpi_score weighted ladder + compare_versions) — never reimplemented. Every operator-facing string
 # is translated through src.api.labels so NO raw internal index (ladder int, driver slug, P-id) ever
 # renders. Episodes/escalations are serialized to flat display DTOs the Next.js client types against.
+# The /api/episodes Calls list is the COMPLETED history: in-progress / unset-outcome / 0-turn calls
+# are EXCLUDED here (see _is_completed) so an active call never leaks in as a finished row — those
+# live/unfinished calls surface only on /api/live (KPI aggregation is intentionally left untouched).
 from __future__ import annotations
 
 from typing import Any, Optional, Protocol, Sequence
@@ -71,6 +74,27 @@ class _StoreBackedReadStore:
 # Drivers the Live monitor (P1) treats as PRIMARY, always-visible, in priority order. Trust +
 # walk-away risk lead per the IA spec; everything else is secondary (the "full belief state").
 _PRIMARY_DRIVERS = ("trust", "bail_risk")
+
+# Outcome keys that mean "not finished yet" — an unset/empty outcome or an explicit in-progress one.
+# These (and any 0-turn episode) are LIVE/unfinished calls, surfaced on /api/live, never on the
+# COMPLETED Calls list (P3).
+_UNFINISHED_OUTCOMES = frozenset({None, "", "in_progress"})
+
+
+# The completed-list filter runs after the store query, so we over-fetch to still fill a page when
+# unfinished calls are interleaved newest-first. The multiple covers a heavy minority of live/0-turn
+# rows; _MAX_FETCH caps the over-fetch so a huge `limit` can't ask the store for an unbounded scan.
+_COMPLETED_OVERFETCH = 3
+_MAX_FETCH = 10000
+
+
+def _is_completed(ep: Episode) -> bool:
+    """A genuinely COMPLETED call for the P3 Calls list: it reached a terminal outcome AND has at
+    least one logged turn. In-progress / unset-outcome / 0-turn episodes are the live, still-running
+    (or never-started) calls — they belong on /api/live, not in the completed history."""
+    if ep.outcome in _UNFINISHED_OUTCOMES:
+        return False
+    return len(ep.turns) > 0
 
 
 def _belief_to_dict(belief: Optional[BeliefSnapshot]) -> Optional[dict[str, Any]]:
@@ -335,13 +359,23 @@ def create_operate_router(read_store: Optional[ReadStore] = None) -> APIRouter:
         escalated: Optional[bool] = None,
         limit: int = 200,
     ) -> dict[str, Any]:
-        """P3 Calls list. Filters (version / cohort / outcome / escalated) AND together; returns
-        summary rows newest-first. `outcome` is the raw outcome key (the UI maps its labeled filter
-        back to the key before calling)."""
+        """P3 Calls list — the COMPLETED-calls history. Filters (version / cohort / outcome /
+        escalated) AND together; returns summary rows newest-first. `outcome` is the raw outcome key
+        (the UI maps its labeled filter back to the key before calling).
+
+        Honest contract: still-in-progress / unset-outcome / 0-turn episodes are LIVE/unfinished
+        calls and are EXCLUDED here (they belong on /api/live), so an active call never leaks in as
+        the top row of the completed list. The filter runs AFTER the store query (store.py owns the
+        SQL and isn't ours to change), so we over-fetch a bounded multiple of `limit` first and then
+        trim back to `limit` — this keeps a full page of completed rows even when unfinished calls
+        are interleaved newest-first. An explicit unfinished `outcome` filter therefore yields an
+        empty completed list (correct: those calls aren't completed)."""
+        fetch_limit = min(limit * _COMPLETED_OVERFETCH, _MAX_FETCH)
         eps = await rs.list_episodes(
-            version=version, cohort=cohort, outcome=outcome, escalated=escalated, limit=limit
+            version=version, cohort=cohort, outcome=outcome, escalated=escalated, limit=fetch_limit
         )
-        return {"episodes": [episode_summary(e) for e in eps], "count": len(eps)}
+        completed = [e for e in eps if _is_completed(e)][:limit]
+        return {"episodes": [episode_summary(e) for e in completed], "count": len(completed)}
 
     @router.get("/api/episodes/{episode_id}")
     async def get_episode_ep(episode_id: str) -> dict[str, Any]:

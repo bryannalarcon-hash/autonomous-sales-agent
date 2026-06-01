@@ -5,14 +5,36 @@
 // badge per destination and maps 1:1 to App Router paths. Active nav state derives from the pathname
 // (the Call Review detail keeps "Calls" highlighted). Operator-facing titles are human-readable —
 // NO internal P-id ever renders.
-// The top bar carries the champion-version chip, persona chip, and the Sandbox/Live environment
-// toggle (local UI state). Pure chrome: pages render as {children} inside .main.
+// The top bar carries the champion-version chip (REAL champion + kb_version from /api/versions, hash
+// suffix stripped — never a fabricated id), the persona chip (the REAL agent persona from config —
+// "Alex", warm-consultative), and the Sandbox/Live environment toggle (local UI state). Pure chrome:
+// pages render as {children} inside .main.
 'use client';
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
+import { fetchVersions, fetchApprovals } from '@/lib/improve-api';
+import { fetchEscalations } from '@/lib/operate-api';
 import { Icon, type IconName } from './Icon';
+
+// The agent's REAL persona, from the champion config (src/config/versions/champion_v0.yaml:
+// persona.name = "Alex", style = "warm-consultative"). The recorded demo names the agent "Alex"; the
+// previous "Ava · Warm-Direct" was fabricated. No persona API endpoint exists, so these mirror config.
+const PERSONA_NAME = 'Alex';
+const PERSONA_STYLE = 'Warm-Consultative';
+
+// Strip the internal suffixes from a raw version id for display: the experiment delta suffix
+// ("champion_v0__playbooks_discovery_sequence__7" -> "champion_v0") and any short hash
+// ("v1-f3798d7a" -> "v1"), then humanize the prefix ("champion_v0" -> "Champion v0"). The dropped
+// parts are internal indices and must not render to the operator (the change is shown via the
+// human-readable dimension_label tag elsewhere).
+function versionLabel(raw: string): string {
+  let base = raw.split('__')[0]; // drop the experiment dimension/seq suffix
+  base = base.split('-')[0]; // drop a short hash suffix
+  if (base.startsWith('champion_')) return `Champion ${base.slice('champion_'.length)}`;
+  return base;
+}
 
 interface NavDest {
   href: string; // the App Router path the rail item navigates to (1:1 with a page)
@@ -30,12 +52,14 @@ const NAV: NavDest[] = [
   { href: '/operate/live', label: 'Live', title: 'Live Call Monitor', icon: 'broadcast', group: 'operate', live: true },
   { href: '/operate/calls', label: 'Calls', title: 'Calls List', icon: 'list', group: 'operate' },
   { href: '/operate/kpi', label: 'KPI Views', title: 'KPI Views', icon: 'chart', group: 'operate' },
-  { href: '/operate/escalations', label: 'Escalations', title: 'Escalation Queue', icon: 'alert', group: 'operate', badge: 3 },
+  // The escalations/approvals badges are bound to REAL counts at runtime (see useNavBadges) — no
+  // hardcoded literal (the old `badge: 3` was stale; the queue actually held ~116 unreviewed).
+  { href: '/operate/escalations', label: 'Escalations', title: 'Escalation Queue', icon: 'alert', group: 'operate' },
   // Improve destinations now point at their dedicated U16 pages under /improve/* (the `target` the
   // U15 scaffold recorded is now the live `href`). The rest of the shell (active-state, mode switch,
   // badges) keys off these entries unchanged.
   { href: '/improve/lab', label: 'Experiment Lab', title: 'Experiment Lab', icon: 'flask', group: 'improve' },
-  { href: '/improve/approvals', label: 'Approvals', title: 'Approval Queue', icon: 'badge', group: 'improve', badge: 2, amber: true },
+  { href: '/improve/approvals', label: 'Approvals', title: 'Approval Queue', icon: 'badge', group: 'improve', amber: true },
   { href: '/improve/kb', label: 'KB / Playbook', title: 'KB / Playbook Editor', icon: 'book', group: 'improve' },
   { href: '/improve/versions', label: 'Versions', title: 'Version History', icon: 'branch', group: 'improve' },
 ];
@@ -43,6 +67,28 @@ const NAV: NavDest[] = [
 // The Call Review detail screen (no rail entry of its own) keeps "Calls" highlighted + shows a
 // breadcrumb back to the list, per the handoff §86/§90.
 const REVIEW_PREFIX = '/operate/review';
+
+// Bind the nav rail's count badges to REAL backend counts (escalations: unreviewed; approvals:
+// pending) rather than hardcoded literals. Non-fatal: a failed/empty fetch just shows no badge.
+function useNavBadges(): Record<string, number> {
+  const [badges, setBadges] = useState<Record<string, number>>({});
+  useEffect(() => {
+    let cancelled = false;
+    Promise.allSettled([fetchEscalations(), fetchApprovals()]).then(([esc, app]) => {
+      if (cancelled) return;
+      const next: Record<string, number> = {};
+      if (esc.status === 'fulfilled') {
+        next['/operate/escalations'] = esc.value.counts?.unreviewed ?? esc.value.count ?? 0;
+      }
+      if (app.status === 'fulfilled') next['/improve/approvals'] = app.value.count ?? 0;
+      setBadges(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return badges;
+}
 
 function NavItem({ dest, active }: { dest: NavDest; active: boolean }) {
   return (
@@ -60,20 +106,42 @@ function NavItem({ dest, active }: { dest: NavDest; active: boolean }) {
 
 function GlobalControls() {
   const [live, setLive] = useState(false);
+  // Real champion version + kb_version from the lineage API (was a hardcoded "v12 / kb-37").
+  const [champion, setChampion] = useState<{ version: string; kbVersion: string } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchVersions()
+      .then((res) => {
+        if (cancelled) return;
+        const champ =
+          res.versions.find((v) => v.version === res.champion_version) ??
+          res.versions.find((v) => v.is_champion) ??
+          null;
+        if (champ) setChampion({ version: champ.version, kbVersion: champ.kb_version });
+      })
+      .catch(() => {
+        // Non-fatal: if the lineage can't load, the chip simply omits the version rather than faking one.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <>
       <Link href="/improve/versions" className="gctl" title="Champion version — open Version History">
         <Icon name="shield" size={15} />
         <span>
-          Champion <b>v12</b>
+          Champion {champion ? <b>{versionLabel(champion.version)}</b> : <b>—</b>}
         </span>
-        <span className="muted">kb-37</span>
+        {champion ? <span className="muted">{champion.kbVersion}</span> : null}
         <Icon name="chevDown" className="gctl-chev" />
       </Link>
-      <div className="gctl" title="Active persona / voice">
+      <div className="gctl" title="Active agent persona / voice">
         <Icon name="mic" size={15} />
         <span>
-          <b>Ava</b> · Warm-Direct
+          <b>{PERSONA_NAME}</b> · {PERSONA_STYLE}
         </span>
       </div>
       <button className={`env${live ? ' live' : ''}`} onClick={() => setLive((v) => !v)} title="Toggle environment">
@@ -101,8 +169,12 @@ export function DashboardShell({ children }: { children: ReactNode }) {
   const title = isReview ? 'Call Review' : current?.title ?? 'Operate';
   const showLivePill = !isReview && current?.live;
 
-  const operate = NAV.filter((n) => n.group === 'operate');
-  const improve = NAV.filter((n) => n.group === 'improve');
+  // Merge real runtime counts onto the static NAV entries (escalations/approvals badges).
+  const navBadges = useNavBadges();
+  const withBadge = (n: NavDest): NavDest =>
+    n.href in navBadges ? { ...n, badge: navBadges[n.href] } : n;
+  const operate = NAV.filter((n) => n.group === 'operate').map(withBadge);
+  const improve = NAV.filter((n) => n.group === 'improve').map(withBadge);
 
   return (
     <div className="cadence">

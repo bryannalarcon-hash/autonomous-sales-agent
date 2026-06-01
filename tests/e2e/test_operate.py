@@ -82,9 +82,10 @@ def _episode(
     qualified: bool,
     escalated: bool = False,
     minutes_ago: int = 0,
+    turn_count: int = 4,
 ) -> Episode:
     created = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
-    turns = [
+    all_turns = [
         Turn(turn_id=0, speaker="agent", text="Hi, thanks for hopping on. What pulled you in?",
              decision="greeting", rationale="Warm open.", belief=_belief(0.42, 0.28, "discovery"), latency_ms=600),
         Turn(turn_id=1, speaker="prospect", text="We keep missing follow-ups."),
@@ -95,6 +96,9 @@ def _episode(
              decision="trial_close", rationale="Buying signal — move to close.",
              belief=_belief(0.66, 0.34, "closing", imminent=escalated), latency_ms=800),
     ]
+    # turn_count lets a test seed a still-connecting (0-turn) or barely-started episode — the
+    # in-progress/0-turn shapes the completed Calls list must EXCLUDE and Live/Review must handle.
+    turns = all_turns[:turn_count]
     return Episode(
         episode_id=eid, turns=turns, outcome=outcome, ladder_tier=tier, qualified=qualified,
         version=version, kb_version="kb-37", channel="voice", persona=persona, cohort=cohort,
@@ -104,8 +108,16 @@ def _episode(
 
 def _seeded_client() -> TestClient:
     episodes = [
+        # Newest call is still connecting: in_progress + 0 turns. It must NOT pollute the COMPLETED
+        # Calls list, but IS the call /api/live hands back (active, connecting state). Kept on v12 so
+        # the v12 KPI math the KPI tests below assert is unchanged (KPI aggregation is out of scope).
         _episode("CALL-4821", outcome="in_progress", tier=0, version="v12", cohort="live",
-                 persona="Skeptical Analyzer", qualified=False, minutes_ago=0),
+                 persona="Skeptical Analyzer", qualified=False, minutes_ago=0, turn_count=0),
+        # A second unfinished shape: outcome unset AND 0 turns (the ep-esc-* artifact) — also excluded
+        # from the completed list. On version "v_live" so it doesn't perturb the v12 KPI math asserted
+        # below (the in-progress CALL-4821 above stays on v12 exactly as the original KPI seed had it).
+        _episode("CALL-4822", outcome=None, tier=0, version="v_live", cohort="live",
+                 persona="Busy Decider", qualified=False, minutes_ago=1, turn_count=0),
         _episode("CALL-4820", outcome="enrolled", tier=4, version="v12", cohort="held_out",
                  persona="Busy Decider", qualified=True, minutes_ago=6),
         _episode("CALL-4819", outcome="escalated", tier=2, version="v12", cohort="held_out",
@@ -143,14 +155,29 @@ def test_episodes_list_returns_summaries_newest_first():
     r = client.get("/api/episodes")
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["count"] == 6
-    # newest-first: the live call leads.
-    assert body["episodes"][0]["episode_id"] == "CALL-4821"
-    row = body["episodes"][1]
+    # COMPLETED list only: the two unfinished calls (CALL-4821 in_progress/0-turn, CALL-4822
+    # unset-outcome/0-turn) are excluded, leaving the 5 genuinely completed episodes.
+    assert body["count"] == 5
+    # newest-first among completed: the most recent COMPLETED call leads (not the live one).
+    row = body["episodes"][0]
+    assert row["episode_id"] == "CALL-4820"
     # labels applied — no bare ladder int as the only outcome signal.
     assert row["outcome"] == "Enrolled"
     assert row["ladder_label"] == "Same-call enrollment"
     assert "transcript" not in row and "turns" not in row  # summary, not full body
+
+
+def test_episodes_list_excludes_in_progress_and_zero_turn():
+    """The completed Calls list must surface ONLY genuinely completed episodes — never an
+    in-progress or 0-turn (still-connecting) call (the leak QA found at the top of P3)."""
+    client = _seeded_client()
+    ids = {e["episode_id"] for e in client.get("/api/episodes").json()["episodes"]}
+    assert "CALL-4821" not in ids  # in_progress + 0 turns
+    assert "CALL-4822" not in ids  # outcome unset + 0 turns
+    assert ids == {"CALL-4820", "CALL-4819", "CALL-4818", "CALL-4816", "CALL-4810"}
+    # an explicit outcome=in_progress filter must STILL return nothing on the completed list.
+    r = client.get("/api/episodes", params={"outcome": "in_progress"})
+    assert r.json()["count"] == 0
 
 
 def test_episodes_filter_by_version_and_cohort():
@@ -201,6 +228,19 @@ def test_episode_detail_404_for_unknown():
     client = _seeded_client()
     r = client.get("/api/episodes/NOPE-9999")
     assert r.status_code == 404, r.text
+
+
+def test_episode_detail_zero_turn_is_empty_not_404():
+    """Opening Review for a still-connecting (0-turn) episode returns a valid, empty payload (the
+    page renders a graceful empty state) — never a 404 or a blank screen."""
+    client = _seeded_client()
+    r = client.get("/api/episodes/CALL-4821")  # in_progress, 0 turns
+    assert r.status_code == 200, r.text
+    ep = r.json()
+    assert ep["episode_id"] == "CALL-4821"
+    assert ep["turns"] == []
+    assert ep["belief_trajectory"] == []
+    assert ep["turn_count"] == 0
 
 
 # =============================== P4 — KPI: LADDER HEADLINE + DISTINCT ENROLLMENT =================
@@ -290,12 +330,19 @@ def test_escalations_empty_state():
 
 
 def test_live_returns_most_recent_call_with_prioritized_belief():
-    client = _seeded_client()
-    r = client.get("/api/live")
-    assert r.status_code == 200, r.text
-    snap = r.json()
-    assert snap["active"] is True  # the newest call is in_progress
-    assert snap["episode"]["episode_id"] == "CALL-4821"
+    # A still-connecting newest call (in_progress, 0 turns) is returned as the LIVE call with
+    # active=True; its belief signals are simply null (the page shows a "connecting…" state, not a
+    # broken wall of dashes). The full prioritized-IA values are exercised below with a live call
+    # that HAS turns.
+    eps = [
+        _episode("CALL-LIVE", outcome="in_progress", tier=0, version="v12", cohort="live",
+                 persona="Skeptical Analyzer", qualified=False, minutes_ago=0, turn_count=4),
+    ]
+    app = create_app(read_store=FakeReadStore(eps, []))
+    client = TestClient(app)
+    snap = client.get("/api/live").json()
+    assert snap["active"] is True  # in_progress call is active
+    assert snap["episode"]["episode_id"] == "CALL-LIVE"
     pr = snap["priority"]
     # the FOUR foremost signals are hoisted: trust, walk-away risk, stage, last act, imminence.
     assert pr["trust"] is not None
@@ -303,6 +350,23 @@ def test_live_returns_most_recent_call_with_prioritized_belief():
     assert pr["stage"] == "Closing"
     assert pr["last_act_label"] is not None
     assert "escalation_imminent" in pr
+
+
+def test_live_zero_turn_active_call_is_connecting_not_dashes():
+    """A 0-turn in_progress call is the 'connecting…' state: active True, an episode with no turns,
+    and null priority signals — NOT a completed row dressed up as live with a wall of dashes."""
+    eps = [
+        _episode("CALL-CONNECTING", outcome="in_progress", tier=0, version="v12", cohort="live",
+                 persona="Skeptical Analyzer", qualified=False, minutes_ago=0, turn_count=0),
+    ]
+    app = create_app(read_store=FakeReadStore(eps, []))
+    client = TestClient(app)
+    snap = client.get("/api/live").json()
+    assert snap["active"] is True
+    assert snap["episode"]["episode_id"] == "CALL-CONNECTING"
+    assert snap["episode"]["turns"] == []  # nothing said yet
+    pr = snap["priority"]
+    assert pr["trust"] is None and pr["bail_risk"] is None  # no belief yet -> null, page shows connecting
 
 
 def test_live_no_active_call_when_most_recent_is_completed():

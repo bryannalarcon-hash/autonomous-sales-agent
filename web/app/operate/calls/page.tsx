@@ -1,4 +1,6 @@
-// P3 — Calls List (U15). Browsable/filterable index of episodes: filters by version, cohort, and
+// P3 — Calls List (U15). Browsable/filterable index of COMPLETED episodes (the /api/episodes
+// contract excludes in-progress / 0-turn live calls, so no still-running call leaks in as a finished
+// row — live calls live on /operate/live): filters by version, cohort, and
 // outcome (a labeled segmented control that maps each option back to its internal outcome KEY before
 // the API call — the key is never shown), plus an "Escalated only" toggle and a free-text search
 // over the call id. The table shows call id, outcome (dot-tag), ladder tier (labeled), duration,
@@ -227,12 +229,6 @@ export default function CallsPage() {
                         <span className="mono" style={{ fontSize: 12, color: 'var(--text-2)' }}>
                           #{c.episode_id}
                         </span>
-                        {c.outcome_key === 'in_progress' ? (
-                          <span className="live-pill" style={{ marginLeft: 8 }}>
-                            <i />
-                            LIVE
-                          </span>
-                        ) : null}
                       </td>
                       <td>
                         <span className="tag">{c.persona ?? 'Unknown'}</span>

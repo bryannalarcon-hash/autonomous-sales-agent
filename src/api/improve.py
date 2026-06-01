@@ -3,20 +3,23 @@
 # challenger records; POST /api/experiments/run RUNS a live A/B between the champion and a single
 # changed value and persists the result), P7 Approval Queue (GET /api/approvals = experiments in
 # `blocked` state, plus POST .../approve -> promote the challenger to champion, POST .../reject), P8
-# KB/Playbook Editor (GET /api/kb + /api/playbook show the current champion config; POST /api/kb +
-# /api/playbook SAVE a DRAFT CHALLENGER — a NEW experiment record built via the generator's pure
-# config mutators that NEVER touches version_lineage, so the live champion is unchanged, R20), and P9
-# Version History (GET /api/versions = the lineage tree + champion; POST /api/versions/{v}/rollback
-# re-promotes a prior version). DB-INJECTABLE the same way src.api.operate is: an ImproveStore protocol
-# abstracts the data layer so create_improve_router(improve_store=...) takes the real src.memory.store
-# in prod and a seeded in-memory fake in tests (no Postgres). The run endpoint also takes an injected
-# LLM factory (prod: a REAL OpenRouterClient — a run SPENDS CREDIT; tests: a free MockLLMClient) and an
-# optional injectable runner (tests stack a deterministic deck). REUSES the loop (generator mutators,
-# run_experiment, evaluate_promotion, experiment_record_from) and src.api.labels so NO raw internal
-# index (dimension slug, state slug, version internals) ever renders in operator-facing text.
+# KB/Playbook Editor (GET /api/kb returns the REAL grounded corpus from the kb_chunk table grouped by
+# section — the facts/objection-rebuttals the agent grounds answers on, NOT placeholder strings; GET
+# /api/playbook shows the current champion config; POST /api/kb + /api/playbook SAVE a DRAFT CHALLENGER
+# — a NEW experiment record built via the generator's pure config mutators that NEVER touches
+# version_lineage, so the live champion is unchanged, R20), and P9 Version History (GET /api/versions =
+# the lineage tree + champion; POST /api/versions/{v}/rollback re-promotes a prior version).
+# DB-INJECTABLE the same way src.api.operate is: an ImproveStore protocol abstracts the data layer so
+# create_improve_router(improve_store=...) takes the real src.memory.store in prod and a seeded
+# in-memory fake in tests (no Postgres). The run endpoint also takes an injected LLM factory (prod: a
+# REAL OpenRouterClient — a run SPENDS CREDIT; tests: a free MockLLMClient) and an optional injectable
+# runner (tests stack a deterministic deck). REUSES the loop (generator mutators, run_experiment,
+# evaluate_promotion, experiment_record_from) and src.api.labels so NO raw internal index (dimension
+# slug, state slug, version internals) ever renders in operator-facing text.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, Awaitable, Callable, Optional, Protocol
 
 from fastapi import APIRouter, HTTPException
@@ -63,6 +66,12 @@ class ImproveStore(Protocol):
     # parent links from the champion when this is absent (see _collect_lineage).
     async def list_lineage(self, *, limit: int = 200) -> list[VersionLineage]: ...
 
+    # The REAL grounded corpus for P8: the kb_chunk rows for a kb_version, each a {"source", "text"}
+    # mapping (source is "<section>#<id>"). Optional — the router degrades to an empty corpus when a
+    # store does not implement it (e.g. a fake seeded only with experiments). The Postgres default
+    # impl queries the kb_chunk table.
+    async def list_kb_chunks(self, *, kb_version: str) -> list[dict[str, Any]]: ...
+
 
 class _StoreBackedImproveStore:
     """Default ImproveStore forwarding to src.memory.store module functions. Imported lazily so
@@ -98,6 +107,17 @@ class _StoreBackedImproveStore:
         if champ is None:
             return []
         return await _collect_lineage(self, champ.version, limit=limit)
+
+    async def list_kb_chunks(self, *, kb_version: str) -> list[dict[str, Any]]:
+        # The REAL grounded corpus the agent retrieves on. Read straight from the kb_chunk table for
+        # the active kb_version (same pool/pattern as src.memory.store). Ordered by source so the
+        # grouping/output is stable.
+        pool = await self._store.get_pool()
+        rows = await pool.fetch(
+            "SELECT source, text FROM kb_chunk WHERE kb_version = $1 ORDER BY source",
+            kb_version,
+        )
+        return [{"source": r["source"], "text": r["text"]} for r in rows]
 
 
 async def _collect_lineage(
@@ -176,6 +196,77 @@ def lineage_to_dict(node: VersionLineage) -> dict[str, Any]:
         "dimension_label": labels.dimension_label(dim) if dim else None,
         "created_at": node.created_at.isoformat() if node.created_at else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# KB corpus grouping — kb_chunk rows -> sections the P8 left tree browses
+# ---------------------------------------------------------------------------
+
+# Operator-facing names for the section prefix of a kb_chunk source ("<section>#<id>"). An unknown
+# prefix falls back to a titleized slug, so a NEW section added to the corpus still renders sensibly
+# without a code change — counts always reflect what's actually in the table.
+_KB_SECTION_LABELS: dict[str, str] = {
+    "objections": "Objection rebuttals",
+    "pricing": "Pricing & plans",
+    "programs": "Programs & services",
+    "policies": "Policies & guarantees",
+    "competitors": "Competitor comparisons",
+}
+
+
+def _kb_section_label(slug: str) -> str:
+    return _KB_SECTION_LABELS.get(slug, slug.replace("_", " ").replace("-", " ").strip().capitalize())
+
+
+def _kb_chunk_title(text: str) -> str:
+    """Derive a short, human title from a kb_chunk body. The corpus text is written as
+    "<Title>. <body…>"; take the leading sentence — the first '. ' that precedes a capital with
+    balanced parens and is not a known abbreviation (e.g./i.e.) — capped so it stays a label, not a
+    paragraph. The full `text` is still returned as the body, so an imperfect title never hides
+    content."""
+    t = " ".join((text or "").split())
+    title = t
+    for m in re.finditer(r"\. (?=[A-Z(])", t):
+        head = t[: m.start()]
+        if head.count("(") != head.count(")"):
+            continue  # the period sits inside a parenthetical — keep scanning
+        if re.search(r"\b(e\.g|i\.e)$", head):
+            continue  # an abbreviation, not a sentence end
+        title = head
+        break
+    if len(title) > 90:
+        title = title[:87].rstrip() + "…"
+    return title or "(untitled)"
+
+
+def kb_chunks_to_sections(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group raw kb_chunk rows (each {"source": "<section>#<id>", "text": ...}) into the sections the
+    P8 left tree browses. Returns one entry per section: its raw slug (client logic only — never
+    rendered), an operator-facing label, the chunk count, and the chunks (id + derived title + full
+    body) so the panel can render THAT section's real grounding content. Order follows first
+    appearance (the rows arrive sorted by source), so the tree is stable."""
+    order: list[str] = []
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in chunks:
+        source = str(row.get("source", ""))
+        section, _, chunk_id = source.partition("#")
+        section = section or "general"
+        text = str(row.get("text", ""))
+        if section not in grouped:
+            grouped[section] = []
+            order.append(section)
+        grouped[section].append(
+            {"id": chunk_id or source, "source": source, "title": _kb_chunk_title(text), "text": text}
+        )
+    return [
+        {
+            "id": section,  # raw slug — for client keys/logic only, never rendered as text
+            "label": _kb_section_label(section),
+            "count": len(grouped[section]),
+            "chunks": grouped[section],
+        }
+        for section in order
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -602,12 +693,31 @@ def create_improve_router(
     # --- P8 KB / Playbook Editor -------------------------------------------------------------
     @router.get("/api/kb")
     async def get_kb_ep() -> dict[str, Any]:
-        """The current champion config's KB reference (P8 left tree / draft banner). Read-only."""
+        """The REAL grounded corpus the agent retrieves on, for the P8 KB browser (read-only).
+
+        Returns the kb_chunk rows for the champion's active kb_version GROUPED BY section (the prefix
+        of each source "<section>#<id>") — so the operator browses the actual facts / objection
+        rebuttals the agent grounds answers on, organized by section, with counts that match what is
+        shown. The champion config's placeholder rebuttal strings are intentionally DROPPED from this
+        response so no PLACEHOLDER text ever reaches the operator — `sections` is the corpus the UI
+        renders. The draft-save path (POST /api/kb) forks the champion config directly, so it does not
+        depend on this read returning the rebuttal map.
+
+        Degrades safely: if the injected store has no list_kb_chunks (e.g. a fake seeded only with
+        experiments) or the table is empty, `sections` is [] and the page shows an empty-state rather
+        than failing.
+        """
         cfg = get_config()
+        chunks: list[dict[str, Any]] = []
+        list_chunks = getattr(store, "list_kb_chunks", None)
+        if list_chunks is not None:
+            chunks = await list_chunks(kb_version=cfg.kb_version)
+        sections = kb_chunks_to_sections(chunks)
         return {
             "kb_version": cfg.kb_version,
             "version": cfg.version,
-            "rebuttals": cfg.playbooks.get("rebuttals", {}),
+            "sections": sections,
+            "total_chunks": sum(s["count"] for s in sections),
         }
 
     @router.get("/api/playbook")

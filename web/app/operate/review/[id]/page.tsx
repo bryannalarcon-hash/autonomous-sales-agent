@@ -4,7 +4,9 @@
 // tick marks at key decision turns, and a belief snapshot (Trust + Walk-away risk gauges, stage +
 // the selected turn's decision, slot mini-table) that reflects the NEAREST belief snapshot at/below
 // the selected turn. Drives entirely off the recorded per-turn belief log (/api/episodes/{id}); all
-// labels are pre-translated by the backend (no driver slug / internal index renders).
+// labels are pre-translated by the backend (no driver slug / internal index renders). A 0-turn /
+// still-connecting episode renders a graceful empty state (with a link to the live monitor) rather
+// than a blank transcript + dash belief.
 'use client';
 
 import { useMemo, useState } from 'react';
@@ -71,6 +73,34 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
       <div className="page">
         <div className="empty" style={{ margin: 'auto' }}>
           <p className="muted">Loading call…</p>
+        </div>
+      </div>
+    );
+  }
+
+  // A still-connecting / never-started call has no turns to replay — show a graceful empty state
+  // (with the call id + a link to the live monitor) instead of a blank transcript + dash belief.
+  if (ep.turns.length === 0) {
+    const live = ep.outcome_key == null || ep.outcome_key === '' || ep.outcome_key === 'in_progress';
+    return (
+      <div className="page">
+        <div className="empty" style={{ margin: 'auto' }}>
+          <div className="ico">
+            <Icon name="eye" size={28} />
+          </div>
+          <h3>{live ? 'Call still in progress' : 'Nothing recorded yet'}</h3>
+          <p>
+            <span className="mono">{ep.episode_id}</span> has no turns to review yet.{' '}
+            {live
+              ? 'The transcript and decision trace will be here once the call wraps up.'
+              : 'This call ended without a recorded transcript.'}
+          </p>
+          {live ? (
+            <a className="btn btn-ghost btn-sm" href="/operate/live" style={{ marginTop: 12 }}>
+              <Icon name="broadcast" size={14} />
+              Watch it live
+            </a>
+          ) : null}
         </div>
       </div>
     );
@@ -150,7 +180,7 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
                 <div className="rv-tnum">{i + 1}</div>
                 <div className="rv-tc">
                   <div className="rv-twho">
-                    {isAgent ? 'Ava (agent)' : 'Prospect'}
+                    {isAgent ? 'Alex (agent)' : 'Prospect'}
                     <span>·</span>
                     {t.belief?.stage ? (
                       <span className="tag" style={{ padding: '1px 7px' }}>

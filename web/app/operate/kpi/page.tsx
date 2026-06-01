@@ -5,20 +5,45 @@
 // can lift one without the other, so the operator sees both. Version + cohort selectors filter the
 // set; "Compare versions" adds a baseline arm with a bootstrap-CI delta. Secondary panels: ladder-
 // tier distribution + per-archetype conversion. All tier/outcome labels are pre-translated.
+//
+// The version selector is populated from REAL data: /api/versions (lineage) plus the cohort the
+// episodes are actually tagged with, and it DEFAULTS to a version that has episodes so numbers show
+// on first load (no more hardcoded v10/v11/v12 placeholders that matched nothing). Hash suffixes on
+// raw version ids are an internal index and are NOT rendered — the selector shows a clean label.
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Icon } from '@/components/cadence/Icon';
 import { Spark } from '@/components/cadence/Spark';
 import { fetchKpis } from '@/lib/operate-api';
+import { fetchVersions } from '@/lib/improve-api';
 import type { KpiResponse } from '@/lib/operate-types';
 
-// Version/cohort options. These mirror the data the loop tags episodes with; the champion is v12.
-const VERSIONS = ['v12', 'v11', 'v10'];
+// The cohort the seeded episodes are actually tagged with — the only selection guaranteed to have
+// episodes on a fresh backend, so it is the default and is always present in the selector.
+const SEEDED_VERSION = 'champion_v0';
 const COHORTS = ['All', 'held_out', 'training', 'live'];
 
 function pct(v: number): string {
   return `${Math.round(v * 100)}%`;
+}
+
+// One selectable version: the raw id sent to the API + the operator-facing label. The hash suffix on
+// a raw id (e.g. "v1-f3798d7a") is an internal index, so the label strips it; the champion is marked.
+interface VersionOption {
+  value: string; // raw version id passed to /api/kpis
+  label: string; // human-readable label shown in the dropdown (no internal hash)
+}
+
+// Strip the internal suffixes from a raw version id for display: the experiment dimension/seq suffix
+// ("champion_v0__playbooks_discovery_sequence__7" -> "champion_v0") and any short hash
+// ("v1-f3798d7a" -> "v1"), then humanize the prefix ("champion_v0" -> "Champion v0"). Never shows the
+// raw internal index to the operator (the raw id is still the value sent to /api/kpis).
+function versionLabel(raw: string): string {
+  let base = raw.split('__')[0];
+  base = base.split('-')[0];
+  if (base.startsWith('champion_')) return `Champion ${base.slice('champion_'.length)}`;
+  return base;
 }
 
 function BarRow({
@@ -52,17 +77,60 @@ function BarRow({
 
 export default function KpiPage() {
   const [mode, setMode] = useState<'overview' | 'compare'>('overview');
-  const [version, setVersion] = useState('v12');
+  // Default to the seeded cohort so real numbers render on first load (was a hardcoded "v12" that
+  // matched no episodes). The selector is repopulated from /api/versions once it loads.
+  const [version, setVersion] = useState(SEEDED_VERSION);
   const [cohort, setCohort] = useState('All');
+  const [versionOptions, setVersionOptions] = useState<VersionOption[]>([
+    { value: SEEDED_VERSION, label: versionLabel(SEEDED_VERSION) },
+  ]);
   const [data, setData] = useState<KpiResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Populate the version selector from REAL lineage data. The seeded cohort (which actually has
+  // episodes) is always kept in the list and stays the default; lineage versions are appended.
+  useEffect(() => {
+    let cancelled = false;
+    fetchVersions()
+      .then((res) => {
+        if (cancelled) return;
+        // De-dupe by the OPERATOR-FACING label, not the raw id: experiment-suffixed ids
+        // ("champion_v0__…") collapse to the same "Champion v0" label, so keep the first (the seeded,
+        // populated cohort) and drop the n=0 duplicates that would only render "No calls".
+        const seenLabels = new Set<string>();
+        const opts: VersionOption[] = [];
+        const add = (raw: string) => {
+          if (!raw) return;
+          const label = versionLabel(raw);
+          if (seenLabels.has(label)) return;
+          seenLabels.add(label);
+          opts.push({ value: raw, label });
+        };
+        add(SEEDED_VERSION); // guaranteed-populated default first
+        for (const v of res.versions) add(v.version);
+        setVersionOptions(opts);
+      })
+      .catch(() => {
+        // Lineage fetch failing is non-fatal — keep the seeded default so the page still shows data.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Compare baseline: prefer a different real version than the current selection, else fall back to
+  // the seeded cohort so the compare arm always queries a version that exists.
+  const compareVersion = useMemo(() => {
+    const other = versionOptions.find((o) => o.value !== version);
+    return other?.value ?? SEEDED_VERSION;
+  }, [versionOptions, version]);
 
   useEffect(() => {
     let cancelled = false;
     fetchKpis({
       version,
       cohort: cohort === 'All' ? undefined : cohort,
-      compare_version: mode === 'compare' ? 'v10' : undefined,
+      compare_version: mode === 'compare' ? compareVersion : undefined,
     })
       .then((res) => {
         if (!cancelled) {
@@ -76,7 +144,7 @@ export default function KpiPage() {
     return () => {
       cancelled = true;
     };
-  }, [version, cohort, mode]);
+  }, [version, cohort, mode, compareVersion]);
 
   return (
     <div className="page">
@@ -94,9 +162,9 @@ export default function KpiPage() {
             </div>
             <div className="grow" />
             <select className="field" value={version} onChange={(e) => setVersion(e.target.value)}>
-              {VERSIONS.map((v) => (
-                <option key={v} value={v}>
-                  Version {v}
+              {versionOptions.map((v) => (
+                <option key={v.value} value={v.value}>
+                  {v.label}
                 </option>
               ))}
             </select>
@@ -132,7 +200,7 @@ export default function KpiPage() {
                   <Icon name="chart" size={28} />
                 </div>
                 <h3>No calls for this selection</h3>
-                <p>No episodes match version {version} {cohort === 'All' ? '' : `· ${cohort}`}. Try another filter.</p>
+                <p>No episodes match {versionLabel(version)} {cohort === 'All' ? '' : `· ${cohort}`}. Try another filter.</p>
               </div>
             </div>
           ) : mode === 'compare' && data.compare ? (
@@ -261,6 +329,9 @@ function Overview({ data }: { data: KpiResponse }) {
 
 function CompareTable({ data }: { data: KpiResponse }) {
   const c = data.compare!;
+  // Show clean, human-readable version labels (no internal hash suffix) for both arms.
+  const baselineLabel = data.compare_version ? versionLabel(data.compare_version) : 'baseline';
+  const championLabel = data.version ? versionLabel(data.version) : 'champion';
   const rows: [string, string, string, string, 'up' | 'down' | 'flat'][] = [
     [
       'Weighted-ladder score',
@@ -284,7 +355,7 @@ function CompareTable({ data }: { data: KpiResponse }) {
       <div className="sec-head">
         <h2>Champion vs. baseline</h2>
         <span className="sub">
-          {data.compare_version} (baseline) vs {data.version} (champion) · n {c.n_baseline} / {c.n_champion}
+          {baselineLabel} (baseline) vs {championLabel} (champion) · n {c.n_baseline} / {c.n_champion}
           {' · '}
           {c.challenger_better ? 'real lift (CI excludes 0)' : 'lift not separated from noise'}
         </span>
@@ -294,8 +365,8 @@ function CompareTable({ data }: { data: KpiResponse }) {
           <thead>
             <tr>
               <th>Metric</th>
-              <th className="num">{data.compare_version} (baseline)</th>
-              <th className="num">{data.version} (champion)</th>
+              <th className="num">{baselineLabel} (baseline)</th>
+              <th className="num">{championLabel} (champion)</th>
               <th className="num">Δ</th>
             </tr>
           </thead>

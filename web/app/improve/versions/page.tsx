@@ -12,11 +12,26 @@ import { Icon } from '@/components/cadence/Icon';
 import { fetchVersions, rollbackVersion } from '@/lib/improve-api';
 import type { VersionNode } from '@/lib/improve-types';
 
-// Pull a numeric ladder KPI out of a node's stored kpi snapshot (best-effort; defaults to 0).
+// Pull the numeric ladder KPI out of a node's stored kpi snapshot. The backend stores it under the
+// `ladder` key (e.g. {"ladder": 0.51}); older snapshots may use challenger_kpi/champion_kpi, so those
+// remain as fallbacks. (Previously this only read challenger_kpi/champion_kpi, so the real `ladder`
+// value rendered as 0.00.) Best-effort; defaults to 0 when no numeric value is present.
 function ladderOf(node: VersionNode): number {
   const kpi = node.kpi || {};
-  const v = (kpi['challenger_kpi'] ?? kpi['champion_kpi'] ?? 0) as number;
+  const v = (kpi['ladder'] ?? kpi['challenger_kpi'] ?? kpi['champion_kpi'] ?? 0) as number;
   return typeof v === 'number' ? v : 0;
+}
+
+// Operator-facing version label: strips the internal experiment suffix
+// ("champion_v0__playbooks_discovery_sequence__7" -> "champion_v0") and any short hash
+// ("v1-f3798d7a" -> "v1"), then humanizes the prefix ("champion_v0" -> "Champion v0") so no internal
+// index leaks into the version text the operator reads. The raw `version` is still used for keys,
+// selection, and the rollback POST; the change itself is shown via the dimension_label tag.
+function versionLabel(raw: string): string {
+  let base = raw.split('__')[0];
+  base = base.split('-')[0];
+  if (base.startsWith('champion_')) return `Champion ${base.slice('champion_'.length)}`;
+  return base;
 }
 
 function Mini({ l, v, w }: { l: string; v: string; w: number }) {
@@ -66,9 +81,9 @@ function RollbackModal({
           >
             <Icon name="rollback" size={20} />
           </div>
-          <h3 style={{ fontSize: 17 }}>Roll back to {v.version}?</h3>
+          <h3 style={{ fontSize: 17 }}>Roll back to {versionLabel(v.version)}?</h3>
           <p className="muted" style={{ fontSize: 13, lineHeight: 1.55 }}>
-            This makes <b className="mono" style={{ color: 'var(--text)' }}>{v.version} · {v.kb_version}</b> the live champion.
+            This makes <b className="mono" style={{ color: 'var(--text)' }}>{versionLabel(v.version)} · {v.kb_version}</b> the live champion.
             The current champion will be archived — no calls in flight are interrupted.
           </p>
           <div className="card solid card-pad" style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -199,7 +214,7 @@ export default function VersionsPage() {
                     }}
                   >
                     <div className="row" style={{ gap: 9 }}>
-                      <span className="b mono" style={{ fontSize: 14 }}>{v.version}</span>
+                      <span className="b mono" style={{ fontSize: 14 }}>{versionLabel(v.version)}</span>
                       {v.is_champion ? <span className="tag accent dot">Champion</span> : null}
                       <span className="tag">{v.kb_version}</span>
                       {v.dimension_label ? <span className="tag">{v.dimension_label}</span> : null}
@@ -207,7 +222,7 @@ export default function VersionsPage() {
                     <div className="row" style={{ gap: 16, marginTop: 9 }}>
                       <Mini l="Ladder" v={ladder.toFixed(2)} w={ladder / maxLadder} />
                       <span className="faint" style={{ fontSize: 11.5, marginLeft: 'auto', alignSelf: 'flex-end' }}>
-                        parent {v.parent_version ?? 'genesis'}
+                        parent {v.parent_version ? versionLabel(v.parent_version) : 'genesis'}
                       </span>
                     </div>
                   </div>
@@ -224,14 +239,14 @@ export default function VersionsPage() {
             style={{ borderLeft: '1px solid var(--border)', overflow: 'auto', padding: 20, display: 'flex', flexDirection: 'column', gap: 14 }}
           >
             <div className="row" style={{ gap: 10 }}>
-              <span className="b mono" style={{ fontSize: 22, fontFamily: 'var(--font-display)' }}>{sel.version}</span>
+              <span className="b mono" style={{ fontSize: 22, fontFamily: 'var(--font-display)' }}>{versionLabel(sel.version)}</span>
               {sel.is_champion ? <span className="tag accent dot">Champion</span> : <span className="tag">Archived</span>}
             </div>
             <div className="card solid card-pad" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
               {(
                 [
                   ['Knowledge base', sel.kb_version],
-                  ['Parent', sel.parent_version ?? '—'],
+                  ['Parent', sel.parent_version ? versionLabel(sel.parent_version) : '—'],
                   ['Change', sel.dimension_label ?? '—'],
                   ['Created', sel.created_at ? new Date(sel.created_at).toLocaleDateString() : '—'],
                 ] as [string, string][]
@@ -247,11 +262,12 @@ export default function VersionsPage() {
                 Performance
               </div>
               <div className="row" style={{ gap: 10, marginBottom: 9 }}>
-                <span style={{ width: 116, fontSize: 12, color: 'var(--text-2)', fontWeight: 600 }}>Weighted ladder</span>
+                <span style={{ width: 116, fontSize: 12, color: 'var(--text-2)', fontWeight: 600 }}>Ladder score</span>
                 <span className="bar grow">
-                  <i style={{ width: `${Math.min(100, (ladderOf(sel) / 5) * 100)}%`, background: 'var(--accent)' }} />
+                  {/* `ladder` is a normalized 0..1 KPI; scale the bar by that fraction directly. */}
+                  <i style={{ width: `${Math.min(100, ladderOf(sel) * 100)}%`, background: 'var(--accent)' }} />
                 </span>
-                <span className="mono" style={{ fontSize: 12, width: 50, textAlign: 'right' }}>{ladderOf(sel).toFixed(2)} / 5</span>
+                <span className="mono" style={{ fontSize: 12, width: 50, textAlign: 'right' }}>{ladderOf(sel).toFixed(2)}</span>
               </div>
             </div>
             {sel.is_champion ? (
@@ -267,7 +283,7 @@ export default function VersionsPage() {
                 </button>
                 <button className="btn btn-primary grow" onClick={() => setRollback(sel)}>
                   <Icon name="rollback" size={16} />
-                  Roll back to {sel.version}
+                  Roll back to {versionLabel(sel.version)}
                 </button>
               </div>
             )}
