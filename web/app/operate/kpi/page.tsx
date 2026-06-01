@@ -9,7 +9,10 @@
 // archetype rows (the agent's own name "Alex", and "Unknown"/empty). The same-call enrollment tile
 // uses rateValue() so a small-but-nonzero rate (≈0.03%) reads "<0.1"/one-decimal, never a flat "0",
 // and carries an "n of N calls" sublabel so a true 0% reads as a measured rare event, not an empty
-// panel. The archetype panel is titled "Same-call enrollment by archetype" and, when every archetype
+// panel. Small-sample cohorts (n < SMALL_SAMPLE_N) — e.g. selecting vB at n=1 — show a muted
+// "n=N — directional only" caveat above the headline tiles so an extreme rate (a "100%" on n=1)
+// doesn't read like a settled stat; the numbers are NOT hidden, just qualified. The archetype panel
+// is titled "Same-call enrollment by archetype" and, when every archetype
 // is at 0% (enrollment is genuinely rare for the seeded champion), leads with the meaningful NON-zero
 // signal — the commitment-reached rate (ladder tier >= 2) — so it's informative, not a wall of 0%.
 //
@@ -34,6 +37,11 @@ import { archetypeLabel, versionLabel } from '@/lib/labels';
 // episodes on a fresh backend, so it is the default and is always present in the selector.
 const SEEDED_VERSION = 'champion_v0';
 const COHORTS = ['All', 'held_out', 'training', 'live'];
+
+// Below this many calls a cohort's rates are too thin to be a real statistic (a single call makes a
+// flat "100%"/"0%" that reads like a settled result). At/under this we surface a muted "directional
+// only" caveat next to the headline numbers — we DON'T hide the numbers, just qualify them.
+const SMALL_SAMPLE_N = 10;
 
 function pct(v: number): string {
   return `${Math.round(v * 100)}%`;
@@ -330,8 +338,34 @@ function Overview({ data }: { data: KpiResponse }) {
     .filter((d) => d.tier >= 2)
     .reduce((sum, d) => sum + d.rate, 0);
   const allArchetypesZero = archetypes.length > 0 && archetypes.every((a) => a.conversion <= 0);
+  // A thin cohort (e.g. vB at n=1): qualify the headline rates as directional rather than letting an
+  // extreme "100%"/"0%" read as a settled statistic. The numbers still render below.
+  const smallSample = data.n < SMALL_SAMPLE_N;
   return (
     <>
+      {/* Small-sample caveat — sits directly above the headline rates so an n=1 "100%" reads as
+          directional, not settled. Muted on purpose; the real numbers are still shown below. */}
+      {smallSample ? (
+        <div
+          className="row"
+          style={{
+            gap: 8,
+            alignItems: 'center',
+            marginBottom: 12,
+            padding: '8px 12px',
+            borderRadius: 10,
+            background: 'var(--surface-2, var(--surface))',
+            border: '1px solid var(--border)',
+          }}
+        >
+          <Icon name="alert" size={14} style={{ color: 'var(--text-3)' }} />
+          <span className="muted" style={{ fontSize: 12.5 }}>
+            n={data.n} — directional only. Rates on so few calls aren&apos;t a stable statistic; treat
+            them as a signal, not a measurement.
+          </span>
+        </div>
+      ) : null}
+
       {/* primary tiles — the ladder headline AND the DISTINCT enrollment rate, side by side */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 14, marginBottom: 16 }}>
         <div className="kpi">

@@ -1,17 +1,21 @@
 // P5 — Escalation Queue (U15). The review queue (store.list_escalations) with lifecycle states:
 // Unreviewed → Reviewed → Resolved, shown as a segmented control with live counts. Each escalation
 // is a card with a severity bar (derived from the reason category — compliance/concession run hot),
-// the labeled reason, the linked call, and the trigger moment. Clicking opens a drawer with the
-// trigger moment, a "Belief at escalation" mini-bar block, and actions: Open call (→ Call Review),
-// an optional manual-takeover affordance, Mark reviewed (only when unreviewed), and Resolve. All
-// reason/lifecycle text is the backend's pre-translated label (no raw key renders).
+// the labeled reason, the linked call, and the trigger moment. Clicking opens a drawer that fetches
+// the referenced episode (fetchEpisode) and renders the REAL belief snapshot at the escalation's
+// turn_id (nearest at/below, like the review page) — hidden if the turn/episode can't be resolved.
+// Drawer actions: Open call (→ Call Review); Take over (honestly DISABLED — operator barge-in is
+// not built, mirrors the Live page treatment); Mark reviewed (unreviewed only) → POST lifecycle
+// `reviewed`; Resolve → POST lifecycle `resolved`. A successful POST optimistically updates the row
+// + drawer and refetches the queue so the segmented-control counts move; a 4xx surfaces inline.
+// All reason/lifecycle text is the backend's pre-translated label (no raw key renders).
 'use client';
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
-import { fetchEscalations } from '@/lib/operate-api';
-import type { Escalation, EscalationListResponse } from '@/lib/operate-types';
+import { fetchEpisode, fetchEscalations, updateEscalationLifecycle } from '@/lib/operate-api';
+import type { BeliefSnapshot, Escalation, EscalationListResponse } from '@/lib/operate-types';
 
 type Sev = 'high' | 'med' | 'low';
 const SEV_COLOR: Record<Sev, string> = { high: 'danger', med: 'warn', low: 'info' };
@@ -32,14 +36,115 @@ const TABS: { key: 'unreviewed' | 'reviewed' | 'resolved'; label: string }[] = [
   { key: 'resolved', label: 'Resolved' },
 ];
 
-function Drawer({ e, onClose }: { e: Escalation; onClose: () => void }) {
+// A belief-driver row to render in the "Belief at escalation" block: the labeled signal, its 0..1
+// value, and a value-tuned color (high = danger, mid = warn, low = info). Trust is INVERTED — low
+// trust is the bad signal — so it greens at high values and reddens at low ones.
+function driverColor(key: string, label: string, value: number): string {
+  const isTrust = key === 'trust' || label.toLowerCase() === 'trust';
+  const v = isTrust ? 1 - value : value;
+  if (v >= 0.66) return 'var(--danger)';
+  if (v >= 0.4) return 'var(--warn)';
+  return 'var(--info)';
+}
+
+// The escalation's belief snapshot = the NEAREST recorded belief at/below the escalation's turn_id
+// (the same fallback the call-review replay uses). turn_id indexes the turns list; a prospect turn
+// often has no belief, so we walk backward to the last agent turn that carries one. Returns null if
+// nothing resolves (the drawer then HIDES the bars rather than show fabricated values).
+function beliefAtTurn(
+  turns: { turn_id: number; belief: BeliefSnapshot | null }[],
+  turnId: number | null,
+): BeliefSnapshot | null {
+  if (turns.length === 0) return null;
+  const start =
+    turnId != null && turnId >= 0 && turnId < turns.length ? turnId : turns.length - 1;
+  for (let i = start; i >= 0; i--) {
+    if (turns[i]?.belief) return turns[i].belief;
+  }
+  return null;
+}
+
+function Drawer({
+  e,
+  onClose,
+  onLifecycleChange,
+}: {
+  e: Escalation;
+  onClose: () => void;
+  // Bubble a confirmed lifecycle transition up so the page optimistically updates the row + refetches
+  // the queue (so the segmented-control counts move). Called only AFTER the POST returns 200.
+  onLifecycleChange: (id: string, lifecycle: Escalation['lifecycle']) => void;
+}) {
   const router = useRouter();
   const sev = severityOf(e.reason_key);
-  const beliefRows: [string, number, string][] = [
-    ['Walk-away risk', 0.71, 'var(--danger)'],
-    ['Concession pressure', 0.64, 'var(--warn)'],
-    ['Trust', 0.38, 'var(--warn)'],
-  ];
+
+  // The drawer reflects the live lifecycle locally (optimistic) so the chip + which actions show
+  // update the instant a POST succeeds, without waiting for the parent's refetch to round-trip.
+  const [lifecycle, setLifecycle] = useState<Escalation['lifecycle']>(e.lifecycle);
+  const [lifecycleLabel, setLifecycleLabel] = useState<string>(e.lifecycle_label);
+  const [busy, setBusy] = useState<null | 'reviewed' | 'resolved'>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [justSaved, setJustSaved] = useState<string | null>(null);
+
+  // Real belief snapshot at the escalation moment: fetch the referenced episode, then read the
+  // nearest belief at/below turn_id. null = couldn't resolve (episode missing / no belief) → bars
+  // are hidden, never faked.
+  const [belief, setBelief] = useState<BeliefSnapshot | null>(null);
+
+  // Reset all per-escalation state when a DIFFERENT escalation is selected (the parent reuses one
+  // Drawer instance across selections). Keyed on escalation_id ONLY — not lifecycle — because our
+  // own successful POST optimistically flips the parent's e.lifecycle for THIS row, and re-running
+  // this reset on that change would instantly clear the "Marked reviewed" success affordance.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    setLifecycle(e.lifecycle);
+    setLifecycleLabel(e.lifecycle_label);
+    setBusy(null);
+    setActionError(null);
+    setJustSaved(null);
+    setBelief(null);
+  }, [e.escalation_id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!e.episode_id) return;
+    fetchEpisode(e.episode_id)
+      .then((ep) => {
+        if (!cancelled) setBelief(beliefAtTurn(ep.turns, e.turn_id));
+      })
+      .catch(() => {
+        // The episode lookup failing just means we hide the bars (no fabricated belief).
+        if (!cancelled) setBelief(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [e.episode_id, e.turn_id]);
+
+  // Drivers to render: the prioritized primary signals (Trust + Walk-away risk) plus the top few
+  // secondary signals, capped so the block stays compact. Each is the REAL recorded 0..1 value.
+  const driverRows = belief
+    ? [...belief.primary_drivers, ...belief.secondary_drivers.slice(0, 2)]
+    : [];
+
+  async function setLifecycleAction(next: 'reviewed' | 'resolved') {
+    if (busy) return;
+    setBusy(next);
+    setActionError(null);
+    try {
+      const res = await updateEscalationLifecycle(e.escalation_id, next);
+      // Reflect the confirmed state in the drawer, then bubble up for the row + queue refetch.
+      setLifecycle(res.lifecycle);
+      setLifecycleLabel(res.lifecycle === 'resolved' ? 'Resolved' : 'Reviewed');
+      setJustSaved(res.lifecycle === 'resolved' ? 'Resolved' : 'Marked reviewed');
+      onLifecycleChange(e.escalation_id, res.lifecycle);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not update this escalation.');
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <>
       <div className="scrim" onClick={onClose} />
@@ -77,7 +182,7 @@ function Drawer({ e, onClose }: { e: Escalation; onClose: () => void }) {
             <span className={`tag ${SEV_COLOR[sev]}`} style={{ textTransform: 'capitalize' }}>
               {sev} severity
             </span>
-            <span className="tag">{e.lifecycle_label}</span>
+            <span className="tag">{lifecycleLabel}</span>
           </div>
           <div className="card solid card-pad">
             <div
@@ -88,44 +193,75 @@ function Drawer({ e, onClose }: { e: Escalation; onClose: () => void }) {
             </div>
             <div style={{ fontSize: 13.5, lineHeight: 1.5 }}>{e.moment ?? '—'}</div>
           </div>
-          <div className="card solid card-pad">
-            <div
-              className="faint"
-              style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 8 }}
-            >
-              Belief at escalation
-            </div>
-            {beliefRows.map(([l, v, col]) => (
-              <div key={l} className="row" style={{ gap: 10, marginBottom: 8 }}>
-                <span style={{ width: 140, fontSize: 12, color: 'var(--text-2)', fontWeight: 600 }}>{l}</span>
-                <span className="bar grow">
-                  <i style={{ width: `${v * 100}%`, background: col }} />
-                </span>
-                <span className="mono" style={{ fontSize: 12, width: 34, textAlign: 'right' }}>{v.toFixed(2)}</span>
+          {/* REAL belief at the escalation's turn — rendered only when we resolved a snapshot; when
+              the episode/turn can't be found we hide this block rather than show fake bars. */}
+          {driverRows.length > 0 ? (
+            <div className="card solid card-pad">
+              <div
+                className="faint"
+                style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 8 }}
+              >
+                Belief at escalation
               </div>
-            ))}
-          </div>
+              {driverRows.map((d) => (
+                <div key={d.key} className="row" style={{ gap: 10, marginBottom: 8 }}>
+                  <span style={{ width: 140, fontSize: 12, color: 'var(--text-2)', fontWeight: 600 }}>{d.label}</span>
+                  <span className="bar grow">
+                    <i style={{ width: `${d.value * 100}%`, background: driverColor(d.key, d.label, d.value) }} />
+                  </span>
+                  <span className="mono" style={{ fontSize: 12, width: 34, textAlign: 'right' }}>{d.value.toFixed(2)}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
           <div className="row" style={{ gap: 10 }}>
             <button className="btn btn-ghost grow" onClick={() => router.push(`/operate/review/${e.episode_id}`)}>
               <Icon name="eye" size={16} />
               Open call
             </button>
-            <button className="btn btn-ghost grow" title="Hand the call to a human operator">
+            {/* Operator barge-in into the live call isn't built (tracked as CB-01), so this is honestly
+                DISABLED with the same tooltip as the Live page — never an enabled-but-inert click. */}
+            <button
+              className="btn btn-ghost grow"
+              disabled
+              title="Live takeover isn't available in this build — the monitor is view-only. Interact via the demo console or the phone line."
+            >
               <Icon name="hand" size={16} />
               Take over
             </button>
           </div>
+          {actionError ? (
+            <div className="row" style={{ gap: 7, alignItems: 'center', color: 'var(--danger)', fontSize: 12.5 }}>
+              <Icon name="alert" size={14} />
+              {actionError}
+            </div>
+          ) : justSaved ? (
+            <div className="row" style={{ gap: 7, alignItems: 'center', color: 'var(--ok)', fontSize: 12.5 }}>
+              <Icon name="check" size={14} />
+              {justSaved}
+            </div>
+          ) : null}
           <div className="row" style={{ gap: 10 }}>
-            {e.lifecycle === 'unreviewed' ? (
-              <button className="btn btn-ghost grow">
+            {lifecycle === 'unreviewed' ? (
+              <button
+                className="btn btn-ghost grow"
+                disabled={busy !== null}
+                onClick={() => setLifecycleAction('reviewed')}
+              >
                 <Icon name="check" size={16} />
-                Mark reviewed
+                {busy === 'reviewed' ? 'Saving…' : 'Mark reviewed'}
               </button>
             ) : null}
-            <button className="btn btn-ok grow">
-              <Icon name="check" size={16} />
-              Resolve
-            </button>
+            {lifecycle !== 'resolved' ? (
+              <button
+                className="btn btn-ok grow"
+                disabled={busy !== null}
+                onClick={() => setLifecycleAction('resolved')}
+              >
+                <Icon name="check" size={16} />
+                {busy === 'resolved' ? 'Resolving…' : 'Resolve'}
+              </button>
+            ) : null}
           </div>
         </div>
       </div>
@@ -138,6 +274,9 @@ export default function EscalationsPage() {
   const [data, setData] = useState<EscalationListResponse | null>(null);
   const [sel, setSel] = useState<Escalation | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Bumped after a successful lifecycle POST to re-run the queue fetch (so the segmented-control
+  // counts unreviewed/reviewed/resolved reflect the move).
+  const [refreshTick, setRefreshTick] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -154,7 +293,27 @@ export default function EscalationsPage() {
     return () => {
       cancelled = true;
     };
-  }, [tab]);
+  }, [tab, refreshTick]);
+
+  // A confirmed lifecycle transition (POST returned 200): optimistically rewrite the moved row in
+  // the current list + the open drawer's selection, then trigger a queue refetch so the per-lifecycle
+  // counts update. The row will drop out of the active tab on the refetch (e.g. an unreviewed item
+  // marked reviewed leaves the Unreviewed tab), which is the expected triage behavior.
+  function handleLifecycleChange(id: string, lifecycle: Escalation['lifecycle']) {
+    const label = lifecycle === 'resolved' ? 'Resolved' : lifecycle === 'reviewed' ? 'Reviewed' : 'Unreviewed';
+    setData((prev) =>
+      prev
+        ? {
+            ...prev,
+            escalations: prev.escalations.map((row) =>
+              row.escalation_id === id ? { ...row, lifecycle, lifecycle_label: label } : row,
+            ),
+          }
+        : prev,
+    );
+    setSel((prev) => (prev && prev.escalation_id === id ? { ...prev, lifecycle, lifecycle_label: label } : prev));
+    setRefreshTick((t) => t + 1);
+  }
 
   const counts = data?.counts ?? { unreviewed: 0, reviewed: 0, resolved: 0, dismissed: 0 };
   const rows = data?.escalations ?? [];
@@ -244,7 +403,7 @@ export default function EscalationsPage() {
           )}
         </div>
       </div>
-      {sel ? <Drawer e={sel} onClose={() => setSel(null)} /> : null}
+      {sel ? <Drawer e={sel} onClose={() => setSel(null)} onLifecycleChange={handleLifecycleChange} /> : null}
     </div>
   );
 }

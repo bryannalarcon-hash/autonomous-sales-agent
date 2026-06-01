@@ -3,9 +3,11 @@
 // contract from lib/operate-types. Reuses the same ApiError + NEXT_PUBLIC_API_BASE convention as
 // lib/api.ts (never embeds secrets). The display helpers (duration / time-ago / initials) format
 // raw numeric backend fields for the glass UI; all SEMANTIC labels come pre-translated from the
-// backend, so nothing here re-derives a human label from an internal index.
+// backend, so nothing here re-derives a human label from an internal index. The lone WRITE here is
+// updateEscalationLifecycle (POST /api/escalations/{id}/lifecycle) — the escalation triage action.
 import { ApiError, API_BASE } from './api';
 import type {
+  Escalation,
   EpisodeDetail,
   EpisodeListResponse,
   EscalationListResponse,
@@ -24,6 +26,40 @@ async function getJson<T>(path: string, params?: Record<string, string | undefin
   let res: Response;
   try {
     res = await fetch(url, { headers: { Accept: 'application/json' }, cache: 'no-store' });
+  } catch (cause) {
+    throw new ApiError(0, 'Could not reach the backend. Is the API running?', cause);
+  }
+  const raw = await res.text();
+  let parsed: unknown = undefined;
+  if (raw) {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = raw;
+    }
+  }
+  if (!res.ok) {
+    const detail =
+      parsed && typeof parsed === 'object' && 'detail' in parsed
+        ? String((parsed as { detail: unknown }).detail)
+        : `Request to ${path} failed (${res.status})`;
+    throw new ApiError(res.status, detail, parsed);
+  }
+  return parsed as T;
+}
+
+// POST a JSON body and parse the JSON response, mirroring getJson's ApiError + detail handling so a
+// 400/404 surfaces the backend's `detail` message verbatim (the only mutating call in this module).
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const url = `${API_BASE}${path}`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      cache: 'no-store',
+    });
   } catch (cause) {
     throw new ApiError(0, 'Could not reach the backend. Is the API running?', cause);
   }
@@ -73,6 +109,19 @@ export function fetchEscalations(params?: {
   limit?: string;
 }): Promise<EscalationListResponse> {
   return getJson<EscalationListResponse>('/api/escalations', params);
+}
+
+/** Triage action: move an escalation to a new lifecycle state. POSTs to
+ *  /api/escalations/{id}/lifecycle and returns the backend's confirmed {escalation_id, lifecycle}.
+ *  Throws ApiError on a 400 (invalid lifecycle) / 404 (unknown id) so the caller can show it. */
+export function updateEscalationLifecycle(
+  id: string,
+  lifecycle: Escalation['lifecycle'],
+): Promise<{ escalation_id: string; lifecycle: Escalation['lifecycle'] }> {
+  return postJson<{ escalation_id: string; lifecycle: Escalation['lifecycle'] }>(
+    `/api/escalations/${encodeURIComponent(id)}/lifecycle`,
+    { lifecycle },
+  );
 }
 
 export function fetchLive(): Promise<LiveSnapshot> {

@@ -12,7 +12,9 @@
 // slug, `__…__` experiment suffix, or DRAFT-/exp- id renders. Cards/drawer show the human version +
 // change label (lib/labels: versionLabel/dimensionLabel; backend dimension_label preferred via
 // changeLabel()); the population/cohort value (e.g. legacy `held_out`) is humanized via
-// lib/labels.populationLabel so no raw snake_case slug leaks next to "Champion v1 · …".
+// lib/labels.populationLabel so no raw snake_case slug leaks next to "Champion v1 · …". An
+// experiment whose raw `name` is empty or the placeholder "draft" (case-insensitive) shows the
+// human change label as its title instead (titleOf), so no bold "draft" renders.
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -26,6 +28,15 @@ import { dimensionLabel, populationLabel, versionLabel } from '@/lib/labels';
 // dimension_label, else derive a human label from the raw `dimension` slug. Never the raw `__…__` id.
 function changeLabel(e: Experiment): string {
   return e.dimension_label || dimensionLabel(e.dimension);
+}
+
+// Card/drawer title for an experiment. The raw `name` can be empty or the unhelpful placeholder
+// "draft" (an un-renamed draft run); in those cases fall back to the human change label already on
+// the card (e.g. "Objection rebuttals") so no bold "draft" renders as a title.
+function titleOf(e: Experiment): string {
+  const name = (e.name ?? '').trim();
+  if (!name || name.toLowerCase() === 'draft') return changeLabel(e);
+  return name;
 }
 
 // Experiment state -> the tag color class for the chip (the LABEL text comes from the backend).
@@ -98,7 +109,7 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
               <span className="faint" style={{ fontSize: 11.5, fontWeight: 600 }}>{changeLabel(e)}</span>
               <span className={`tag ${STATE_TAG[e.state]} dot`}>{e.state_label}</span>
             </div>
-            <div className="b" style={{ fontSize: 15.5, fontFamily: 'var(--font-display)' }}>{e.name}</div>
+            <div className="b" style={{ fontSize: 15.5, fontFamily: 'var(--font-display)' }}>{titleOf(e)}</div>
           </div>
           <button className="gctl" onClick={onClose} style={{ width: 36, padding: 0, justifyContent: 'center' }}>
             <Icon name="x" size={16} />
@@ -568,7 +579,7 @@ export default function LabPage() {
                         </span>
                       ) : null}
                     </div>
-                    <div className="b" style={{ fontSize: 15, fontFamily: 'var(--font-display)', letterSpacing: '-0.02em' }}>{e.name}</div>
+                    <div className="b" style={{ fontSize: 15, fontFamily: 'var(--font-display)', letterSpacing: '-0.02em' }}>{titleOf(e)}</div>
                     <div className="row" style={{ gap: 8, marginTop: 6 }}>
                       <span className="tag">
                         {versionLabel(e.champion_version)}
