@@ -11,8 +11,16 @@
 # disclosure. It SEEDS that gate from the consent the BROWSER already captured + carried on the room
 # metadata (_seed_gate_from_metadata): recording granted -> ready, refused-but-proceeding ->
 # unrecorded, unresolved minor -> stays blocked — so can_converse is True from the first turn and the
-# brain answers (the U13 deadlock fix). With NO consent metadata (a future direct SIP call) the gate
-# stays `pending`, so a turn raises ConsentError and is never recorded — fail-closed is preserved.
+# brain answers (the U13 deadlock fix).
+# SIP / PHONE path (no browser to click consent): when _seed_gate_from_metadata returns False AND a
+# remote participant is a SIP caller (_is_sip_call -> ParticipantKind.SIP), the worker arms an
+# IVR-style SPOKEN consent (WorkerVoiceAgent.arm_spoken_consent): the FIRST user turn(s) are
+# intercepted by handle_consent_turn (NOT run through the brain) and classified by
+# _classify_consent_reply — "yes" grants (ready + recorded), "no" refuses (unrecorded or end per
+# RefusalPolicy), a minor-indicating reply flags need_parental (blocked), "unclear" re-asks ONCE then
+# politely ends. Once the gate reaches can_converse, subsequent turns route to the brain as normal —
+# so a phone call works end-to-end without deadlocking on a `pending` gate, while still fail-closed
+# (a turn before consent resolves never reaches the brain / is never recorded).
 # PERSISTENCE (U2/U15): at room close the finished VoiceSession is saved via
 # src.api.persistence.persist_call_end (channel="voice") with the bound phone-hash, any escalations
 # captured DURING the call, and the last close tier — so voice calls flow into /operate exactly like
@@ -33,6 +41,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -43,7 +52,7 @@ from src.kb.embeddings import SentenceTransformerEmbedder
 from src.kb.live import build_live_retrieve_hook
 from src.memory.schema import phone_hash as compute_phone_hash
 from src.voice.agent import AGENT_MODEL, STT_MODEL_ID, build_voice_agent
-from src.voice.consent import NEED_PARENTAL, ConsentGate, RefusalPolicy
+from src.voice.consent import NEED_PARENTAL, ConsentGate, RefusalPolicy, detect_minor
 from src.voice.session import VoiceSession
 
 # --- Import guard for the livekit-agents CORE -----------------------------------------------------
@@ -100,6 +109,90 @@ _MIN_INTERRUPTION_DURATION = float(os.environ.get("VOICE_MIN_INTERRUPTION_DURATI
 _MIN_ENDPOINTING_DELAY = float(os.environ.get("VOICE_MIN_ENDPOINTING_DELAY", "0.4"))
 _MAX_ENDPOINTING_DELAY = float(os.environ.get("VOICE_MAX_ENDPOINTING_DELAY", "6.0"))
 
+# --- SIP spoken-consent: the IVR prompts + the deterministic reply classifier --------------------
+# A PSTN caller has NO browser to click consent, so the worker captures recording consent BY VOICE.
+# The first user turn(s) are routed to handle_consent_turn and classified here (no LLM): an
+# affirmation -> "yes", a negation -> "no", anything ambiguous -> "unclear" (re-asked once).
+
+# The recording-consent ask the agent SPEAKS at the top of a SIP call (after the AI disclosure).
+SIP_CONSENT_PROMPT = (
+    "Before we continue, this call may be recorded for quality and training. "
+    "Do you consent to this call being recorded? Please say yes or no."
+)
+# The single re-ask on an unclear first answer (then we end politely if still unclear).
+SIP_CONSENT_REASK = (
+    "Sorry, I didn't catch that. Do you consent to this call being recorded? "
+    "Please say yes or no."
+)
+# Spoken hand-offs once consent resolves (recorded vs not) and the polite endings.
+SIP_CONSENT_RECORDED = "Thank you. This call will be recorded. How can I help you today?"
+SIP_CONSENT_UNRECORDED = "Thank you. This call will not be recorded. How can I help you today?"
+SIP_CONSENT_ENDED = (
+    "No problem — we won't proceed without your consent to record. Thanks for calling, goodbye."
+)
+SIP_CONSENT_MINOR = (
+    "Thanks for calling. Because this may involve a minor, we'll need a parent or guardian's "
+    "consent before we can continue. Please have them join or call back. Goodbye."
+)
+
+# Affirmation / negation cues for the consent reply. Negation is checked FIRST so "no thanks" and
+# "I do not consent" never read as the affirmative "consent". Word-boundaried so "nope" matches but
+# "another" does not falsely hit "no".
+_CONSENT_NO_RE = re.compile(
+    r"\b(no|nope|nah|don'?t|do not|never|stop|refuse|decline|rather not|"
+    r"negative|disagree|reject|won'?t)\b",
+    re.IGNORECASE,
+)
+_CONSENT_YES_RE = re.compile(
+    r"\b(yes|yeah|yep|yup|sure|ok|okay|consent|agree|agreed|fine|"
+    r"go ahead|of course|absolutely|definitely|please do|that'?s fine|sounds good|affirmative)\b",
+    re.IGNORECASE,
+)
+
+# The livekit.rtc ParticipantKind value for a SIP (PSTN) caller (verified against installed
+# livekit-rtc: PARTICIPANT_KIND_SIP == 3). Kept as a literal so this module stays livekit-free /
+# import-guard-clean; the worker only reads the numeric `.kind` off a remote participant.
+PARTICIPANT_KIND_SIP = 3
+
+
+def _classify_consent_reply(text: str) -> str:
+    """Classify a spoken recording-consent reply as "yes" | "no" | "unclear" (deterministic, no LLM).
+
+    Negation is matched FIRST (so "no thanks" / "I do not consent" / "I'd rather not" are firmly
+    "no") before the affirmation pass, so a reply that contains BOTH (e.g. "no") never reads as yes.
+    Empty / question / pure-filler replies are "unclear" so the worker re-asks once rather than
+    guessing. Robust to punctuation/case; word-boundaried to avoid false hits (e.g. "another" != no).
+    """
+    t = (text or "").strip()
+    if not t:
+        return "unclear"
+    if _CONSENT_NO_RE.search(t):
+        return "no"
+    if _CONSENT_YES_RE.search(t):
+        return "yes"
+    return "unclear"
+
+
+def _is_sip_call(ctx: Any) -> bool:
+    """True when a remote participant is a SIP (PSTN) caller — the no-browser path that needs SPOKEN
+    consent. Reads the numeric `.kind` off each remote participant (livekit.rtc.RemoteParticipant.kind
+    == ParticipantKind.PARTICIPANT_KIND_SIP, 3). Livekit-free: only the int is compared, tolerating
+    a missing kind / empty participant map (-> False, the browser/web default)."""
+    room = getattr(ctx, "room", None)
+    participants = getattr(room, "remote_participants", None) or {}
+    try:
+        values = participants.values()
+    except AttributeError:
+        values = participants
+    for p in values:
+        kind = getattr(p, "kind", None)
+        try:
+            if int(kind) == PARTICIPANT_KIND_SIP:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
 
 class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
     """The live LiveKit Agent for the worker — delegates EVERY brain decision to a VoiceSession.
@@ -134,6 +227,13 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
         self.voice_session: VoiceSession = base.voice_session
         self._pending_speech_id: Optional[str] = None
         self._turn_counter = 0
+        # SIP spoken-consent state (U13 phone path): when armed (arm_spoken_consent), the FIRST user
+        # turn(s) are intercepted by handle_consent_turn — NOT run through the brain — until recording
+        # consent resolves the gate to can_converse (or ends it). False on the browser path (consent
+        # was seeded from room metadata), so a web call proceeds to the brain on the first turn.
+        self._awaiting_consent = False
+        # Whether the unclear-reply re-ask has already been spent (we re-ask ONCE, then end).
+        self._consent_reasked = False
         # Escalations captured DURING the call (re-pointed onto the episode at persist) + the last
         # committed close tier (the schema Turn carries no tier, so we track it for outcome mapping).
         self.escalations: list[Any] = []
@@ -141,20 +241,105 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
         # In-flight async escalation-handling tasks, awaited at shutdown before persisting.
         self._escalation_tasks: list[Any] = []
 
+    # --- SIP spoken-consent sub-flow (the no-browser phone path) --------------------------------
+
+    def arm_spoken_consent(self) -> str:
+        """Arm the IVR-style spoken-consent capture for a SIP/phone call and return the prompt to SPEAK.
+
+        Called by entrypoint ONLY when there was NO browser-captured consent (the gate is still
+        `pending`) AND the caller is a SIP participant. While armed, on_user_turn_completed routes the
+        first user turn(s) to handle_consent_turn instead of the brain. The browser/web path never
+        calls this, so its first turn flows straight to the brain (the web-voice path is unchanged)."""
+        self._awaiting_consent = True
+        self._consent_reasked = False
+        return SIP_CONSENT_PROMPT
+
+    async def handle_consent_turn(self, text: str) -> Optional[str]:
+        """Advance the ConsentGate from ONE spoken consent reply and return the next line to SPEAK.
+
+        This is the SIP equivalent of the browser's consent click — the reply is NEVER run through the
+        brain (no record/answer before consent). Classifies via _classify_consent_reply, also runs
+        detect_minor on the reply so a school-aged self-referring caller is gated (COPPA/FERPA):
+          - minor detected -> flag_minor() -> need_parental (BLOCKED, even on a "yes"); stop awaiting.
+          - "yes" -> acknowledge_ai() + grant_recording() -> ready (recorded); stop awaiting.
+          - "no"  -> refuse_recording() -> unrecorded or ended per RefusalPolicy; stop awaiting.
+          - "unclear" -> re-ask ONCE (stay awaiting); a second unclear -> end() (no deadlock).
+        Once this returns with _awaiting_consent False AND the gate can_converse, subsequent turns
+        route to the brain. Returns the spoken hand-off / re-ask / ending line (None never expected)."""
+        gate = self.voice_session.consent_gate
+        if gate is None:  # pragma: no cover - entrypoint always arms with a gate attached
+            self._awaiting_consent = False
+            return None
+
+        # Suspected-minor check on the captured reply FIRST (R40): a minor may not proceed unsupervised
+        # regardless of what they answered, so this overrides a "yes".
+        if detect_minor({"text": text}):
+            gate.flag_minor()
+            self._awaiting_consent = False
+            return SIP_CONSENT_MINOR
+
+        verdict = _classify_consent_reply(text)
+        if verdict == "yes":
+            gate.acknowledge_ai()
+            gate.grant_recording()
+            self._awaiting_consent = False
+            return SIP_CONSENT_RECORDED
+        if verdict == "no":
+            gate.acknowledge_ai()
+            gate.refuse_recording()  # -> unrecorded or ended per the gate's RefusalPolicy
+            self._awaiting_consent = False
+            return SIP_CONSENT_UNRECORDED if gate.can_converse else SIP_CONSENT_ENDED
+        # Unclear: re-ask exactly once, then end politely (never loop forever / deadlock).
+        if not self._consent_reasked:
+            self._consent_reasked = True
+            return SIP_CONSENT_REASK
+        gate.end()
+        self._awaiting_consent = False
+        return SIP_CONSENT_ENDED
+
     async def on_user_turn_completed(
         self, turn_ctx: Any, new_message: Any
     ) -> None:
-        """User finished speaking (final STT): run the brain speculatively and buffer the reply.
+        """User finished speaking (final STT): capture spoken consent (SIP path) or run the brain.
 
-        Generates a fresh speech_id, runs respond() through the session (consent-gated + RAG-grounded),
-        and remembers the speech_id so llm_node can surface the buffered reply. No state write here."""
+        While _awaiting_consent (SIP/phone path with no browser-captured consent), the turn is the
+        consent answer: route it to handle_consent_turn and SPEAK the result — the brain NEVER runs on
+        it. Otherwise (consent already resolved, or the browser path), generate a fresh speech_id, run
+        respond() through the session (consent-gated + RAG-grounded), and remember the speech_id so
+        llm_node can surface the buffered reply. No committed-state write here."""
         user_text = (new_message.text_content or "").strip()
         if not user_text:
+            return
+        if self._awaiting_consent:
+            # Intercept as the consent answer — do NOT run the brain or record this turn.
+            reply = await self.handle_consent_turn(user_text)
+            if reply is not None:
+                await self._say_consent_line(reply)
             return
         self._turn_counter += 1
         speech_id = f"t-{self._turn_counter}"
         self._pending_speech_id = speech_id
         await self.voice_session.handle_user_turn(user_text, speech_id)
+
+    async def _say_consent_line(self, text: str) -> None:
+        """SPEAK a consent prompt/hand-off line via the running AgentSession (livekit), if available.
+
+        The agent's real `session` is the running AgentSession; with no live session attached (unit
+        tests, or before the AgentSession starts) the real livekit Agent's `session` PROPERTY RAISES
+        (no activity), and with the object base there is none — both are treated as "no session, no-op"
+        (the tests drive handle_consent_turn directly). Kept tiny + defensive so a missing/erroring
+        session or a TTS hiccup never crashes the consent flow."""
+        try:
+            session = self.session  # real livekit Agent: property; raises if not running
+        except Exception:  # no running AgentSession (tests / pre-start) -> nothing to speak through
+            return
+        say = getattr(session, "say", None)
+        if say is None:  # pragma: no cover - exercised only with a live AgentSession attached
+            return
+        try:
+            await say(text, allow_interruptions=False)
+        except Exception:  # pragma: no cover - defensive: a TTS hiccup must not crash the call
+            logger.warning("failed to speak consent line")
 
     async def llm_node(self, chat_ctx: Any, tools: Any, model_settings: Any) -> str:
         """Surface the brain's pre-computed reply for the current turn (PARITY — never re-decide).
@@ -456,8 +641,13 @@ async def entrypoint(ctx: Any) -> None:  # pragma: no cover - requires live live
     # waiting forever for spoken consent. If NO consent metadata is present (a future direct SIP
     # call), the gate stays `pending` and the worker keeps its fail-closed behavior.
     seeded = _seed_gate_from_metadata(gate, ctx)
-    logger.info("consent gate: jurisdiction=%r mode=%s phone_bound=%s seeded=%s state=%s can_converse=%s",
-                jurisdiction, gate.mode, phone_hash_value is not None, seeded, gate.state,
+    # SIP / PHONE path: no browser captured consent (seeded is False) AND the caller is a SIP
+    # participant -> capture consent BY VOICE (the browser path has no SIP participant, so this stays
+    # False there and the seeded gate proceeds straight to the brain). When neither seeded nor SIP
+    # (an unexpected no-consent web call), the gate stays fail-closed exactly as before.
+    is_sip = (not seeded) and _is_sip_call(ctx)
+    logger.info("consent gate: jurisdiction=%r mode=%s phone_bound=%s seeded=%s sip=%s state=%s can_converse=%s",
+                jurisdiction, gate.mode, phone_hash_value is not None, seeded, is_sip, gate.state,
                 gate.can_converse)
 
     agent = _build_brain(config, consent_gate=gate, lead_phone_hash=phone_hash_value)
@@ -495,11 +685,17 @@ async def entrypoint(ctx: Any) -> None:  # pragma: no cover - requires live live
         # DISCLOSURE BEFORE the brain answers (R33): the opening turn re-states the AI + recording
         # disclosure (good practice — the caller hears it on the call too). When the gate was SEEDED
         # from the browser-captured consent it is ALREADY can_converse, so the first user turn flows
-        # straight to the brain (no deadlock). When NO consent metadata was carried (a future direct
-        # SIP call) the gate stays `pending`, so a user turn raises ConsentError until recording
-        # consent is captured (recording granted -> ready, refused -> unrecorded per policy) —
-        # fail-closed is preserved. Spoken consent capture for that SIP path is a MANUAL audio check.
+        # straight to the brain (no deadlock).
         await session.say(gate.disclosure_text, allow_interruptions=True)
+        if is_sip:
+            # SIP / PHONE path (no browser to click consent): ARM the spoken-consent capture and SPEAK
+            # the recording-consent ask. The FIRST user turn(s) are now intercepted by
+            # WorkerVoiceAgent.handle_consent_turn (NOT the brain): "yes" -> ready (recorded), "no" ->
+            # unrecorded/ended per policy, a minor reply -> need_parental (blocked), unclear -> re-ask
+            # once then end. Once consent resolves to can_converse, subsequent turns hit the brain —
+            # so the phone call works end-to-end instead of deadlocking on a `pending` gate.
+            await session.say(agent.arm_spoken_consent(), allow_interruptions=False)
+            logger.info("SIP spoken-consent armed for room %r", ctx.room.name)
         logger.info("voice session started + disclosure spoken for room %r (version=%s kb_version=%s)",
                     ctx.room.name, stamp.get("version"), stamp.get("kb_version"))
     except Exception as exc:

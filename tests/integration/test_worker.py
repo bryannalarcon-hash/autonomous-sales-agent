@@ -10,6 +10,12 @@
 # _wire_commit_on_speech done-callback committing on uninterrupted playout vs discarding on barge-in,
 # the persist-forwarding capture (escalation EscalationLog buffered + close-tier tracked on commit),
 # and the pure room-metadata helpers (_room_jurisdiction / _room_raw_phone from metadata + SIP attrs).
+# ALSO covers the SIP spoken-consent sub-flow (the PSTN path that has no browser to click consent):
+# the deterministic _classify_consent_reply, _is_sip_call participant-kind detection, and the
+# WorkerVoiceAgent IVR loop — the first user turn is intercepted as the consent answer (NOT run
+# through the brain), "yes" -> can_converse + recorded, "no" -> unrecorded/ended per policy, a minor
+# reply -> need_parental (blocked), unclear -> re-ask once then end; once consent resolves a
+# subsequent turn flows to the brain. The browser path (metadata-seeded) is unchanged (regression).
 from __future__ import annotations
 
 import json
@@ -548,3 +554,188 @@ async def test_unseeded_gate_keeps_worker_fail_closed():
         await agent.voice_session.handle_user_turn("How much does it cost?", "pre-consent")
     assert agent.voice_session.state.pending == {}
     assert agent.voice_session.recorded is False
+
+
+# =============================== SIP SPOKEN-CONSENT: the classifier =============================
+# A phone caller has NO browser to click consent, so the worker runs an IVR-style spoken consent
+# before the brain. The classifier is the deterministic core: map a free-text consent reply to
+# yes / no / unclear (keyword/affirmation-negation based, robust to filler/punctuation).
+
+
+def test_classify_consent_reply_affirmatives():
+    """Affirmations -> "yes": plain yes, "sure", "I consent", "go ahead", "yeah that's fine"."""
+    from src.voice import worker as w
+
+    for text in ("yes", "Yes.", "sure", "I consent", "go ahead",
+                 "yeah, that's fine", "yep absolutely", "okay yes please", "of course"):
+        assert w._classify_consent_reply(text) == "yes", text
+
+
+def test_classify_consent_reply_negatives():
+    """Negations -> "no": plain no, "I don't", "stop", "no thanks", "I do not consent"."""
+    from src.voice import worker as w
+
+    for text in ("no", "No.", "I don't", "stop", "no thanks",
+                 "I do not consent", "nope", "please don't record", "I'd rather not"):
+        assert w._classify_consent_reply(text) == "no", text
+
+
+def test_classify_consent_reply_unclear():
+    """Ambiguous / non-answers -> "unclear": "uh, what?", empty, a question, pure filler."""
+    from src.voice import worker as w
+
+    for text in ("uh, what?", "", "   ", "can you repeat that?", "hmm", "who is this"):
+        assert w._classify_consent_reply(text) == "unclear", text
+
+
+# =============================== SIP PATH DETECTION (participant kind) ===========================
+# The SIP path is a call where _seed_gate_from_metadata returned False AND a remote participant is a
+# SIP caller (ParticipantKind.PARTICIPANT_KIND_SIP == 3). The browser/web path is NOT a SIP call.
+
+
+class _StubKindParticipant:
+    """A remote participant exposing a numeric `.kind` (3 == SIP) like livekit.rtc.RemoteParticipant."""
+
+    def __init__(self, kind: int, attributes: Optional[dict[str, str]] = None) -> None:
+        self.kind = kind
+        self.attributes = attributes or {}
+
+
+def test_is_sip_call_true_for_sip_participant():
+    """_is_sip_call is True when a remote participant's kind == PARTICIPANT_KIND_SIP (3)."""
+    from src.voice import worker as w
+
+    room = _StubRoom(remote_participants={"caller": _StubKindParticipant(3)})
+    assert w._is_sip_call(_StubCtx(room)) is True
+
+
+def test_is_sip_call_false_for_standard_participant():
+    """_is_sip_call is False for a standard (browser) participant (kind 0) or no participants."""
+    from src.voice import worker as w
+
+    web_room = _StubRoom(remote_participants={"web": _StubKindParticipant(0)})
+    assert w._is_sip_call(_StubCtx(web_room)) is False
+    assert w._is_sip_call(_StubCtx(_StubRoom(remote_participants={}))) is False
+
+
+# =============================== SIP SPOKEN-CONSENT SUB-FLOW (the IVR loop) ======================
+# The load-bearing new behavior: on a SIP call (no browser-captured consent) the worker arms an
+# _awaiting_consent state. The FIRST user turn(s) are intercepted by handle_consent_turn (NOT run
+# through the brain): "yes" -> grant (ready + recorded), "no" -> refuse (unrecorded/ended per
+# policy), a minor reply -> flag_minor (need_parental, blocked), unclear -> re-ask once then end.
+# Once the gate reaches can_converse, on_user_turn_completed routes subsequent turns to the brain.
+
+
+def _sip_agent(refusal_policy: RefusalPolicy = RefusalPolicy.PROCEED_UNRECORDED,
+               *, llm: Optional[MockLLMClient] = None):
+    """A worker agent armed for the SIP spoken-consent flow: a fresh (pending) gate + _awaiting_consent
+    set, exactly as entrypoint arms it when _seed_gate_from_metadata returned False on a SIP call."""
+    gate = ConsentGate(jurisdiction="ca", refusal_policy=refusal_policy)
+    agent = _make_worker_agent(consent_gate=gate, llm=llm)
+    agent.arm_spoken_consent()
+    return agent, gate
+
+
+async def test_sip_consent_yes_grants_and_records():
+    """"yes" on the intercepted first turn -> gate reaches can_converse AND recorded; the brain never
+    ran on the consent turn (no pending turn / no transcript captured for it)."""
+    agent, gate = _sip_agent()
+    assert agent._awaiting_consent is True
+
+    prompt = await agent.handle_consent_turn("Yes, that's fine.")
+
+    assert gate.can_converse is True
+    assert gate.can_record is True
+    assert agent.voice_session.recorded is True
+    assert agent._awaiting_consent is False
+    # The consent turn was NOT run through the brain: nothing buffered, nothing captured.
+    assert agent.voice_session.state.pending == {}
+    assert agent.voice_session.state.turns == []
+    assert prompt is not None  # a spoken hand-off line is returned
+
+
+async def test_sip_consent_no_proceeds_unrecorded():
+    """"no" with PROCEED_UNRECORDED -> can_converse True but recorded False (the call continues
+    unrecorded); the consent turn never hit the brain."""
+    agent, gate = _sip_agent(RefusalPolicy.PROCEED_UNRECORDED)
+
+    await agent.handle_consent_turn("No, please don't record.")
+
+    assert gate.can_converse is True
+    assert agent.voice_session.recorded is False
+    assert agent._awaiting_consent is False
+    assert agent.voice_session.state.pending == {}
+
+
+async def test_sip_consent_no_ends_under_end_policy():
+    """"no" with the END refusal policy -> the gate ends (NOT conversable); the call is over."""
+    agent, gate = _sip_agent(RefusalPolicy.END)
+
+    await agent.handle_consent_turn("No.")
+
+    assert gate.state == "ended"
+    assert gate.can_converse is False
+    assert agent._awaiting_consent is False
+
+
+async def test_sip_consent_minor_blocks_need_parental():
+    """A minor-indicating consent/early reply -> flag_minor -> need_parental (BLOCKED): can_converse
+    stays False (a suspected minor may not proceed unsupervised), even if they said "yes"."""
+    agent, gate = _sip_agent()
+
+    await agent.handle_consent_turn("Yes, I'm in 9th grade and calling for myself.")
+
+    assert gate.state == "need_parental"
+    assert gate.can_converse is False
+    assert agent._awaiting_consent is False
+
+
+async def test_sip_consent_unclear_reasks_once_then_ends():
+    """Unclear reply -> re-ask ONCE (still awaiting, gate not advanced); a second unclear reply ->
+    politely END (no infinite loop, no deadlock)."""
+    agent, gate = _sip_agent()
+
+    first = await agent.handle_consent_turn("uh, what?")
+    assert agent._awaiting_consent is True  # still capturing consent after one unclear reply
+    assert gate.can_converse is False
+    assert first is not None  # a re-ask prompt
+
+    await agent.handle_consent_turn("hmm")
+    assert gate.state == "ended"
+    assert agent._awaiting_consent is False
+
+
+async def test_sip_first_turn_intercepted_then_brain_runs():
+    """END-TO-END (SIP path) through on_user_turn_completed: the FIRST user turn is intercepted as the
+    consent answer (NOT run through the brain), and AFTER "yes" a subsequent turn DOES run the brain."""
+    agent, gate = _sip_agent()
+
+    # First turn = the consent answer. Intercepted: no pending turn, no transcript.
+    await agent.on_user_turn_completed(None, _StubMessage("Yes, go ahead."))
+    assert gate.can_converse is True
+    assert agent._awaiting_consent is False
+    assert agent.voice_session.state.pending == {}
+    assert agent._pending_speech_id is None  # no speculative brain turn for the consent answer
+
+    # Next turn flows to the brain: a pending turn is buffered (consent resolved).
+    await agent.on_user_turn_completed(None, _StubMessage("How much does it cost per month?"))
+    sid = agent._pending_speech_id
+    assert sid is not None
+    assert sid in agent.voice_session.state.pending
+
+
+async def test_sip_consent_does_not_arm_for_web_path():
+    """REGRESSION: a metadata-seeded (browser) gate is NOT armed for spoken consent — a web call
+    proceeds to the brain on the first turn with no IVR detour (the web-voice path is unchanged)."""
+    from src.voice import worker as w
+
+    gate = ConsentGate(jurisdiction="ca", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
+    w._seed_gate_from_metadata(gate, _StubCtx(_StubRoom(metadata=_consent_meta())))
+    agent = _make_worker_agent(consent_gate=gate)
+    # The web path NEVER calls arm_spoken_consent(), so _awaiting_consent stays False.
+    assert agent._awaiting_consent is False
+
+    await agent.on_user_turn_completed(None, _StubMessage("How much does it cost per month?"))
+    sid = agent._pending_speech_id
+    assert sid is not None and sid in agent.voice_session.state.pending  # brain ran immediately
+    assert agent.voice_session.recorded is True

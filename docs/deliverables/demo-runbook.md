@@ -64,13 +64,13 @@ Installs the backend incl. the FastAPI/uvicorn API service (pydantic, pyyaml, as
 
 ---
 
-## 5. Run the test suite (verified: 224 passed)
+## 5. Run the test suite (verified: 322 passed)
 
 ```bash
 PYTHONPATH=. python3 -m pytest tests -q
 ```
 
-**Verified output:** `224 passed in ~5s`. Breakdown (verified by collection): **unit 93** (`tests/unit/`: config, consent, dst, llm, policy, prospect), **integration 93** (`tests/integration/`: store, respond, kb, memory, selfplay, grading, loop, validation, voice_adapter, escalation, sim2real), **e2e 38** (`tests/e2e/`: demo_call, operate, improve). The suite is fully offline (mock LLMs + fake embedder + in-memory stores).
+**Verified output:** `322 passed` (DB up on 5434; ~10–20s). Spread across `tests/unit/` (config, consent, dst, llm, policy, prospect), `tests/integration/` (store, respond, kb, memory, selfplay, grading, loop, validation, voice_adapter, escalation, sim2real, worker, persistence), and `tests/e2e/` (demo_call, operate, improve, live_rag_persistence). The suite runs offline (mock LLMs + fake embedder); DB-gated tests skip without `DATABASE_URL`/Postgres.
 
 ---
 
@@ -238,6 +238,51 @@ INFO  livekit.agents  registered worker  {"agent_name": "", "id": "AW_********",
 
 ---
 
+## 11. Phone (inbound PSTN via LiveKit Phone Numbers)
+
+A real person can **dial a phone number** and talk to the agent — no browser. The chosen provider is **LiveKit Phone Numbers** (LiveKit Cloud sells the US number). It is **inbound-only and US-only**, and needs **no inbound SIP trunk**: a **SIP dispatch rule** routes each inbound call into its own LiveKit room and dispatches our worker into it. Because a phone caller can't click the browser consent step, the worker captures **recording consent BY VOICE** (the spoken-consent IVR added in `src/voice/worker.py`).
+
+### 11.1 Buy + link a number (LiveKit Cloud dashboard, one-time)
+
+1. In the **LiveKit Cloud dashboard** → **Telephony / Phone Numbers**, **buy a US number** (the project includes **1 free** number). Linking the number to your project is done in the dashboard.
+2. Make sure the project's API key/secret are the ones in your `.env` (`LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`).
+
+> **Manual step:** buying/linking the number is a dashboard action and **cannot be scripted** here. The dispatch rule (next) is scripted.
+
+### 11.2 Create the SIP dispatch rule (one-time)
+
+Run the provided script **once** — it creates a SIP **dispatch rule** that routes inbound calls into per-call `phone-<call_id>` rooms with our worker dispatched into them. It's idempotent on the rule **name** (re-running won't create a duplicate) and **never prints secrets**:
+
+```bash
+PYTHONPATH=. python3 -m scripts.setup_sip_dispatch
+# or:  python3 scripts/setup_sip_dispatch.py
+```
+
+What it does (verified against the installed **livekit-api 1.1.0** SDK): builds a `CreateSIPDispatchRuleRequest` with a `SIPDispatchRuleIndividual(room_prefix="phone-")` and a `RoomConfiguration(agents=[RoomAgentDispatch(agent_name="")])`, then calls `LiveKitAPI().sip.create_dispatch_rule(...)`. `agent_name=""` matches the worker's **default auto-dispatch** (the worker runs with an empty agent name). Overridable via env: `SIP_DISPATCH_RULE_NAME`, `SIP_ROOM_PREFIX`, `SIP_DISPATCH_AGENT_NAME`.
+
+> **Manual / live-account step:** creating the rule mutates your live LiveKit account, so it's run by you (not in CI). With missing creds the script exits cleanly with a clear message; the SDK request shapes were verified in this environment up to the network boundary.
+
+### 11.3 Start the worker
+
+Same worker as the web path (§10.2) — it auto-dispatches into the `phone-<call_id>` room the rule creates:
+
+```bash
+PYTHONPATH=. python3 -m src.voice.worker dev
+```
+
+### 11.4 Dial in → spoken consent → talk to the agent
+
+1. **Dial the number** from any phone.
+2. You'll hear the **AI + recording disclosure**, then: *"…Do you consent to this call being recorded? Please say yes or no."*
+3. Say **"yes"** → the call is recorded and you're handed to the agent (*"Thank you. This call will be recorded. How can I help you today?"*). Say **"no"** → the call proceeds **unrecorded** (or ends, if `VOICE_REFUSAL_POLICY=end`). An **unclear** reply is re-asked once, then the call ends politely. If you say something that flags a **minor** (e.g. *"I'm in 9th grade and calling for myself"*) the call is **blocked** pending a parent/guardian's consent.
+4. After consent resolves, **talk to the agent** — every subsequent turn runs through the same brain as text/web voice; on hang-up the call persists to `/operate` (channel `"voice"`).
+
+> **How it works:** on a SIP call with no browser-captured consent, the worker detects the SIP participant (`ParticipantKind.PARTICIPANT_KIND_SIP`) and **arms spoken consent** — the first user turn(s) are intercepted as the consent answer (classified yes/no/unclear by `_classify_consent_reply`, **never run through the brain**). Once the gate reaches `can_converse`, turns route to the brain. This is the fix for the fail-closed deadlock (a phone caller had no way to consent, so the gate stayed `pending` forever).
+
+> **Cost note:** LiveKit Phone Numbers inbound is roughly **~$0.01/min** (telephony) on top of the same LiveKit Cloud minutes + ElevenLabs STT/TTS + OpenRouter tokens a web voice call spends. **Inbound-only, US-only.** The **live dial-in audio loop and the actual dispatch-rule creation against a real number are MANUAL checks** (they need a real LiveKit account + a real phone call; they can't be CI-tested).
+
+---
+
 ## Command checklist (copy/paste order)
 
 ```bash
@@ -247,9 +292,14 @@ docker compose up -d db                                         # optional (DB p
 for f in 001_init.sql 002_kb.sql 003_experiments.sql; do \
   docker compose exec -T db psql -U sales -d sales_agent < "migrations/$f"; done   # optional
 pip install -e '.[dev]'
-PYTHONPATH=. python3 -m pytest tests -q                         # -> 224 passed
+PYTHONPATH=. python3 -m pytest tests -q                         # -> 322 passed
 PYTHONPATH=. python3 -m uvicorn src.api.server:app --port 8000  # -> /api/health 200
 
 # web (new shell)
 cd web && npm install && cp .env.local.example .env.local && npm run dev   # -> :3000 /demo
+
+# phone (inbound PSTN via LiveKit Phone Numbers) — one-time setup, then start the worker
+#   1) buy + link a US number in the LiveKit Cloud dashboard (1 free)        # MANUAL, dashboard
+PYTHONPATH=. python3 -m scripts.setup_sip_dispatch                 # create the SIP dispatch rule (once)
+PYTHONPATH=. python3 -m src.voice.worker dev                       # start the worker, then dial the number
 ```
