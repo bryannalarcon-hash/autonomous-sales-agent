@@ -8,11 +8,14 @@
 // explainer of what "Start voice call" does (connects you to the AI advisor by voice in-browser;
 // mic permission needed) plus a status/idle indicator, and fills the same column height as the text
 // console beside it — so the panel reads as ready rather than broken. Button + behavior unchanged.
+// Styled in the dark "Cadence" design system (rendered inside the page's `.cadence` scope): a .card
+// shell, .tag warn fallback banner, .btn-primary start control — not raw light Tailwind.
 'use client';
 
 import { useCallback, useRef, useState } from 'react';
 import { Room } from 'livekit-client';
 import { livekitToken, ApiError } from '@/lib/api';
+import { Icon } from '@/components/cadence/Icon';
 import VoiceRoom from './VoiceRoom';
 
 interface VoiceCallProps {
@@ -61,8 +64,10 @@ export default function VoiceCall({ sessionId, identity, enabled }: VoiceCallPro
   }, [sessionId, identity]);
 
   // Idle/connecting status dot + label — mirrors the connected VoiceRoom's status row so the panel
-  // shows a clear state at every stage instead of reading as an empty box (N8).
-  const statusDot = status === 'connecting' ? 'bg-amber-500 animate-pulse' : 'bg-neutral-300';
+  // shows a clear state at every stage instead of reading as an empty box (N8). Dot color maps to a
+  // Cadence token; connecting pulses via the shared cad-blink animation.
+  const dotColor =
+    status === 'connecting' ? 'var(--warn)' : status === 'error' ? 'var(--danger)' : 'var(--text-3)';
   const statusLabel =
     status === 'connecting'
       ? 'Connecting…'
@@ -71,49 +76,67 @@ export default function VoiceCall({ sessionId, identity, enabled }: VoiceCallPro
         : enabled
           ? 'Ready'
           : 'Awaiting consent';
+  const canStart = enabled && !!sessionId && status !== 'connecting';
 
   return (
-    <section className="flex h-full flex-col rounded-lg border border-neutral-200 bg-white">
-      <header className="border-b border-neutral-200 px-4 py-2.5">
-        <h2 className="text-sm font-semibold">Voice call</h2>
+    <section className="card" style={{ display: 'flex', height: '100%', flexDirection: 'column', overflow: 'hidden' }}>
+      <header className="card-head">
+        <Icon name="phone" size={16} />
+        <h3>Voice call</h3>
       </header>
 
-      <div className="flex-1 overflow-y-auto p-4">
+      <div className="scroll" style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 16 }}>
         {status === 'unavailable' ? (
-          <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+          <div
+            className="tag warn"
+            style={{ display: 'flex', width: '100%', padding: '10px 13px', lineHeight: 1.5, whiteSpace: 'normal' }}
+          >
             Voice is unavailable in this environment (LiveKit not configured). Please use the text
             console instead.
           </div>
         ) : status === 'connected' && room ? (
           <VoiceRoom room={room} onDisconnect={() => void disconnect()} />
         ) : (
-          <div className="space-y-4">
+          <div className="col gap16">
             {/* Idle status indicator — parity with the text console's filled panel. */}
-            <div className="flex items-center gap-2 text-sm">
-              <span className={`inline-block h-2 w-2 rounded-full ${statusDot}`} />
-              <span className="text-neutral-600">{statusLabel}</span>
+            <div className="row gap8" style={{ fontSize: 13 }}>
+              <span
+                className={status === 'connecting' ? 'live-dot' : undefined}
+                style={{
+                  display: 'inline-block',
+                  width: 8,
+                  height: 8,
+                  borderRadius: '50%',
+                  background: dotColor,
+                  margin: 0,
+                }}
+              />
+              <span className="muted">{statusLabel}</span>
             </div>
 
             {/* Honest explainer of what the button does, so the panel never looks broken/empty. */}
-            <p className="text-sm leading-relaxed text-neutral-500">
-              <strong className="font-medium text-neutral-700">Start voice call</strong> connects
-              you to the AI tutoring advisor by voice, right in your browser. Your browser will ask
-              for microphone permission so the advisor can hear you — a live transcript appears once
-              you&rsquo;re connected.
+            <p className="muted" style={{ fontSize: 13, lineHeight: 1.6 }}>
+              <strong style={{ fontWeight: 600, color: 'var(--text)' }}>Start voice call</strong>{' '}
+              connects you to the AI tutoring advisor by voice, right in your browser. Your browser
+              will ask for microphone permission so the advisor can hear you — a live transcript
+              appears once you&rsquo;re connected.
             </p>
 
             <button
               type="button"
-              disabled={!enabled || !sessionId || status === 'connecting'}
+              disabled={!canStart}
               onClick={() => void start()}
-              className="rounded-md bg-neutral-900 px-4 py-2 text-sm font-medium text-white hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-40"
+              className="btn btn-primary"
+              style={{ alignSelf: 'flex-start', opacity: canStart ? 1 : 0.4, cursor: canStart ? 'pointer' : 'not-allowed' }}
             >
               {status === 'connecting' ? 'Connecting…' : 'Start voice call'}
             </button>
             {!enabled ? (
-              <p className="text-xs text-neutral-400">Consent required before starting a call.</p>
+              <p className="faint" style={{ fontSize: 11.5 }}>Consent required before starting a call.</p>
             ) : null}
-            {status === 'error' && error ? <p className="text-xs text-red-600">{error}</p> : null}
+            {status === 'error' && error ? (
+              <p style={{ fontSize: 11.5, color: 'var(--danger)' }}>{error}</p>
+            ) : null}
           </div>
         )}
       </div>

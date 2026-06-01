@@ -6,6 +6,9 @@
 // challenger to champion, reject leaves the champion unchanged. A decided card leaves the queue and
 // appends a logged-decision line. A drawer surfaces the full "why it needs sign-off" detail. All
 // version/dimension text is humanized (lib/labels) — no raw `__…__` slug or exp-/DRAFT- id renders.
+// The "champion → challenger" arrow uses challengerArrowLabel: when the challenger shares the
+// champion's base version (a same-base fork), it qualifies the right side with the change dimension
+// so the arrow shows a REAL transition (not an identical "Champion v1 → Champion v1").
 'use client';
 
 import { useEffect, useState } from 'react';
@@ -18,6 +21,19 @@ import { dimensionLabel, versionLabel } from '@/lib/labels';
 // derive a human label from the raw `dimension` slug. Never the raw `__…__` id or slug.
 function changeLabel(a: Experiment): string {
   return a.dimension_label || dimensionLabel(a.dimension);
+}
+
+// The challenger label for the "champion → challenger" arrow. A challenger forked from the champion
+// shares the SAME base version (e.g. champion_v1 → champion_v1__pricing__7 both humanize to
+// "Champion v1"), so a bare versionLabel would render an identical-looking, meaningless transition.
+// When the two base labels collide, qualify the challenger with its change dimension ("Champion v1 ·
+// Pricing concession band") so the arrow shows a REAL change, not "Champion v1 → Champion v1".
+function challengerArrowLabel(a: Experiment): string {
+  const champion = versionLabel(a.champion_version);
+  const challenger = versionLabel(a.challenger_version);
+  if (challenger !== champion) return challenger;
+  const change = changeLabel(a);
+  return change ? `${challenger} · ${change}` : `${challenger} (challenger)`;
 }
 
 function Box({ l, v, good, warn, last }: { l: string; v: string; good?: boolean; warn?: boolean; last?: boolean }) {
@@ -61,7 +77,7 @@ function AprDrawer({
           <div className="grow">
             <div className="row" style={{ gap: 8, marginBottom: 4 }}>
               <span className="faint" style={{ fontSize: 11.5, fontWeight: 600 }}>
-                {versionLabel(a.champion_version)} → {versionLabel(a.challenger_version)}
+                {versionLabel(a.champion_version)} → {challengerArrowLabel(a)}
               </span>
               <span className="tag warn dot">{changeLabel(a)}</span>
             </div>
@@ -209,7 +225,7 @@ export default function ApprovalsPage() {
                   <div className="card-pad">
                     <div className="row" style={{ gap: 9, marginBottom: 9 }}>
                       <span className="tag warn dot">{changeLabel(a)}</span>
-                      <span className="tag">{versionLabel(a.champion_version)} → {versionLabel(a.challenger_version)}</span>
+                      <span className="tag">{versionLabel(a.champion_version)} → {challengerArrowLabel(a)}</span>
                     </div>
                     <div className="b" style={{ fontSize: 16, fontFamily: 'var(--font-display)', letterSpacing: '-0.02em' }}>{a.name}</div>
                     <div className="muted" style={{ fontSize: 13, marginTop: 5, lineHeight: 1.5, maxWidth: 760 }}>

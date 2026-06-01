@@ -3,6 +3,8 @@
 // useConnectionState / useTracks work, and renders the live transcript from the agent's published
 // transcription segments. Exposes mute + disconnect controls. This component assumes a connected
 // Room is passed in; it never fetches tokens or holds secrets (the parent does that).
+// Styled in the dark "Cadence" design system (rendered inside the page's `.cadence` scope): token
+// status dot, .btn-ghost/.btn-danger controls, a surface transcript panel — not raw light Tailwind.
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
@@ -31,29 +33,25 @@ function RoomInner({ onDisconnect }: { onDisconnect: () => void }) {
   }
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-center gap-2 text-sm">
+    <div className="col gap12">
+      <div className="row gap8" style={{ fontSize: 13 }}>
         <span
-          className={`inline-block h-2 w-2 rounded-full ${
-            connectionState === 'connected' ? 'bg-green-500' : 'bg-amber-500'
-          }`}
+          style={{
+            display: 'inline-block',
+            width: 8,
+            height: 8,
+            borderRadius: '50%',
+            background: connectionState === 'connected' ? 'var(--ok)' : 'var(--warn)',
+          }}
         />
-        <span className="capitalize text-neutral-600">{connectionState}</span>
+        <span className="muted" style={{ textTransform: 'capitalize' }}>{connectionState}</span>
       </div>
 
-      <div className="flex gap-2">
-        <button
-          type="button"
-          onClick={() => void toggleMute()}
-          className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 hover:bg-neutral-100"
-        >
+      <div className="row gap8">
+        <button type="button" onClick={() => void toggleMute()} className="btn btn-ghost btn-sm">
           {muted ? 'Unmute' : 'Mute'}
         </button>
-        <button
-          type="button"
-          onClick={onDisconnect}
-          className="rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-500"
-        >
+        <button type="button" onClick={onDisconnect} className="btn btn-danger btn-sm">
           End call
         </button>
       </div>
@@ -106,16 +104,33 @@ export default function VoiceRoom({ room, onDisconnect }: VoiceRoomProps) {
     <RoomContext.Provider value={room}>
       <RoomInner onDisconnect={onDisconnect} />
 
-      <div className="mt-4 rounded-md border border-neutral-200 bg-neutral-50 p-3">
-        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-500">
+      <div
+        style={{
+          marginTop: 16,
+          background: 'var(--surface)',
+          border: '1px solid var(--border)',
+          borderRadius: 'var(--r-sm)',
+          padding: 12,
+        }}
+      >
+        <h3
+          style={{
+            marginBottom: 8,
+            fontSize: 10.5,
+            fontWeight: 700,
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+            color: 'var(--text-3)',
+          }}
+        >
           Live transcript
         </h3>
         {orderedSegments.length === 0 ? (
-          <p className="text-sm text-neutral-400">Transcript will appear here as you talk.</p>
+          <p className="faint" style={{ fontSize: 13 }}>Transcript will appear here as you talk.</p>
         ) : (
-          <ul className="space-y-1 text-sm">
+          <ul className="col gap6" style={{ fontSize: 13, listStyle: 'none', margin: 0, padding: 0 }}>
             {orderedSegments.map((seg) => (
-              <li key={seg.id} className="text-neutral-700">
+              <li key={seg.id} style={{ color: 'var(--text-2)' }}>
                 {seg.text}
               </li>
             ))}

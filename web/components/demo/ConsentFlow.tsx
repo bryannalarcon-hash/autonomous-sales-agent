@@ -4,6 +4,8 @@
 // every returned state. On `need_parental` it shows a parental step that re-submits with
 // parental_consent:true. It NEVER enables the call itself — it reports the resolved ConsentState up
 // to the demo page, which owns gating; this component just drives the conversation to a resolution.
+// Styled in the dark "Cadence" design system (rendered inside the page's `.cadence` scope) — uses
+// the shared .btn-*/.tag/.card tokens, not raw light Tailwind, so it matches the operator console.
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
@@ -80,18 +82,14 @@ export default function ConsentFlow({ jurisdiction, channel, onResolved }: Conse
   );
 
   if (phase === 'loading') {
-    return <p className="text-sm text-neutral-500">Loading disclosure…</p>;
+    return <p className="muted" style={{ fontSize: 13 }}>Loading disclosure…</p>;
   }
 
   if (phase === 'error') {
     return (
-      <div className="space-y-3">
-        <p className="text-sm text-red-600">{error}</p>
-        <button
-          type="button"
-          onClick={() => void start()}
-          className="rounded-md bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-neutral-700"
-        >
+      <div className="col gap12">
+        <p style={{ fontSize: 13, color: 'var(--danger)' }}>{error}</p>
+        <button type="button" onClick={() => void start()} className="btn btn-primary" style={{ alignSelf: 'flex-start' }}>
           Retry
         </button>
       </div>
@@ -100,25 +98,17 @@ export default function ConsentFlow({ jurisdiction, channel, onResolved }: Conse
 
   if (phase === 'parental') {
     return (
-      <div className="space-y-4">
-        <h3 className="text-base font-semibold">Parental consent required</h3>
-        <p className="text-sm text-neutral-600">
+      <div className="col gap14">
+        <h3 style={{ fontSize: 16 }}>Parental consent required</h3>
+        <p className="muted" style={{ fontSize: 13, lineHeight: 1.5 }}>
           Because this call involves someone under 18, a parent or guardian must consent before we
           continue.
         </p>
-        <div className="flex gap-2">
-          <button
-            type="button"
-            onClick={() => void submit(true)}
-            className="rounded-md bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-neutral-700"
-          >
+        <div className="row gap8 wrap">
+          <button type="button" onClick={() => void submit(true)} className="btn btn-primary">
             I am the parent/guardian and I consent
           </button>
-          <button
-            type="button"
-            onClick={() => void submit(false)}
-            className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 hover:bg-neutral-100"
-          >
+          <button type="button" onClick={() => void submit(false)} className="btn btn-ghost">
             Decline
           </button>
         </div>
@@ -130,17 +120,29 @@ export default function ConsentFlow({ jurisdiction, channel, onResolved }: Conse
   const canSubmit = aiAck && recordingConsent !== null && phase !== 'submitting';
 
   return (
-    <div className="space-y-5">
+    <div className="col gap16">
       {/* Disclosure text shown verbatim from the backend (AI disclosure + recording notice). */}
-      <div className="rounded-md border border-neutral-200 bg-white p-4 text-sm leading-relaxed text-neutral-700 whitespace-pre-wrap">
+      <div
+        className="muted"
+        style={{
+          background: 'var(--surface)',
+          border: '1px solid var(--border)',
+          borderRadius: 'var(--r-sm)',
+          padding: 14,
+          fontSize: 13,
+          lineHeight: 1.6,
+          color: 'var(--text-2)',
+          whiteSpace: 'pre-wrap',
+        }}
+      >
         {disclosure}
       </div>
 
       {/* (a) Acknowledge AI */}
-      <label className="flex items-start gap-2 text-sm">
+      <label className="row gap8" style={{ alignItems: 'flex-start', fontSize: 13.5, cursor: 'pointer' }}>
         <input
           type="checkbox"
-          className="mt-0.5"
+          style={{ marginTop: 2, accentColor: 'var(--accent)' }}
           checked={aiAck}
           onChange={(e) => setAiAck(e.target.checked)}
         />
@@ -148,28 +150,20 @@ export default function ConsentFlow({ jurisdiction, channel, onResolved }: Conse
       </label>
 
       {/* (b) Recording consent: Allow / Decline */}
-      <fieldset className="space-y-2">
-        <legend className="text-sm font-medium">Recording</legend>
-        <div className="flex gap-2">
+      <fieldset className="col gap8" style={{ border: 0, padding: 0, margin: 0 }}>
+        <legend style={{ fontSize: 13, fontWeight: 600, padding: 0, marginBottom: 4 }}>Recording</legend>
+        <div className="row gap8 wrap">
           <button
             type="button"
             onClick={() => setRecordingConsent(true)}
-            className={`rounded-md border px-3 py-1.5 text-sm font-medium ${
-              recordingConsent === true
-                ? 'border-neutral-900 bg-neutral-900 text-white'
-                : 'border-neutral-300 text-neutral-700 hover:bg-neutral-100'
-            }`}
+            className={`btn ${recordingConsent === true ? 'btn-primary' : 'btn-ghost'}`}
           >
             Allow recording
           </button>
           <button
             type="button"
             onClick={() => setRecordingConsent(false)}
-            className={`rounded-md border px-3 py-1.5 text-sm font-medium ${
-              recordingConsent === false
-                ? 'border-neutral-900 bg-neutral-900 text-white'
-                : 'border-neutral-300 text-neutral-700 hover:bg-neutral-100'
-            }`}
+            className={`btn ${recordingConsent === false ? 'btn-primary' : 'btn-ghost'}`}
           >
             Decline recording
           </button>
@@ -177,23 +171,24 @@ export default function ConsentFlow({ jurisdiction, channel, onResolved }: Conse
       </fieldset>
 
       {/* (c) Minor checkbox */}
-      <label className="flex items-start gap-2 text-sm">
+      <label className="row gap8" style={{ alignItems: 'flex-start', fontSize: 13.5, cursor: 'pointer' }}>
         <input
           type="checkbox"
-          className="mt-0.5"
+          style={{ marginTop: 2, accentColor: 'var(--accent)' }}
           checked={isMinor}
           onChange={(e) => setIsMinor(e.target.checked)}
         />
         <span>I am calling about a student under 18, or I am under 18.</span>
       </label>
 
-      {error ? <p className="text-sm text-red-600">{error}</p> : null}
+      {error ? <p style={{ fontSize: 13, color: 'var(--danger)' }}>{error}</p> : null}
 
       <button
         type="button"
         disabled={!canSubmit}
         onClick={() => void submit()}
-        className="rounded-md bg-neutral-900 px-4 py-2 text-sm font-medium text-white hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-40"
+        className="btn btn-primary btn-lg"
+        style={{ alignSelf: 'flex-start', opacity: canSubmit ? 1 : 0.4, cursor: canSubmit ? 'pointer' : 'not-allowed' }}
       >
         {phase === 'submitting' ? 'Submitting…' : 'Continue'}
       </button>

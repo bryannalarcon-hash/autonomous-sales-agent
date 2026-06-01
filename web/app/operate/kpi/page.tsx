@@ -7,18 +7,24 @@
 // tier distribution + per-archetype conversion. All tier/outcome labels are pre-translated. The
 // archetype panel humanizes raw persona slugs (lib/labels.archetypeLabel) and filters out NON-
 // archetype rows (the agent's own name "Alex", and "Unknown"/empty). The same-call enrollment tile
-// uses rateValue() so a small-but-nonzero rate (≈0.03%) reads "<0.1"/one-decimal, never a flat "0".
+// uses rateValue() so a small-but-nonzero rate (≈0.03%) reads "<0.1"/one-decimal, never a flat "0",
+// and carries an "n of N calls" sublabel so a true 0% reads as a measured rare event, not an empty
+// panel. The archetype panel is titled "Same-call enrollment by archetype" and, when every archetype
+// is at 0% (enrollment is genuinely rare for the seeded champion), leads with the meaningful NON-zero
+// signal — the commitment-reached rate (ladder tier >= 2) — so it's informative, not a wall of 0%.
 //
 // The version selector is populated from REAL data: /api/versions (lineage) plus the cohort the
 // episodes are actually tagged with, and it DEFAULTS to a version that has episodes so numbers show
 // on first load (no more hardcoded v10/v11/v12 placeholders that matched nothing). Hash suffixes on
-// raw version ids are an internal index and are NOT rendered — the selector shows a clean label.
+// raw version ids are an internal index and are NOT rendered — the selector shows a clean label. The
+// COMPARE baseline is derived empirically (probe candidate versions' episode counts, pick the most-
+// populated non-selected one) so the baseline arm has real n instead of a misleading "0 / N".
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Icon } from '@/components/cadence/Icon';
 import { Spark } from '@/components/cadence/Spark';
-import { fetchKpis } from '@/lib/operate-api';
+import { fetchKpis, fetchEpisodes } from '@/lib/operate-api';
 import { fetchVersions } from '@/lib/improve-api';
 import type { KpiResponse } from '@/lib/operate-types';
 import { archetypeLabel, versionLabel } from '@/lib/labels';
@@ -30,6 +36,11 @@ const COHORTS = ['All', 'held_out', 'training', 'live'];
 
 function pct(v: number): string {
   return `${Math.round(v * 100)}%`;
+}
+
+// Integer with thousands separators ("2465" -> "2,465"), for the small "n of N calls" sublabels.
+function nfmt(v: number): string {
+  return Math.round(v).toLocaleString('en-US');
 }
 
 // The number-only part of a SMALL rate where a flat "0" would read as no-data (the headline tile
@@ -134,19 +145,62 @@ export default function KpiPage() {
     };
   }, []);
 
-  // Compare baseline: prefer a different real version than the current selection, else fall back to
-  // the seeded cohort so the compare arm always queries a version that exists.
-  const compareVersion = useMemo(() => {
-    const other = versionOptions.find((o) => o.value !== version);
-    return other?.value ?? SEEDED_VERSION;
-  }, [versionOptions, version]);
+  // Compare baseline: a version that ACTUALLY has episodes (not just any different option). The
+  // lineage versions from /api/versions are records with 0 tagged episodes, so naively picking "the
+  // first different option" produced a baseline arm of n=0 ("0 / 2464") — an uninformative compare.
+  // We instead derive the baseline empirically: gather candidate versions (the selector options PLUS
+  // the version ids the episodes are actually tagged with), probe each via /api/kpis, and pick the
+  // non-selected one with the MOST episodes. Until that probe resolves we hold null (compare mode
+  // simply shows a "finding a baseline…" state rather than a misleading n=0 arm).
+  const [compareVersion, setCompareVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Candidate raw version ids to consider as a baseline, deduped, excluding the current selection.
+    const candidates = new Set<string>();
+    for (const o of versionOptions) candidates.add(o.value);
+
+    async function pickBaseline() {
+      // Pull the real episode-tagged version ids (the seeded data tags vA-…/vB-…/champion_v0, which
+      // the lineage endpoint does NOT surface) so a populated baseline is actually reachable.
+      try {
+        const eps = await fetchEpisodes({ limit: '500' });
+        for (const e of eps.episodes) if (e.version) candidates.add(e.version);
+      } catch {
+        // Episode probe failing is non-fatal — fall back to the selector options alone.
+      }
+      if (cancelled) return;
+
+      const pool = [...candidates].filter((v) => v !== version);
+      // Probe each candidate's episode count; keep the most-populated one.
+      const counts = await Promise.all(
+        pool.map(async (v) => {
+          try {
+            const k = await fetchKpis({ version: v, cohort: cohort === 'All' ? undefined : cohort });
+            return { v, n: k.n };
+          } catch {
+            return { v, n: 0 };
+          }
+        }),
+      );
+      if (cancelled) return;
+      const best = counts.filter((c) => c.n > 0).sort((a, b) => b.n - a.n)[0];
+      // If nothing populated turns up, fall back to the seeded cohort (still a real selection).
+      setCompareVersion(best?.v ?? (version === SEEDED_VERSION ? null : SEEDED_VERSION));
+    }
+
+    void pickBaseline();
+    return () => {
+      cancelled = true;
+    };
+  }, [versionOptions, version, cohort]);
 
   useEffect(() => {
     let cancelled = false;
     fetchKpis({
       version,
       cohort: cohort === 'All' ? undefined : cohort,
-      compare_version: mode === 'compare' ? compareVersion : undefined,
+      compare_version: mode === 'compare' && compareVersion ? compareVersion : undefined,
     })
       .then((res) => {
         if (!cancelled) {
@@ -221,6 +275,12 @@ export default function KpiPage() {
             </div>
           ) : mode === 'compare' && data.compare ? (
             <CompareTable data={data} />
+          ) : mode === 'compare' && !compareVersion ? (
+            <div className="card">
+              <div className="empty">
+                <p className="muted">Finding a baseline version with episodes…</p>
+              </div>
+            </div>
           ) : (
             <Overview data={data} />
           )}
@@ -235,6 +295,17 @@ function Overview({ data }: { data: KpiResponse }) {
   // Real prospect archetypes only — drop the agent persona name ("Alex") and the "Unknown"/empty
   // fallback, then humanize the slug for display ("anxious_parent" -> "Anxious parent").
   const archetypes = data.archetype_conversion.filter((a) => isProspectArchetype(a.label));
+
+  // Same-call enrollment is a RARE terminal event (full enrollment closed on the call). For the
+  // seeded champion it is genuinely 0 — calls land at "Consultation booked", not enrollment. A flat
+  // "0%" reads as a broken/empty panel, so we surface (1) the raw count behind it ("0 of N calls")
+  // and (2) the meaningful, NON-zero signal that IS in the data: the share of calls that reached a
+  // commitment (consultation+, ladder tier >= 2), derived from the labeled ladder distribution.
+  const enrolledCount = Math.round(data.enrollment_rate * data.n);
+  const commitmentRate = data.ladder_distribution
+    .filter((d) => d.tier >= 2)
+    .reduce((sum, d) => sum + d.rate, 0);
+  const allArchetypesZero = archetypes.length > 0 && archetypes.every((a) => a.conversion <= 0);
   return (
     <>
       {/* primary tiles — the ladder headline AND the DISTINCT enrollment rate, side by side */}
@@ -262,7 +333,11 @@ function Overview({ data }: { data: KpiResponse }) {
             {rateValue(data.enrollment_rate)}
             <span className="u">%</span>
           </div>
-          <div className="k-delta flat">→ closed at enrollment</div>
+          {/* The raw count behind the rate, so a true 0% reads as a measured rare event ("0 of N
+              calls closed at enrollment"), not a broken/empty panel. */}
+          <div className="k-delta flat">
+            → {nfmt(enrolledCount)} of {nfmt(data.n)} calls closed at enrollment
+          </div>
           <div className="k-spark">
             <Spark
               data={[data.enrollment_rate * 0.8, data.enrollment_rate * 0.9, data.enrollment_rate]}
@@ -321,7 +396,10 @@ function Overview({ data }: { data: KpiResponse }) {
         <div className="card">
           <div className="card-head">
             <Icon name="user" size={16} style={{ color: 'var(--accent)' }} />
-            <h3>Conversion by archetype</h3>
+            <h3>Same-call enrollment by archetype</h3>
+            <span className="sub" style={{ marginLeft: 'auto' }}>
+              {pct(commitmentRate)} reached a commitment
+            </span>
           </div>
           <div className="card-pad">
             {archetypes.length === 0 ? (
@@ -329,15 +407,28 @@ function Overview({ data }: { data: KpiResponse }) {
                 No archetype data for this selection.
               </p>
             ) : (
-              archetypes.map((a) => (
-                <BarRow
-                  key={a.label}
-                  label={`${archetypeLabel(a.label)} · ${a.n}`}
-                  value={a.conversion}
-                  asPct
-                  color={a.conversion < 0.4 ? 'var(--danger)' : a.conversion < 0.65 ? 'var(--warn)' : 'var(--ok)'}
-                />
-              ))
+              <>
+                {/* When every archetype sits at 0% same-call enrollment (the rare terminal event),
+                    a column of empty bars looks broken. Lead with the meaningful, NON-zero signal —
+                    the share of calls that reached a commitment (consultation+) — so the panel is
+                    informative; the per-archetype bars below still show each cohort's call volume. */}
+                {allArchetypesZero ? (
+                  <p className="faint" style={{ fontSize: 12, marginBottom: 12, lineHeight: 1.5 }}>
+                    No calls closed at full enrollment on this selection — calls land at a
+                    consultation/callback. <b className="mono">{pct(commitmentRate)}</b> reached a
+                    commitment overall. Per-archetype call volume:
+                  </p>
+                ) : null}
+                {archetypes.map((a) => (
+                  <BarRow
+                    key={a.label}
+                    label={`${archetypeLabel(a.label)} · ${nfmt(a.n)} calls`}
+                    value={a.conversion}
+                    asPct
+                    color={a.conversion < 0.4 ? 'var(--danger)' : a.conversion < 0.65 ? 'var(--warn)' : 'var(--ok)'}
+                  />
+                ))}
+              </>
             )}
           </div>
         </div>

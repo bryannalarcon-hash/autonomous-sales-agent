@@ -9,10 +9,14 @@
 // id is muted/secondary (never the headline) — no internal index renders as an operator-facing label.
 // A 0-turn / still-connecting episode renders a graceful empty state (with a link to the live monitor)
 // rather than a blank transcript + dash belief.
+// The strip's three actions are all HONEST (no dead clicks): "Flag" is a local-only toggle that
+// shows a "Flagged" pill (no backend), "Export" downloads the fetched episode as JSON client-side,
+// and "Use in experiment" routes to /improve/lab (same destination as the KB page's lab button).
 'use client';
 
 import { useMemo, useState } from 'react';
 import { useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { Ring } from '@/components/cadence/Spark';
 import { fetchEpisode, fmtDuration } from '@/lib/operate-api';
@@ -27,9 +31,28 @@ function driverValue(b: BeliefSnapshot | null, key: string): number | null {
 // Passing a plain object to React.use() throws "unsupported type" — so destructure params directly.
 export default function ReviewPage({ params }: { params: { id: string } }) {
   const { id } = params;
+  const router = useRouter();
   const [ep, setEp] = useState<EpisodeDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [cur, setCur] = useState(0);
+  // "Flag" has no backend in this demo, so it's an HONEST local-only marker: toggling it shows a
+  // "Flagged" pill on the call strip (a clear state change), reset per visit. Not persisted.
+  const [flagged, setFlagged] = useState(false);
+
+  // "Export" — client-side download of the already-fetched episode as JSON. No silent no-op: it
+  // produces a real file (the forensic record the operator is looking at) named by the call id.
+  function exportEpisode() {
+    if (!ep) return;
+    const blob = new Blob([JSON.stringify(ep, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${ep.episode_id}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -156,16 +179,29 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
               {versionLabel(ep.version)} · {ep.kb_version}
             </div>
           </div>
-          <div style={{ marginLeft: 'auto', display: 'flex', gap: 9 }}>
-            <button className="btn btn-ghost btn-sm">
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 9, alignItems: 'center' }}>
+            {flagged ? (
+              <span className="tag warn dot" title="Flagged for follow-up (local to this view)">
+                Flagged
+              </span>
+            ) : null}
+            <button
+              className={`btn btn-sm ${flagged ? 'btn-ok' : 'btn-ghost'}`}
+              onClick={() => setFlagged((f) => !f)}
+              title={flagged ? 'Remove the flag from this call' : 'Flag this call for follow-up (local to this view)'}
+            >
               <Icon name="flag" size={14} />
-              Flag
+              {flagged ? 'Unflag' : 'Flag'}
             </button>
-            <button className="btn btn-ghost btn-sm">
+            <button className="btn btn-ghost btn-sm" onClick={exportEpisode} title="Download this call's full record as JSON">
               <Icon name="download" size={14} />
               Export
             </button>
-            <button className="btn btn-ghost btn-sm">
+            <button
+              className="btn btn-ghost btn-sm"
+              onClick={() => router.push('/improve/lab')}
+              title="Open the Experiment Lab to trial a config change against calls like this"
+            >
               <Icon name="flask" size={14} />
               Use in experiment
             </button>
