@@ -47,6 +47,23 @@ export interface ExperimentListResponse {
   counts: { active: number; past: number };
 }
 
+/** A "run an A/B between two values" request (POST /api/experiments/run). `dimension` is a supported
+ *  mutation surface: 'playbooks.discovery_sequence' (value = a reordered slot-name list) or
+ *  'thresholds.<key>' (value = the new number). `n` is the held-out sample PER ARM — modest, since
+ *  each call spends real model credit in prod. */
+export interface RunExperimentRequest {
+  dimension: string;
+  value: string[] | number;
+  n?: number;
+  name?: string;
+}
+
+/** The run result: the freshly-persisted experiment (already label-translated) + the gate decision. */
+export interface RunExperimentResponse {
+  experiment: Experiment;
+  decision: string;
+}
+
 export interface ApprovalListResponse {
   approvals: Experiment[];
   count: number;

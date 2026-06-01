@@ -13,6 +13,8 @@ import type {
   KbResponse,
   PlaybookResponse,
   RollbackResponse,
+  RunExperimentRequest,
+  RunExperimentResponse,
   VersionListResponse,
 } from './improve-types';
 
@@ -70,6 +72,12 @@ async function postJson<T>(path: string, body?: unknown): Promise<T> {
 // --- P6 Experiment Lab ---------------------------------------------------------------------------
 export function fetchExperiments(params?: { state?: string }): Promise<ExperimentListResponse> {
   return getJson<ExperimentListResponse>('/api/experiments', params);
+}
+
+/** RUN a champion-vs-value A/B and persist the result. COST: in prod this spends real model credit
+ *  (n calls per arm) — the caller surfaces an explicit "this runs N real model calls" note. */
+export function runExperiment(req: RunExperimentRequest): Promise<RunExperimentResponse> {
+  return postJson<RunExperimentResponse>('/api/experiments/run', req);
 }
 
 // --- P7 Approval Queue ---------------------------------------------------------------------------

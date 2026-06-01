@@ -56,8 +56,9 @@ def _agent_mock(
 def _client(**kw) -> TestClient:
     """Build a TestClient over an app whose LLM client is a fresh routed MockLLMClient per session
     (so call-state never collides) and whose lead lookup is overridable for the returning-caller
-    test. DB-free: the app uses an in-memory session store and no store calls in tests."""
-    app = create_app(llm_client_factory=lambda: _agent_mock(), **kw)
+    test. DB-free: live_rag is OFF (no real embedder / no pgvector retrieve) and no store calls — these
+    consent/voice/token tests don't exercise grounding (see tests/e2e/test_live_rag_persistence.py)."""
+    app = create_app(llm_client_factory=lambda: _agent_mock(), live_rag=False, **kw)
     return TestClient(app)
 
 
@@ -200,7 +201,11 @@ def test_returning_caller_reuses_assigned_voice():
     def lead_voice_lookup(phash: str) -> Optional[str]:
         return stored if phash == h else None
 
-    app = create_app(llm_client_factory=lambda: _agent_mock(), lead_voice_lookup=lead_voice_lookup)
+    app = create_app(
+        llm_client_factory=lambda: _agent_mock(),
+        lead_voice_lookup=lead_voice_lookup,
+        live_rag=False,
+    )
     client = TestClient(app)
     body = _start(client)
     sid = body["session_id"]
@@ -284,7 +289,9 @@ def test_livekit_token_minted_with_creds(monkeypatch):
         seen.update(api_key=api_key, api_secret=api_secret, identity=identity, room=room)
         return "fake.jwt.token"  # never embeds the secret
 
-    app = create_app(llm_client_factory=lambda: _agent_mock(), token_builder=fake_builder)
+    app = create_app(
+        llm_client_factory=lambda: _agent_mock(), token_builder=fake_builder, live_rag=False
+    )
     client = TestClient(app)
     body = _start(client)
     sid = body["session_id"]

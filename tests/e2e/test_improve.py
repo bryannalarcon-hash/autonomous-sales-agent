@@ -10,13 +10,15 @@
 # internal index (dimension slug, state slug) leaks into operator-facing labels.
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional, Sequence
 
 from fastapi.testclient import TestClient
 
 from src.api.server import create_app
 from src.config.settings import load_config
+from src.core.llm import Message, MockLLMClient
 from src.memory.schema import ExperimentRecord, VersionLineage
 
 
@@ -211,6 +213,148 @@ def test_experiments_empty_is_not_error():
     r = client.get("/api/experiments")
     assert r.status_code == 200, r.text
     assert r.json()["count"] == 0
+
+
+# =============================== P6 — RUN AN A/B (POST /api/experiments/run) =====================
+# The "run an A/B between two values" path: build the champion config + a challenger via the
+# generator's pure mutators for the requested dimension/value, run the experiment on a frozen held-out
+# set with the app's injected LLM client (MockLLM in tests = free), persist the resulting
+# ExperimentRecord per the gate, and return it. A deterministic runner is injected so the outcome is
+# decoupled from self-play scoring (production uses real self-play + a real OpenRouterClient = paid).
+
+
+def _routed_mock() -> MockLLMClient:
+    """A free, network-free MockLLMClient the run endpoint passes through as both arms' LLM. The
+    deterministic runner ignores it, so its exact replies don't matter — it only proves the wiring."""
+
+    def serve(messages: Sequence[Message], **opts: Any) -> str:
+        rf = opts.get("response_format")
+        if isinstance(rf, dict) and rf.get("type") == "json_object":
+            return json.dumps({"act": "ask", "target_slot": "goal", "confidence": 0.8})
+        return "ok"
+
+    return MockLLMClient(serve)
+
+
+def _dominating_runner(champ_version: str):
+    """A deterministic run_experiment runner (no self-play, no network): champion config -> tier-0
+    episodes; challenger -> tier-4 episodes. Stacks the deck so the challenger is clearly better."""
+
+    from src.memory.schema import Episode, Turn
+
+    async def runner(personas, agent_llm_factory, prospect_llm_factory, config, **kw):
+        tier, outcome = (0, "walked") if config.version == champ_version else (4, "enrolled")
+        return [
+            Episode(
+                episode_id=f"{config.version}_{i}",
+                turns=[Turn(turn_id=0, speaker="agent", text="hi", decision="greeting")],
+                outcome=outcome, ladder_tier=tier, qualified=True,
+                version=config.version, kb_version=config.kb_version, channel="sim",
+                cohort="held_out",
+            )
+            for i in range(len(personas))
+        ]
+
+    return runner
+
+
+def _run_client() -> tuple[TestClient, FakeImproveStore]:
+    """A DB-free TestClient wired for the run endpoint: empty injected store, MockLLM factory (free),
+    and a deterministic dominating runner so the A/B outcome is reproducible without self-play."""
+    champ = load_config("champion_v0")
+    store = FakeImproveStore([], [])
+    app = create_app(
+        improve_store=store,
+        config=champ,
+        llm_client_factory=_routed_mock,
+        experiment_runner=_dominating_runner(champ.version),
+    )
+    return TestClient(app), store
+
+
+def test_run_experiment_discovery_reorder_creates_and_persists():
+    """POST /api/experiments/run with a discovery-sequence reorder builds + runs + persists a real
+    ExperimentRecord (state from the gate), returns the before/after, and it appears in
+    /api/experiments. MockLLM + a dominating runner = free + deterministic."""
+    client, store = _run_client()
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]  # a reordered list = the challenger "value"
+
+    r = client.post(
+        "/api/experiments/run",
+        json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6},
+    )
+    assert r.status_code == 200, r.text
+    exp = r.json()["experiment"]
+    # before/after: the dominating challenger is clearly better (tier 4 vs tier 0).
+    assert exp["challenger_kpi"] > exp["champion_kpi"]
+    assert exp["delta"] > 0
+    assert exp["challenger_better"] is True
+    # a non-extreme clean pass -> promoted (auto), surfaced as a readable label (never a raw slug).
+    assert exp["state"] in ("promoted", "passed")
+    assert exp["dimension_label"] == "Discovery sequencing"
+    assert "." not in exp["dimension_label"]
+    assert exp["is_extreme"] is False
+    assert exp["n"] == 6
+
+    # persisted + queryable in the lab (the whole point — running the A/B SHOWS in /api/experiments).
+    body = client.get("/api/experiments").json()
+    assert any(e["experiment_id"] == exp["experiment_id"] for e in body["experiments"])
+    assert exp["experiment_id"] in store._experiments
+
+
+def test_run_experiment_pricing_threshold_blocks_for_approval():
+    """A pricing-concession threshold value is EXTREME: even a clean pass is persisted in `blocked`
+    state (the human-gate), so it lands in the approval queue, not auto-promoted."""
+    client, _ = _run_client()
+    r = client.post(
+        "/api/experiments/run",
+        json={"dimension": "thresholds.max_concession_band", "value": 0.4, "n": 6},
+    )
+    assert r.status_code == 200, r.text
+    exp = r.json()["experiment"]
+    assert exp["is_extreme"] is True
+    assert exp["state"] == "blocked"
+    # it shows up in the approval queue.
+    apr = client.get("/api/approvals").json()
+    assert any(e["experiment_id"] == exp["experiment_id"] for e in apr["approvals"])
+
+
+def test_run_experiment_default_n_is_modest():
+    """N defaults to a modest value (cost control: each call spends real credit in prod) when omitted."""
+    client, store = _run_client()
+    r = client.post(
+        "/api/experiments/run",
+        json={"dimension": "thresholds.pushiness_cap", "value": 0.5},  # champion is 0.7 -> a real diff
+    )
+    assert r.status_code == 200, r.text
+    exp = r.json()["experiment"]
+    assert 1 <= exp["n"] <= 24  # modest by default (the spec suggests ~12)
+    assert exp["n"] == 12  # the documented default when omitted
+
+
+def test_run_experiment_rejects_unknown_dimension():
+    """An unsupported dimension is a 400 (validation at the boundary) — not a crash, not a paid run."""
+    client, _ = _run_client()
+    r = client.post(
+        "/api/experiments/run",
+        json={"dimension": "code.something", "value": 1},
+    )
+    assert r.status_code == 400, r.text
+
+
+def test_run_experiment_rejects_no_op_value():
+    """A value equal to the current champion's is a no-op (zero changed dimensions) -> 400 BEFORE any
+    paid run, with a clear message (never the opaque R17 minimal-diff error)."""
+    client, store = _run_client()
+    r = client.post(
+        "/api/experiments/run",
+        json={"dimension": "thresholds.pushiness_cap", "value": 0.7},  # champion is already 0.7
+    )
+    assert r.status_code == 400, r.text
+    assert "nothing to A/B test" in r.json()["detail"]
+    assert store._experiments == {}  # nothing persisted
 
 
 # =============================== P7 — APPROVAL QUEUE (AE6) =======================================

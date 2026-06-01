@@ -386,6 +386,178 @@ def _ep(eid: str, *, ladder_tier: int, outcome: str, qualified: bool, version: s
     )
 
 
+def _dominating_runner(champ_version: str):
+    """A deterministic run_experiment runner stand-in (network-free, no self-play): champion config
+    -> all tier-0 episodes; ANY other config -> all tier-4 episodes. Stacks the deck so the
+    challenger is unambiguously, significantly better, keyed by the config.version stamped per run."""
+
+    async def runner(personas, agent_llm_factory, prospect_llm_factory, config, **kw):
+        if config.version == champ_version:
+            tier, outcome = 0, "walked"
+        else:
+            tier, outcome = 4, "enrolled"
+        return [
+            _ep(f"{config.version}_{i}", ladder_tier=tier, outcome=outcome, qualified=True, version=config.version)
+            for i in range(len(personas))
+        ]
+
+    return runner
+
+
+# === 6b. ExperimentResult -> ExperimentRecord mapping + loop persistence (DB-FREE) =============
+# The wiring that makes a loop round SHOW in the Experiment Lab: experiment_record_from maps a graded
+# ExperimentResult + the gate's PromotionDecision to a durable ExperimentRecord (state derived from
+# the decision, before/after + guardrail + qual + diff filled), and run_improvement_round(
+# persist_experiment=True) writes it via an injected store. No DB, no network — an in-memory fake
+# store + a dominating runner stack the deck so the round promotes and the record is retrievable.
+
+
+class _FakeExperimentStore:
+    """In-memory ExperimentStore (the save/list/get surface run_improvement_round needs). No DB."""
+
+    def __init__(self) -> None:
+        self._experiments: dict[str, object] = {}
+
+    async def save_experiment(self, experiment) -> str:
+        self._experiments[experiment.experiment_id] = experiment
+        return experiment.experiment_id
+
+    async def list_experiments(self, *, state=None, limit: int = 200):
+        rows = [e for e in self._experiments.values() if state is None or e.state == state]
+        return rows[:limit]
+
+    async def get_experiment(self, experiment_id: str):
+        return self._experiments.get(experiment_id)
+
+
+def test_experiment_record_from_maps_decision_to_state():
+    """experiment_record_from translates a graded ExperimentResult + PromotionDecision into a durable
+    ExperimentRecord: the decision status maps to the lifecycle state (promoted/rejected/blocked(=
+    pending_approval)/paused), and the before/after comparison + guardrail + qual + diff are filled."""
+    from src.loop.experiment import experiment_record_from
+    from src.loop.promotion import evaluate_promotion
+
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+    challenger = generator_mod._build_challenger(
+        champ, reorder_discovery(champ, seq), dimension_hint=None, seed=42
+    )
+    exp = _clean_passing_experiment(dimension=challenger.dimension)
+    decision = evaluate_promotion(exp, is_extreme=challenger.is_extreme)
+
+    rec = experiment_record_from(exp, decision, challenger=challenger, n=12, population="held-out")
+    assert rec.state == "promoted"  # clean non-extreme pass
+    assert rec.challenger_version == challenger.challenger_version
+    assert rec.parent_version == champ.version
+    assert rec.dimension == challenger.dimension
+    assert rec.declared_diff == [challenger.dimension]
+    assert rec.is_extreme is False
+    assert rec.n == 12
+    assert rec.guardrail == "pass"
+    # before/after carried from the comparison.
+    assert rec.champion_kpi == exp.comparison.champion_kpi
+    assert rec.challenger_kpi == exp.comparison.challenger_kpi
+    assert rec.delta == exp.comparison.delta
+    assert rec.challenger_better is True
+    assert rec.champion_qual_acc == exp.champion_qual_acc
+    assert rec.challenger_qual_acc == exp.challenger_qual_acc
+
+
+def test_experiment_record_from_extreme_pass_is_blocked():
+    """An EXTREME challenger that passes the bar -> pending_approval decision -> ExperimentRecord
+    state 'blocked' (the human-gate state), with the guardrail-trip verdict surfaced."""
+    from src.loop.experiment import experiment_record_from
+    from src.loop.promotion import evaluate_promotion
+
+    champ = load_config("champion_v0")
+    challenger = generator_mod._build_challenger(
+        champ, mutate_threshold(champ, "max_concession_band", 0.4), dimension_hint=None, seed=7
+    )
+    exp = _clean_passing_experiment(dimension=challenger.dimension)
+    decision = evaluate_promotion(exp, is_extreme=challenger.is_extreme)
+    assert decision.status == "pending_approval"
+
+    rec = experiment_record_from(exp, decision, challenger=challenger, n=12)
+    assert rec.is_extreme is True
+    assert rec.state == "blocked"
+
+
+def test_experiment_record_from_rejected_when_guardrail_regresses():
+    """A challenger that REGRESSES a guardrail is rejected -> state 'rejected' with guardrail 'trip'
+    and the reason carried for the lab card."""
+    from src.loop.experiment import experiment_record_from
+    from src.loop.promotion import evaluate_promotion
+
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+    challenger = generator_mod._build_challenger(
+        champ, reorder_discovery(champ, seq), dimension_hint=None, seed=3
+    )
+    exp = _clean_passing_experiment(
+        dimension=challenger.dimension,
+        chal_guardrails=_guardrails(pushiness_rate=0.5),  # pushed harder -> regression
+    )
+    decision = evaluate_promotion(exp, is_extreme=challenger.is_extreme)
+    rec = experiment_record_from(exp, decision, challenger=challenger, n=12)
+    assert rec.state == "rejected"
+    assert rec.guardrail == "trip"
+    assert rec.guardrail_reason and "guardrail" in rec.guardrail_reason.lower()
+
+
+async def test_run_improvement_round_persists_experiment_record():
+    """run_improvement_round(persist_experiment=True) with an injected store writes an
+    ExperimentRecord retrievable via list_experiments — so running the loop SHOWS in the lab. The
+    record's state matches the gate decision; the lineage write still happens for an auto-promote."""
+    champ = load_config("champion_v0")
+    losers = [_ep(f"L{i}", ladder_tier=0, outcome="walked", qualified=True) for i in range(4)]
+    winners = [_ep(f"W{i}", ladder_tier=3, outcome="trial_booked", qualified=True) for i in range(4)]
+    held = frozen_held_out(seed=4, n=6, rotation_index=0)
+    store_fake = _FakeExperimentStore()
+
+    rr = await promotion_mod.run_improvement_round(
+        champ, training_episodes=losers + winners, held_out=held,
+        agent_llm_factory=lambda: None, prospect_llm_factory=lambda: None, llm=None, seed=7,
+        runner=_dominating_runner(champ.version),
+        persist_experiment=True, experiment_store=store_fake,
+    )
+    assert rr.challenger is not None and rr.experiment is not None
+
+    saved = await store_fake.list_experiments()
+    assert len(saved) == 1, "the round must persist exactly one ExperimentRecord"
+    rec = saved[0]
+    assert rec.challenger_version == rr.challenger.challenger_version
+    assert rec.parent_version == champ.version
+    # the persisted state mirrors the gate decision.
+    expected_state = {
+        "promoted": "promoted", "rejected": "rejected",
+        "pending_approval": "blocked", "paused": "paused",
+    }[rr.decision.status]
+    assert rec.state == expected_state
+    # the before/after comparison made it onto the record (the lab's headline artifact).
+    assert rec.challenger_kpi == rr.experiment.comparison.challenger_kpi
+    assert rec.challenger_better == rr.experiment.comparison.challenger_better
+
+
+async def test_run_improvement_round_no_persist_skips_store_write():
+    """persist_experiment defaults off (DB-free gate tests must not require a store): no store call,
+    no ExperimentRecord, the gate still decides."""
+    champ = load_config("champion_v0")
+    losers = [_ep(f"L{i}", ladder_tier=0, outcome="walked", qualified=True) for i in range(4)]
+    held = frozen_held_out(seed=4, n=6, rotation_index=0)
+    store_fake = _FakeExperimentStore()
+
+    rr = await promotion_mod.run_improvement_round(
+        champ, training_episodes=losers, held_out=held,
+        agent_llm_factory=lambda: None, prospect_llm_factory=lambda: None, llm=None, seed=7,
+        runner=_dominating_runner(champ.version),
+        persist_experiment=False, experiment_store=store_fake,
+    )
+    assert rr.experiment is not None
+    assert await store_fake.list_experiments() == []
+
+
 # === 7. DB-GATED end-to-end verification (U10) =================================================
 # Skips when DATABASE_URL is unset; the orchestrator runs it with Postgres up (5434). A deterministic
 # stacked runner makes the challenger CLEARLY better (its episodes dominate the ladder), so the round
@@ -420,24 +592,6 @@ async def _seed_champion(champ) -> None:
     await store.record_version(
         VersionLineage(version=champ.version, parent_version=None, kb_version=champ.kb_version, is_champion=True)
     )
-
-
-def _dominating_runner(champ_version: str):
-    """A deterministic run_experiment runner stand-in (network-free, no self-play): champion config
-    -> all tier-0 episodes; ANY other config -> all tier-4 episodes. Stacks the deck so the
-    challenger is unambiguously, significantly better, keyed by the config.version stamped per run."""
-
-    async def runner(personas, agent_llm_factory, prospect_llm_factory, config, **kw):
-        if config.version == champ_version:
-            tier, outcome = 0, "walked"
-        else:
-            tier, outcome = 4, "enrolled"
-        return [
-            _ep(f"{config.version}_{i}", ladder_tier=tier, outcome=outcome, qualified=True, version=config.version)
-            for i in range(len(personas))
-        ]
-
-    return runner
 
 
 @_db_required

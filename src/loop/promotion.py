@@ -11,15 +11,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional, Sequence
+from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence
 
 from src.config.settings import AgentConfig
 from src.core.llm import LLMClient
-from src.loop.experiment import ExperimentResult, HeldOutSet, run_experiment
+from src.loop.experiment import (
+    ExperimentResult,
+    HeldOutSet,
+    experiment_record_from,
+    run_experiment,
+)
 from src.loop.generator import Challenger, generate_challengers
 from src.loop.grading import guardrails_regressed
 from src.memory import store
-from src.memory.schema import Episode, VersionLineage
+from src.memory.schema import Episode, ExperimentRecord, VersionLineage
+
+
+class ExperimentSaver(Protocol):
+    """The minimal write seam run_improvement_round needs to PERSIST a round's ExperimentRecord so it
+    shows in the dashboard lab (P6). The real src.memory.store satisfies it; tests inject an in-memory
+    fake (DB-free). Kept separate from the full Improve ImproveStore so the loop depends on nothing
+    more than save_experiment."""
+
+    async def save_experiment(self, experiment: ExperimentRecord) -> str: ...
 
 # The sim-to-real divergence ceiling: above this the loop PAUSES (R36 — divergence is a GATE, not a
 # report). Fed by U14 later; None at the gate means "not yet measured" -> the pause check is skipped.
@@ -190,17 +204,26 @@ async def run_improvement_round(
     kb_chunks: Optional[Sequence[Any]] = None,
     divergence: Optional[float] = None,
     persist_promotion: bool = False,
+    persist_experiment: bool = False,
+    experiment_store: Optional[ExperimentSaver] = None,
+    population: str = "",
     runner: Optional[Callable[..., Awaitable[list[Episode]]]] = None,
 ) -> RoundResult:
     """Orchestrate ONE improvement round (plan U10): generate a challenger -> run the experiment on
     the frozen held-out set -> evaluate the promotion gate -> (if promoted AND persist_promotion)
-    record it as the new champion.
+    record it as the new champion, and (if persist_experiment) write the round's ExperimentRecord so
+    it SHOWS in the dashboard lab (P6).
 
     `training_episodes` are the mined champion runs the generator clusters (failure-conditioned +
     tactic-mined). `runner` is forwarded to run_experiment (injectable for deterministic tests;
     defaults to self-play). `divergence` (None = not yet measured) feeds the R36 pause check.
-    Returns a RoundResult; when the generator finds NO candidate, decision is a 'rejected' with a
-    reason and challenger/experiment are None.
+
+    PERSISTENCE is opt-in + injectable so DB-free gate tests stay pure: `persist_promotion` writes the
+    champion lineage on an auto-promote (existing behavior); `persist_experiment` flattens the graded
+    ExperimentResult + the gate decision into an ExperimentRecord (state from the decision) and saves
+    it via `experiment_store` (defaults to src.memory.store when None). Returns a RoundResult; when the
+    generator finds NO candidate, decision is a 'rejected' with a reason and challenger/experiment are
+    None (and nothing is persisted).
     """
     challengers = generate_challengers(champion_config, training_episodes, llm=llm, seed=seed, n=1)
     if not challengers:
@@ -229,6 +252,16 @@ async def run_improvement_round(
     )
 
     decision = evaluate_promotion(experiment, is_extreme=challenger.is_extreme, divergence=divergence)
+
+    # Persist the round as a durable ExperimentRecord so it shows in the lab (P6) — in ADDITION to the
+    # lineage write below (which only fires on an auto-promote). Injectable store keeps the gate tests
+    # DB-free; defaults to the real Postgres store in prod.
+    if persist_experiment:
+        saver: ExperimentSaver = experiment_store if experiment_store is not None else store
+        record = experiment_record_from(
+            experiment, decision, challenger=challenger, population=population
+        )
+        await saver.save_experiment(record)
 
     lineage: Optional[VersionLineage] = None
     if decision.promote and persist_promotion:

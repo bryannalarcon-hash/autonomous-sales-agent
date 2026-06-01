@@ -1,31 +1,37 @@
 # Operator-dashboard IMPROVE API (plan U16 — Improve mode). The 4 Improve screens read/write JSON
 # through these endpoints: P6 Experiment Lab (GET /api/experiments — the before/after champion-vs-
-# challenger records), P7 Approval Queue (GET /api/approvals = experiments in `blocked` state, plus
-# POST .../approve -> promote the challenger to champion, POST .../reject), P8 KB/Playbook Editor
-# (GET /api/kb + /api/playbook show the current champion config; POST /api/kb + /api/playbook SAVE a
-# DRAFT CHALLENGER — a NEW experiment record built via the generator's pure config mutators that
-# NEVER touches version_lineage, so the live champion is unchanged, R20), and P9 Version History
-# (GET /api/versions = the lineage tree + champion; POST /api/versions/{v}/rollback re-promotes a
-# prior version). DB-INJECTABLE the same way src.api.operate is: an ImproveStore protocol abstracts
-# the data layer so create_improve_router(improve_store=...) takes the real src.memory.store in prod
-# and a seeded in-memory fake in tests (no Postgres). REUSES the loop (generator config mutators,
-# evaluate_promotion semantics) and src.api.labels so NO raw internal index (dimension slug, state
-# slug, version internals) ever renders in operator-facing text.
+# challenger records; POST /api/experiments/run RUNS a live A/B between the champion and a single
+# changed value and persists the result), P7 Approval Queue (GET /api/approvals = experiments in
+# `blocked` state, plus POST .../approve -> promote the challenger to champion, POST .../reject), P8
+# KB/Playbook Editor (GET /api/kb + /api/playbook show the current champion config; POST /api/kb +
+# /api/playbook SAVE a DRAFT CHALLENGER — a NEW experiment record built via the generator's pure
+# config mutators that NEVER touches version_lineage, so the live champion is unchanged, R20), and P9
+# Version History (GET /api/versions = the lineage tree + champion; POST /api/versions/{v}/rollback
+# re-promotes a prior version). DB-INJECTABLE the same way src.api.operate is: an ImproveStore protocol
+# abstracts the data layer so create_improve_router(improve_store=...) takes the real src.memory.store
+# in prod and a seeded in-memory fake in tests (no Postgres). The run endpoint also takes an injected
+# LLM factory (prod: a REAL OpenRouterClient — a run SPENDS CREDIT; tests: a free MockLLMClient) and an
+# optional injectable runner (tests stack a deterministic deck). REUSES the loop (generator mutators,
+# run_experiment, evaluate_promotion, experiment_record_from) and src.api.labels so NO raw internal
+# index (dimension slug, state slug, version internals) ever renders in operator-facing text.
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Awaitable, Callable, Optional, Protocol
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from src.api import labels
 from src.config.settings import AgentConfig, load_config
+from src.core.llm import LLMClient
+from src.loop.experiment import experiment_record_from, frozen_held_out, run_experiment
 from src.loop.generator import (
     _build_challenger,
     declared_diff,
     mutate_threshold,
     reorder_discovery,
 )
+from src.loop.promotion import evaluate_promotion
 from src.memory.schema import ExperimentRecord, VersionLineage
 
 # ---------------------------------------------------------------------------
@@ -270,6 +276,46 @@ def _mutate_rebuttal(champion: AgentConfig, body: Optional[dict[str, Any]]) -> A
     )
 
 
+def _challenger_for(champion: AgentConfig, dimension: str, value: Any, *, seed: int):
+    """Build a minimal-diff Challenger for a "run an A/B" request from one (dimension, value) pair.
+
+    Supports the two loop-mutable run dimensions via the generator's PURE deep-copy mutators (the
+    champion is never touched): "playbooks.discovery_sequence" (value = a reordered slot list, via
+    reorder_discovery) and "thresholds.<key>" (value = a number, via mutate_threshold). _build_challenger
+    enforces the R17 minimal one-dimension diff and stamps is_extreme (a pricing threshold is extreme,
+    R19). Raises ValueError for an unsupported dimension or a value of the wrong shape (validated at
+    the boundary BEFORE any paid run starts)."""
+    if dimension == "playbooks.discovery_sequence":
+        if not isinstance(value, (list, tuple)) or not all(isinstance(s, str) for s in value):
+            raise ValueError("discovery_sequence value must be a list of slot-name strings")
+        chal_config = reorder_discovery(champion, list(value))
+        desc = f"reorder discovery_sequence -> {list(value)}"
+    elif dimension.startswith("thresholds."):
+        key = dimension.split(".", 1)[1]
+        if key not in champion.thresholds:
+            raise ValueError(f"unknown threshold {key!r}")
+        try:
+            num = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"threshold value must be a number, got {value!r}") from exc
+        chal_config = mutate_threshold(champion, key, num)
+        desc = f"set {key} -> {num} (was {champion.thresholds[key]})"
+    else:
+        raise ValueError(
+            f"unsupported run dimension {dimension!r}: only 'playbooks.discovery_sequence' or "
+            "'thresholds.<key>' can be A/B-tested"
+        )
+    # A value equal to the champion's is a no-op (zero changed dimensions) — reject BEFORE a paid run
+    # instead of surfacing the opaque R17 minimal-diff error from _build_challenger.
+    if not declared_diff(champion, chal_config):
+        raise ValueError(
+            f"value for {dimension!r} matches the current champion — nothing to A/B test"
+        )
+    return _build_challenger(
+        champion, chal_config, dimension_hint=dimension, seed=seed, diff_description=desc
+    )
+
+
 # ---------------------------------------------------------------------------
 # Request DTOs
 # ---------------------------------------------------------------------------
@@ -281,6 +327,27 @@ class SaveDraftRequest(BaseModel):
 
     name: str = "Draft challenger"
     body: Optional[dict[str, Any]] = None
+
+
+# Modest default sample size for a run-an-A/B request. COST: in the running app the injected LLM is a
+# REAL OpenRouterClient, so each held-out persona is a paid self-play conversation per arm — keep N
+# small. Tests inject a MockLLMClient + a deterministic runner (free). Capped so a UI typo can't bill.
+_DEFAULT_RUN_N = 12
+_MAX_RUN_N = 24
+# A fixed held-out seed so a given (dimension, value, n) re-runs the SAME frozen scenarios (R20).
+_RUN_HELD_OUT_SEED = 7
+
+
+class RunExperimentRequest(BaseModel):
+    """A "run an A/B between two values" request (POST /api/experiments/run). `dimension` is a
+    mutation-surface label the loop supports: "playbooks.discovery_sequence" (with `value` = a
+    reordered slot list) or "thresholds.<key>" (with `value` = the new number). `n` is the held-out
+    sample size PER ARM — modest by default because each call spends real model credit in prod."""
+
+    dimension: str
+    value: Any
+    n: int = _DEFAULT_RUN_N
+    name: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -295,12 +362,27 @@ def create_improve_router(
     *,
     improve_store: Optional[ImproveStore] = None,
     champion_config_provider: Optional[Callable[[], AgentConfig]] = None,
+    llm_client_factory: Optional[Callable[[], LLMClient]] = None,
+    experiment_runner: Optional[Callable[..., Awaitable[list[Any]]]] = None,
 ) -> APIRouter:
     """Build the /api Improve router. `improve_store` is injectable (default Postgres store, tests
     pass a seeded fake). `champion_config_provider` returns the champion AgentConfig a KB/playbook
-    SAVE forks into a draft (default: load_config('champion_v0')). All endpoints are async."""
+    SAVE forks into a draft (default: load_config('champion_v0')).
+
+    `llm_client_factory` builds the LLMClient both arms of POST /api/experiments/run use (prod: a REAL
+    OpenRouterClient — a run SPENDS CREDIT; tests: a free MockLLMClient). `experiment_runner` is the
+    optional run_experiment runner seam (tests inject a deterministic deck so the A/B is reproducible
+    without self-play; prod leaves it None -> real self-play). All endpoints are async."""
     store: ImproveStore = improve_store if improve_store is not None else _StoreBackedImproveStore()
     get_config = champion_config_provider or (lambda: load_config("champion_v0"))
+
+    def _make_llm() -> LLMClient:
+        if llm_client_factory is not None:
+            return llm_client_factory()
+        from src.core.llm import OpenRouterClient  # lazy: keep httpx/env off the test import path.
+
+        return OpenRouterClient()
+
     router = APIRouter()
 
     # --- P6 Experiment Lab -------------------------------------------------------------------
@@ -318,6 +400,49 @@ def create_improve_router(
             "count": len(rows),
             "counts": {"active": len(active), "past": len(past)},
         }
+
+    @router.post("/api/experiments/run")
+    async def run_experiment_ep(req: RunExperimentRequest) -> dict[str, Any]:
+        """RUN an A/B between the current champion and a single changed value (P6 "Run experiment").
+
+        Builds the champion config + a minimal-diff challenger for {dimension, value} via the
+        generator's pure mutators (is_extreme set per R19), runs run_experiment on a FROZEN held-out
+        set of `n` adversarial personas using the app's injected LLM client, evaluates the promotion
+        gate, flattens the graded result into an ExperimentRecord (state passed/blocked/etc. per the
+        gate), PERSISTS it, and returns it — so the run SHOWS in the lab immediately.
+
+        COST: in the running app the injected client is a REAL OpenRouterClient, so this spends model
+        credit — `n` is modest by default (and capped). Tests inject a MockLLMClient + a deterministic
+        runner (free). Input is validated at the boundary (400) BEFORE any paid run begins.
+        """
+        n = max(1, min(int(req.n), _MAX_RUN_N))
+        champion = get_config()
+        try:
+            challenger = _challenger_for(champion, req.dimension, req.value, seed=_RUN_HELD_OUT_SEED)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        held_out = frozen_held_out(seed=_RUN_HELD_OUT_SEED, n=n, rotation_index=0)
+        experiment = await run_experiment(
+            champion,
+            challenger,
+            held_out,
+            _make_llm,
+            _make_llm,
+            seed=_RUN_HELD_OUT_SEED,
+            runner=experiment_runner,
+        )
+        decision = evaluate_promotion(experiment, is_extreme=challenger.is_extreme)
+        record = experiment_record_from(
+            experiment,
+            decision,
+            challenger=challenger,
+            n=n,
+            population=f"Held-out · {n} personas",
+            name=req.name or challenger.diff_description,
+        )
+        await store.save_experiment(record)
+        return {"experiment": experiment_to_dict(record), "decision": decision.status}
 
     # --- P7 Approval Queue -------------------------------------------------------------------
     @router.get("/api/approvals")

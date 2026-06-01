@@ -188,3 +188,36 @@ async def test_grounded_with_no_chunks_rejects_factual_answer(embedder):
     """With no retrieved chunks, a factual answer is ungrounded (agent must defer, not fabricate)."""
     report = retriever.grounded("The membership costs $349 per month.", [])
     assert not bool(report)
+
+
+# ---------------------------------------------------------------------------
+# ingest_corpus entrypoint + the shared live retrieve hook (plan U5 live wiring).
+# ---------------------------------------------------------------------------
+async def test_ingest_corpus_populates_chunks_and_live_hook_retrieves(embedder):
+    """src.kb.ingest.ingest_corpus populates kb_chunk and the shared build_live_retrieve_hook (the
+    SAME hook the demo API + voice worker import) returns the pricing chunks over the real store."""
+    from src.kb.ingest import ingest_corpus
+    from src.kb.live import build_live_retrieve_hook
+
+    n = await ingest_corpus(kb_version=KB_VERSION, embedder=embedder)
+    # programs(5) + pricing(6) + policies(4) + competitors(3) + objections(9) = 27 sections.
+    assert n == 27
+
+    from src.memory import store
+
+    pool = await store.get_pool()
+    async with pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT count(*) FROM kb_chunk WHERE kb_version = $1", KB_VERSION
+        )
+    assert count == 27
+
+    # The live hook (closure over the embedder + kb_version) retrieves real grounding over pgvector.
+    hook = build_live_retrieve_hook(embedder, kb_version=KB_VERSION, k=4)
+    chunks = await hook(
+        "How pricing works monthly tiered membership recurring effective per-hour",
+        kb_version=KB_VERSION,
+        k=4,
+    )
+    assert chunks, "live retrieve hook should return chunks"
+    assert any(c.source.startswith("pricing#") for c in chunks), [c.source for c in chunks]

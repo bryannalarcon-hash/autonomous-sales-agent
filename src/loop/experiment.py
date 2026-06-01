@@ -5,13 +5,15 @@
 # frozen_held_out(seed,n,rotation_index) reproduces the exact set; rotate() advances the rotation
 # while EXCLUDING any R22-mined persona ids (mined failures feed the TRAINING population only, never
 # the held-out eval set). Reuses src.sim.selfplay.run_batch (injectable as `runner` for deterministic
-# tests), src.sim.personas.sample_population, and src.loop.grading. Async (matches run_batch/store);
+# tests), src.sim.personas.sample_population, and src.loop.grading. Also exposes experiment_record_from
+# — the ExperimentResult + PromotionDecision -> durable ExperimentRecord mapping the loop AND the
+# Improve API persist so a run SHOWS in the dashboard lab (P6). Async (matches run_batch/store);
 # NO LiveKit / numpy / scipy / pandas; SEEDED random only.
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, replace
-from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Protocol, Sequence
 
 from src.config.settings import AgentConfig
 from src.core.llm import LLMClient
@@ -21,10 +23,27 @@ from src.loop.grading import (
     GuardrailReport,
     compare_versions,
     guardrail_report,
+    guardrails_regressed,
 )
-from src.memory.schema import Episode
+from src.memory.schema import Episode, ExperimentRecord
 from src.sim import selfplay
 from src.sim.personas import Persona, sample_population
+
+if TYPE_CHECKING:  # annotation-only import — promotion.py imports this module (avoid a cycle).
+    from src.loop.promotion import PromotionDecision
+
+# The standard confidence level of the comparison's delta CI (compare_versions uses alpha=0.05).
+# significance is surfaced as a % chip = 1 - alpha when the CI cleanly excludes 0 (a real lift).
+_COMPARISON_CONFIDENCE = 0.95
+
+# PromotionDecision.status -> the durable ExperimentRecord lifecycle state. `pending_approval` (an
+# extreme pass blocked for a human, R19) maps to the dashboard's `blocked` chip; the rest are 1:1.
+_STATUS_TO_STATE: dict[str, str] = {
+    "promoted": "promoted",
+    "rejected": "rejected",
+    "pending_approval": "blocked",
+    "paused": "paused",
+}
 
 # A persona is "qualified" by the DERIVED agent verdict (v0 proxy) when the agent pursued a
 # substantive commitment — ladder_tier at/above consultation (2). See qualification_accuracy.
@@ -280,4 +299,85 @@ async def run_experiment(
         challenger_qual_acc=qualification_accuracy(challenger_eps),
         champion_eps=list(champion_eps),
         challenger_eps=list(challenger_eps),
+    )
+
+
+# === ExperimentResult + PromotionDecision -> durable ExperimentRecord (dashboard P6/P7) ========
+
+
+def _enroll_rate(episodes: Sequence[Episode]) -> float:
+    """Same-call enrollment rate for an arm: the fraction of episodes whose outcome is 'enrolled'.
+    Distinct from the weighted-ladder KPI (which counts partial commitments). Empty -> 0.0."""
+    eps = list(episodes)
+    if not eps:
+        return 0.0
+    return sum(1 for ep in eps if ep.outcome == "enrolled") / len(eps)
+
+
+def _significance(comparison: ComparisonResult) -> float:
+    """A 0..1 significance the lab renders as a % chip (schema: 1 - alpha at which the delta CI
+    excludes 0). compare_versions decides challenger_better at the 95% level; when it holds, the lift
+    is separated from noise so significance is _COMPARISON_CONFIDENCE, else 0.0 (CI includes 0)."""
+    return _COMPARISON_CONFIDENCE if comparison.challenger_better else 0.0
+
+
+def experiment_record_from(
+    experiment: ExperimentResult,
+    decision: "PromotionDecision",
+    *,
+    challenger: Challenger,
+    n: Optional[int] = None,
+    population: str = "",
+    target: int = 0,
+    name: str = "",
+    experiment_id: Optional[str] = None,
+) -> ExperimentRecord:
+    """Flatten a graded ExperimentResult + the gate's PromotionDecision into the DURABLE
+    ExperimentRecord the dashboard lab (P6) / approval queue (P7) read (plan U16). This is the wiring
+    that makes a loop round SHOW up: the loop AND the Improve `run` endpoint both build the record here.
+
+    State comes from the decision (promoted/rejected/blocked(=pending_approval)/paused). The
+    before/after comparison (champion/challenger KPI, delta, delta_ci, challenger_better) + the
+    same-call enroll delta + significance are pulled from the comparison; the guardrail verdict is
+    `trip` when the challenger regressed a guardrail vs the champion (R24) else `pass`, with the
+    decision's first reason carried as the human-readable guardrail_reason on a non-promote; the
+    per-arm qualification accuracies (R29) + the single declared diff + is_extreme (R19) come from the
+    experiment/challenger. `n` defaults to the challenger arm size when omitted.
+    """
+    cmp = experiment.comparison
+    regressed = guardrails_regressed(
+        experiment.champion_guardrails, experiment.challenger_guardrails
+    )
+    guardrail = "trip" if regressed else "pass"
+    # On a non-promote, surface WHY (the gate's first reason) so the lab card explains the block.
+    guardrail_reason: Optional[str] = None
+    if decision.status != "promoted" and decision.reasons:
+        guardrail_reason = decision.reasons[0]
+    state = _STATUS_TO_STATE.get(decision.status, "running")
+    eid = experiment_id or f"RUN-{challenger.challenger_version}"
+    return ExperimentRecord(
+        experiment_id=eid,
+        challenger_version=challenger.challenger_version,
+        parent_version=challenger.parent_version,
+        name=name or challenger.diff_description or f"changed {challenger.dimension}",
+        dimension=challenger.dimension,
+        declared_diff=[challenger.dimension],
+        diff_description=challenger.diff_description,
+        population=population,
+        n=n if n is not None else cmp.n_challenger,
+        target=target,
+        kb_version=challenger.config.kb_version,
+        champion_kpi=cmp.champion_kpi,
+        challenger_kpi=cmp.challenger_kpi,
+        delta=cmp.delta,
+        delta_ci=[cmp.delta_ci[0], cmp.delta_ci[1]],
+        challenger_better=cmp.challenger_better,
+        enroll_delta=_enroll_rate(experiment.challenger_eps) - _enroll_rate(experiment.champion_eps),
+        significance=_significance(cmp),
+        guardrail=guardrail,
+        guardrail_reason=guardrail_reason,
+        champion_qual_acc=experiment.champion_qual_acc,
+        challenger_qual_acc=experiment.challenger_qual_acc,
+        is_extreme=challenger.is_extreme,
+        state=state,
     )
