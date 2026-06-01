@@ -9,6 +9,7 @@
 # (room metadata + session.userdata + a SessionReport hook) are all behind LIVEKIT_AVAILABLE.
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 from src.config.settings import AgentConfig
@@ -16,9 +17,11 @@ from src.core.llm import LLMClient
 from src.kb.embeddings import EmbeddingModel
 from src.voice.session import RetrieveHook, VoiceSession
 
-# Default model/component ids for the live wiring (only used when livekit IS installed). Kept as
-# module constants so the demo/orchestrator can override without touching the glue.
-AGENT_MODEL = "anthropic/claude-3.5-sonnet"
+# Default model/component ids for the live LiveKit LLM-node wiring (only used when livekit IS
+# installed). The BRAIN's decisions run on the `llm_client` passed to build_voice_agent (the env-
+# driven OpenRouterClient), NOT this constant — so it is read from AGENT_MODEL with the SAME default
+# the text path uses (claude-sonnet-4.5), keeping text/voice on one model family. Overridable via env.
+AGENT_MODEL = os.environ.get("AGENT_MODEL", "anthropic/claude-sonnet-4.5")
 STT_MODEL_ID = "scribe_v2_realtime"
 
 # --- Import guard: the suite (and CI) run WITHOUT livekit-agents installed --------------------

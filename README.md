@@ -14,13 +14,17 @@ is exactly what ships in voice.
 - Belief-state schema: `docs/belief-state-schema.md`
 - Build plan: `docs/plans/2026-05-31-001-feat-voice-sales-agent-plan.md`
 - Dashboard UI/IA spec: `docs/design/dashboard-ia-spec.md`
+- **Deliverables + how to run the demo: `docs/deliverables/` (start with `demo-runbook.md`)**
 
 ## Setup
 1. `cp .env.example .env` and fill in keys (see `.env.example`).
-2. `docker compose up -d db` to start Postgres + pgvector.
-3. `pip install -e .` (Python 3.10+).
-4. `pytest` to run the test suite.
+2. `docker compose up -d db` to start Postgres + pgvector (host port 5434).
+3. Install deps (`pip install -e .` or `pip install --user ...`), then run the suite:
+   `PYTHONPATH=. python3 -m pytest tests -q`.
+4. Full demo (API + dashboard + a real-LLM smoke run): see `docs/deliverables/demo-runbook.md`.
 
 ## Stack
-Python · LiveKit Agents (voice) · Deepgram (STT) · ElevenLabs (TTS) · Postgres + pgvector ·
-Claude (agent) + a different family for the prospect sim/judges · Next.js dashboard.
+Python 3.10 · LiveKit Agents (voice) · **ElevenLabs Scribe v2 Realtime (STT) + ElevenLabs (TTS)**
+(Deepgram is an optional fallback only) · OpenRouter (one key → Claude for the agent, a different
+family for the prospect sim/judges) · local BGE embeddings · Postgres + pgvector · FastAPI (demo API)
+· Next.js + React (Cadence Operate/Improve dashboard + the prospect demo console).
