@@ -4,8 +4,10 @@
 # position-bias mitigation, pure-stdlib bootstrap CIs, the weighted-ladder KPI + champion/challenger
 # ranking that GATES promotion. U10 adds generator.py (minimal-diff challenger generation),
 # experiment.py (champion-vs-challenger on a frozen held-out set + qualification accuracy), and
-# promotion.py (THE promotion gate + round orchestrator). Re-exports the public U9+U10 API so callers
-# do `from src.loop import compare_versions, evaluate_promotion, generate_challengers, ...`.
+# promotion.py (THE promotion gate + round orchestrator). U11 adds validation.py (empirical driver
+# validation: keep/drop the six latent drivers, config-only graceful degradation, fallback experiment).
+# Re-exports the public U9+U10+U11 API so callers do
+# `from src.loop import compare_versions, evaluate_promotion, generate_challengers, analyze_drivers, ...`.
 # Pure stdlib + the src.core.llm seam for the judge; NO LiveKit / numpy / scipy / pandas imports.
 from __future__ import annotations
 
@@ -53,6 +55,17 @@ from src.loop.promotion import (
     promote,
     run_improvement_round,
 )
+from src.loop.validation import (
+    DriverStats,
+    DriverValidationReport,
+    analyze_drivers,
+    annotation_agreement_ok,
+    apply_validation_to_config,
+    dropped_drivers,
+    fallback_experiment,
+    inter_annotator_agreement,
+    validated_drivers,
+)
 
 __all__ = [
     # grading (U9)
@@ -95,4 +108,14 @@ __all__ = [
     "evaluate_promotion",
     "promote",
     "run_improvement_round",
+    # validation (U11)
+    "DriverStats",
+    "DriverValidationReport",
+    "analyze_drivers",
+    "annotation_agreement_ok",
+    "apply_validation_to_config",
+    "dropped_drivers",
+    "fallback_experiment",
+    "inter_annotator_agreement",
+    "validated_drivers",
 ]

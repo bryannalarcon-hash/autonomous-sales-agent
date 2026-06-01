@@ -1,11 +1,14 @@
-# Pure-stdlib statistics primitives for the U9 grading layer (src/loop/grading.py). Kept in its own
-# module so grading.py stays under the file-size cap and the stats stay dependency-free + testable in
-# isolation. Provides: bootstrap_ci (percentile bootstrap of the MEAN), bootstrap_delta_ci (CI of a
-# two-arm mean difference), _percentile (linear-interpolated), and cohens_kappa (chance-corrected
-# agreement for the R39 headline gate). All randomness flows through a SEEDED random.Random — NEVER
-# the global random module — so every interval is reproducible. NO numpy/scipy/pandas; NO LiveKit.
+# Pure-stdlib statistics primitives for the U9 grading layer (src/loop/grading.py) AND the U11
+# driver-validation layer (src/loop/validation.py). Kept in its own module so callers stay under the
+# file-size cap and the stats stay dependency-free + testable in isolation. Provides: bootstrap_ci
+# (percentile bootstrap of the MEAN), bootstrap_delta_ci (CI of a two-arm mean difference),
+# percentile (linear-interpolated), cohens_kappa (chance-corrected agreement for the R39 headline
+# gate), and the U11 additions variance / pearson_correlation / point_biserial (driver signal,
+# collinearity, outcome separation). All randomness flows through a SEEDED random.Random — NEVER the
+# global random module — so every interval is reproducible. NO numpy/scipy/pandas; NO LiveKit.
 from __future__ import annotations
 
+import math
 from random import Random
 from typing import Any, List, Sequence, Tuple
 
@@ -96,3 +99,57 @@ def cohens_kappa(a: Sequence[Any], b: Sequence[Any]) -> float:
     if pe >= 1.0:
         return po  # degenerate (single label) — kappa undefined; report raw agreement
     return (po - pe) / (1.0 - pe)
+
+
+# === U11 driver-validation primitives (variance / correlation / point-biserial), pure stdlib ===
+
+def variance(values: Sequence[float]) -> float:
+    """Population variance of `values` (the U11 driver SIGNAL measure). Pure stdlib.
+
+    Returns 0.0 for fewer than two values (a single observation can carry no variance). Population
+    (divide-by-n) not sample variance: we want the spread of the observed levels themselves, and the
+    low-signal threshold (min_variance) is calibrated against this absolute spread, not an estimator.
+    """
+    vals = [float(v) for v in values]
+    n = len(vals)
+    if n < 2:
+        return 0.0
+    mean = sum(vals) / n
+    return sum((v - mean) ** 2 for v in vals) / n
+
+
+def pearson_correlation(xs: Sequence[float], ys: Sequence[float]) -> float:
+    """Pearson product-moment correlation of two paired series (the U11 COLLINEARITY measure).
+
+    r = cov(x, y) / (std(x) * std(y)), in [-1, 1]. Returns 0.0 when the series are mismatched/empty
+    or when EITHER series is constant (zero variance -> correlation undefined; 0.0 means "no linear
+    redundancy we can claim"). Pure stdlib — NO numpy/scipy. Reused by analyze_drivers for the
+    max-pairwise-|r| collinearity flag.
+    """
+    n = min(len(xs), len(ys))
+    if n < 2:
+        return 0.0
+    x = [float(v) for v in xs[:n]]
+    y = [float(v) for v in ys[:n]]
+    mx = sum(x) / n
+    my = sum(y) / n
+    cov = sum((a - mx) * (b - my) for a, b in zip(x, y))
+    var_x = sum((a - mx) ** 2 for a in x)
+    var_y = sum((b - my) ** 2 for b in y)
+    denom = math.sqrt(var_x * var_y)
+    if denom == 0.0:
+        return 0.0  # a constant series has no defined linear correlation
+    return cov / denom
+
+
+def point_biserial(values: Sequence[float], binary: Sequence[int]) -> float:
+    """Point-biserial correlation between a continuous `values` series and a 0/1 `binary` outcome
+    (the U11 OUTCOME-SEPARATION measure). Equals the Pearson r of the continuous series with the
+    binary one, so a value that is systematically higher for the 1-group separates the outcomes.
+
+    Returns 0.0 for mismatched/empty input or when either side is constant (e.g. all-committed or a
+    driver that never moves) — in those degenerate cases separation is undefined and we report 0.0
+    (NON-separating). Pure stdlib; coerces the binary labels to floats and delegates to
+    pearson_correlation so there is ONE correlation implementation.
+    """
+    return pearson_correlation([float(v) for v in values], [float(b) for b in binary])
