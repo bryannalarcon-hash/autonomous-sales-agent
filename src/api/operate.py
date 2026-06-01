@@ -11,6 +11,8 @@
 # live/unfinished calls surface only on /api/live (KPI aggregation is intentionally left untouched).
 from __future__ import annotations
 
+import os
+from datetime import datetime, timezone
 from typing import Any, Optional, Protocol, Sequence
 
 from fastapi import APIRouter, HTTPException
@@ -189,17 +191,28 @@ def episode_detail(ep: Episode) -> dict[str, Any]:
     return detail
 
 
-def live_snapshot(ep: Optional[Episode]) -> dict[str, Any]:
+# A 0-turn in-progress call older than this is an ABANDONED/never-started call (e.g. a dropped dial),
+# not a live one — surfacing it would strand the monitor on a perpetual "Connecting…". Overridable.
+_LIVE_STALE_SECONDS = float(os.environ.get("LIVE_STALE_SECONDS", "600"))
+
+
+def live_snapshot(ep: Optional[Episode], *, now: Optional[datetime] = None) -> dict[str, Any]:
     """P1 Live monitor payload. There is no realtime infra in this build, so "live" = the most recent
     episode; the page polls this. When the most recent call is still in progress (outcome unset /
     'in_progress') we mark it active; otherwise we hand back the most-recent COMPLETED call and flag
-    active=False so the page can show its "no active call" affordance. The PRIORITIZED belief IA —
-    trust, walk-away risk, current stage + last act, escalation-imminent — is hoisted to the top."""
+    active=False so the page can show its "no active call" affordance. A 0-turn in-progress call that
+    has gone STALE (older than _LIVE_STALE_SECONDS) is treated as no-active-call so the monitor never
+    hangs on "Connecting…" for an abandoned dial. The PRIORITIZED belief IA — trust, walk-away risk,
+    current stage + last act, escalation-imminent — is hoisted to the top."""
     if ep is None:
         return {"active": False, "episode": None}
+    active = ep.outcome in (None, "", "in_progress")
+    if active and len(ep.turns) == 0 and ep.created_at is not None:
+        now = now or datetime.now(timezone.utc)
+        if (now - ep.created_at).total_seconds() > _LIVE_STALE_SECONDS:
+            return {"active": False, "episode": None}  # abandoned/never-started — not live
     belief = _last_belief(ep)
     last_agent = next((t for t in reversed(ep.turns) if t.speaker == "agent"), None)
-    active = ep.outcome in (None, "", "in_progress")
     bd = _belief_to_dict(belief)
     return {
         "active": active,

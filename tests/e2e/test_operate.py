@@ -402,3 +402,26 @@ def test_no_raw_driver_slug_in_operator_facing_labels():
     assert "bail_risk" not in labels_shown
     assert "Walk-away risk" in labels_shown
     assert "Trust" in labels_shown
+
+
+# --- live monitor: a stale 0-turn in-progress call is NOT shown as perpetually "Connecting…" -----
+
+def test_live_snapshot_stale_zero_turn_in_progress_is_not_active():
+    """A 0-turn in-progress episode older than the stale window is an abandoned/never-started dial —
+    live_snapshot must return no-active-call so the monitor doesn't hang on "Connecting…" forever.
+    A RECENT 0-turn in-progress call (a genuine just-started call) is still active."""
+    from src.api.operate import live_snapshot
+
+    stale = _episode("CALL-STALE", outcome="in_progress", tier=0, version="v", cohort="live",
+                     persona="anxious_parent", qualified=False, minutes_ago=120, turn_count=0)
+    snap = live_snapshot(stale)
+    assert snap == {"active": False, "episode": None}
+
+    fresh = _episode("CALL-FRESH", outcome="in_progress", tier=0, version="v", cohort="live",
+                     persona="anxious_parent", qualified=False, minutes_ago=0, turn_count=0)
+    assert live_snapshot(fresh)["active"] is True
+
+    # An in-progress call that HAS turns is genuinely live regardless of age.
+    started = _episode("CALL-LIVE", outcome="in_progress", tier=0, version="v", cohort="live",
+                       persona="anxious_parent", qualified=False, minutes_ago=120, turn_count=2)
+    assert live_snapshot(started)["active"] is True

@@ -20,6 +20,32 @@ load_dotenv()
 
 # Clean reason keys that map to a human label in src/api/labels.py (no raw gate rationale strings).
 _REASONS = ["human_request", "pricing_concession", "compliance", "concession_pressure"]
+# Reason-COHERENT trigger moments: the real 3-turn sim transcripts contain no escalation-worthy line
+# (they're generic discovery), so pulling "the last prospect turn" gave 48 identical, incoherent
+# quotes. Instead each reason carries a small bank of realistic quotes that actually EVIDENCE that
+# reason, cycled for variety — so the queue reads as a believable set of distinct escalations.
+_MOMENTS: dict[str, list[str]] = {
+    "human_request": [
+        "Can I just talk to a real person about this?",
+        "I'd rather speak with an actual advisor, not a bot.",
+        "Is there a human I can get on the line?",
+    ],
+    "pricing_concession": [
+        "Can you match the $99/month another service quoted me?",
+        "I need at least 20% off to make this work for us.",
+        "That's over our budget — what can you actually do on price?",
+    ],
+    "compliance": [
+        "How is my child's data protected — is this FERPA compliant?",
+        "Are you allowed to help with a graded, for-credit assignment?",
+        "I need your privacy policy in writing before we go further.",
+    ],
+    "concession_pressure": [
+        "Give me the Premier tier at the Core price or I'm walking.",
+        "I'll only sign up today if you throw in extra hours free.",
+        "Knock 30% off right now and we have a deal.",
+    ],
+}
 # Mostly unreviewed (so the queue has work) with some reviewed/resolved for lifecycle variety.
 _LIFECYCLES = ["unreviewed", "unreviewed", "unreviewed", "unreviewed", "reviewed", "resolved"]
 _N_ESCALATIONS = 48  # a believable review-queue size referencing real escalated calls
@@ -32,26 +58,6 @@ def _turns(raw) -> list:
         return json.loads(raw) if raw else []
     except (TypeError, ValueError):
         return []
-
-
-def _as_turn_id(raw) -> int:
-    """escalation_log.turn_id is an INTEGER column; coerce a turn's id to int (0 on anything odd)."""
-    try:
-        return int(str(raw).strip())
-    except (TypeError, ValueError):
-        return 0
-
-
-def _trigger_moment(turns: list) -> tuple[str, int]:
-    """Pick a real prospect line from the transcript as the escalation trigger moment + its turn id."""
-    for t in reversed(turns):
-        if isinstance(t, dict) and t.get("speaker") in ("prospect", "user") and (t.get("text") or "").strip():
-            return f"“{str(t['text']).strip()[:160]}”", _as_turn_id(t.get("turn_id"))
-    # Fall back to any non-empty line.
-    for t in reversed(turns):
-        if isinstance(t, dict) and (t.get("text") or "").strip():
-            return f"“{str(t['text']).strip()[:160]}”", _as_turn_id(t.get("turn_id"))
-    return "Prospect asked to speak with a human advisor.", 0
 
 
 async def main() -> int:
@@ -77,8 +83,12 @@ async def main() -> int:
         now = datetime.now(timezone.utc)
         made = 0
         for i, ep in enumerate(eps):
-            moment, turn_id = _trigger_moment(_turns(ep["turns"]))
             reason = _REASONS[i % len(_REASONS)]
+            # A reason-COHERENT moment (cycled for variety), and the turn it would have fired on
+            # (the last turn of the call) — not a generic line pulled from the thin transcript.
+            bank = _MOMENTS[reason]
+            moment = bank[(i // len(_REASONS)) % len(bank)]
+            turn_id = max(0, len(_turns(ep["turns"])) - 1)
             lifecycle = _LIFECYCLES[i % len(_LIFECYCLES)]
             esc_id = f"esc-{ep['episode_id'].split('-')[-1][:8]:>08}"[:12]
             created = now - timedelta(hours=i * 3)  # spread over recent history, newest first
