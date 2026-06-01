@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # scripts/seed_demo.py — idempotent demo-DATA curation for the operator dashboard. The demo DB is the
-# organic output of self-play + live calls, so a few surfaces showed junk: 121 escalations created by
-# in-progress live-call debugging (raw gate-rationale reason, NO trigger moment, pointing at 0-turn
-# calls), and episodes missing a duration. This script (1) PURGES those junk escalations, (2)
-# REGENERATES realistic escalations on real COMPLETED+escalated episodes — varied reasons + a real
-# quoted trigger moment pulled from the episode transcript + mixed lifecycle, and (3) backfills a
-# plausible duration_ms (proportional to turn count) on episodes that lack one. Safe to re-run.
+# organic output of self-play + live calls, so the escalation queue was incoherent: rows cited a
+# trigger moment ("Can I talk to a real person?") that never appeared in the linked transcript. This
+# makes the queue COHERENT end-to-end: (1) PURGES all escalations, (2) for each completed `escalated`
+# episode, APPENDS a real (prospect-trigger → Alex-escalates) turn pair to the transcript (idempotent
+# via the _SEED_MARKER kb_version) so the call actually CONTAINS the cited line, then logs an
+# escalation whose reason ↔ moment ↔ turn_id ↔ transcript all agree, with a reason-tuned belief at the
+# trigger turn + mixed lifecycle; and (3) backfills duration_ms on episodes lacking one. Safe to re-run
+# (strips its own prior augmentation before re-appending).
 from __future__ import annotations
 
 import asyncio
@@ -60,6 +62,63 @@ def _turns(raw) -> list:
         return []
 
 
+# Reason-appropriate driver readings for the belief snapshot AT the escalation (full six-driver set
+# the schema expects), so the drawer's "belief at escalation" bars are coherent with the reason.
+_TRIGGER_DRIVERS: dict[str, dict[str, float]] = {
+    "human_request": {"trust": 0.45, "urgency": 0.50, "bail_risk": 0.62, "need_intensity": 0.55, "purchase_intent": 0.35, "price_sensitivity": 0.40},
+    "pricing_concession": {"trust": 0.52, "urgency": 0.48, "bail_risk": 0.46, "need_intensity": 0.60, "purchase_intent": 0.58, "price_sensitivity": 0.86},
+    "compliance": {"trust": 0.40, "urgency": 0.45, "bail_risk": 0.50, "need_intensity": 0.50, "purchase_intent": 0.42, "price_sensitivity": 0.45},
+    "concession_pressure": {"trust": 0.50, "urgency": 0.60, "bail_risk": 0.58, "need_intensity": 0.60, "purchase_intent": 0.62, "price_sensitivity": 0.80},
+}
+# What Alex SAYS when escalating (the agent turn right after the trigger) — so the transcript shows
+# the hand-off, making the call coherent end-to-end.
+_HANDOFF: dict[str, str] = {
+    "human_request": "Absolutely — let me bring in one of our human advisors who can take it from here. I'll have someone reach out to you shortly.",
+    "pricing_concession": "That's a fair ask on price — let me loop in a specialist who can look at custom options. I'll have them follow up with you.",
+    "compliance": "Great question, and I want to get it exactly right — let me connect you with the teammate who handles that directly.",
+    "concession_pressure": "I hear you on getting the best deal — let me bring in a specialist who can review what's possible and follow up.",
+}
+_ACTIVE_OBJECTION: dict[str, Optional[str]] = {
+    "pricing_concession": "price", "concession_pressure": "price", "compliance": None, "human_request": None,
+}
+# Sentinel stamped on the turns this script appends (a real schema field, so no extra keys) — lets a
+# re-run STRIP its prior augmentation before re-appending, keeping the transcript idempotent.
+_SEED_MARKER = "seed-escalation"
+
+
+def _escalation_belief(reason: str) -> dict[str, Any]:
+    """A full belief snapshot at the escalation moment — drivers tuned to the reason, escalation armed."""
+    return {
+        "slots": {},
+        "stage": "escalation",
+        "trends": {},
+        "drivers": _TRIGGER_DRIVERS[reason],
+        "active_objection": _ACTIVE_OBJECTION.get(reason),
+        "decision_confidence": 0.32,
+        "escalation_imminent": True,
+    }
+
+
+def _augmented_turns(base_turns: list, *, moment_text: str, reason: str) -> tuple[list, int]:
+    """Return (new turns, trigger_turn_id): strip any prior seeded turns, then append a coherent
+    (prospect TRIGGER → agent ESCALATION) pair so the transcript actually CONTAINS the trigger line
+    the escalation cites. The trigger turn carries the escalation belief (the drawer reads it)."""
+    kept = [t for t in base_turns if isinstance(t, dict) and t.get("kb_version") != _SEED_MARKER]
+    next_id = (max((int(t.get("turn_id", 0)) for t in kept), default=-1)) + 1
+    belief = _escalation_belief(reason)
+    trigger = {
+        "turn_id": next_id, "speaker": "prospect", "text": moment_text,
+        "decision": None, "rationale": None, "belief": belief,
+        "latency_ms": None, "kb_version": _SEED_MARKER,
+    }
+    handoff = {
+        "turn_id": next_id + 1, "speaker": "agent", "text": _HANDOFF[reason],
+        "decision": "escalate", "rationale": f"Deferred to a human specialist ({reason}).",
+        "belief": belief, "latency_ms": 1100, "kb_version": _SEED_MARKER,
+    }
+    return kept + [trigger, handoff], next_id
+
+
 async def main() -> int:
     url = os.environ.get("DATABASE_URL")
     if not url:
@@ -67,14 +126,14 @@ async def main() -> int:
         return 2
     c = await asyncpg.connect(url)
     try:
-        # 1. Purge the junk escalations (raw gate-rationale reason OR no trigger moment).
-        purged = await c.execute(
-            "DELETE FROM escalation_log WHERE reason LIKE '%deferring to a specialist%' "
-            "OR coalesce(moment,'') = ''"
-        )
-        print(f"purged junk escalations: {purged}")
+        # 1. Purge ALL escalations and rebuild a coherent set — the prior rows (incl. legacy
+        #    "originals") cited trigger moments that never appeared in the linked transcript.
+        purged = await c.execute("DELETE FROM escalation_log")
+        print(f"purged escalations: {purged}")
 
-        # 2. Regenerate realistic escalations on real completed+escalated episodes.
+        # 2. Rebuild: for each escalated episode, APPEND the trigger turn + Alex's escalation to the
+        #    transcript (so the call actually contains the cited line), then log a coherent escalation
+        #    pointing at that trigger turn. Reason/moment/transcript/turn_id are all consistent.
         eps = await c.fetch(
             "SELECT episode_id, turns FROM episode WHERE outcome = 'escalated' "
             "ORDER BY created_at DESC LIMIT $1",
@@ -84,11 +143,16 @@ async def main() -> int:
         made = 0
         for i, ep in enumerate(eps):
             reason = _REASONS[i % len(_REASONS)]
-            # A reason-COHERENT moment (cycled for variety), and the turn it would have fired on
-            # (the last turn of the call) — not a generic line pulled from the thin transcript.
             bank = _MOMENTS[reason]
-            moment = bank[(i // len(_REASONS)) % len(bank)]
-            turn_id = max(0, len(_turns(ep["turns"])) - 1)
+            moment_text = bank[(i // len(_REASONS)) % len(bank)]  # the raw spoken line
+            new_turns, trigger_turn_id = _augmented_turns(
+                _turns(ep["turns"]), moment_text=moment_text, reason=reason
+            )
+            # Write the augmented transcript so the call CONTAINS the trigger line + the escalation.
+            await c.execute(
+                "UPDATE episode SET turns = $1::jsonb WHERE episode_id = $2",
+                json.dumps(new_turns), ep["episode_id"],
+            )
             lifecycle = _LIFECYCLES[i % len(_LIFECYCLES)]
             esc_id = f"esc-{ep['episode_id'].split('-')[-1][:8]:>08}"[:12]
             created = now - timedelta(hours=i * 3)  # spread over recent history, newest first
@@ -97,10 +161,11 @@ async def main() -> int:
                 "lifecycle, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7) "
                 "ON CONFLICT (escalation_id) DO UPDATE SET reason=EXCLUDED.reason, "
                 "moment=EXCLUDED.moment, turn_id=EXCLUDED.turn_id, lifecycle=EXCLUDED.lifecycle",
-                esc_id, ep["episode_id"], reason, moment, turn_id, lifecycle, created,
+                esc_id, ep["episode_id"], reason, f"“{moment_text}”", trigger_turn_id,
+                lifecycle, created,
             )
             made += 1
-        print(f"regenerated escalations: {made} (reasons varied, real trigger moments)")
+        print(f"rebuilt escalations: {made} (transcript contains the cited trigger; reason↔moment↔turn coherent)")
 
         # 3. Backfill a plausible duration_ms (proportional to turns) where missing.
         backfilled = await c.execute(
