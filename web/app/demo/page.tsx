@@ -7,6 +7,7 @@
 // decision_act labels for engineers only — never shown to the prospect by default.
 'use client';
 
+import Link from 'next/link';
 import { useCallback, useState } from 'react';
 import ConsentFlow from '@/components/demo/ConsentFlow';
 import TextConsole from '@/components/demo/TextConsole';
@@ -44,15 +45,24 @@ export default function DemoPage() {
           <h1 className="text-lg font-semibold">Talk to our tutoring advisor</h1>
           <p className="text-sm text-neutral-500">An AI assistant — text or voice.</p>
         </div>
-        {/* Debug toggle — engineer-only; controls visibility of internal decision_act labels. */}
-        <label className="flex items-center gap-1.5 text-xs text-neutral-400">
-          <input
-            type="checkbox"
-            checked={showDebug}
-            onChange={(e) => setShowDebug(e.target.checked)}
-          />
-          debug
-        </label>
+        <div className="flex items-center gap-4">
+          {/* Operator-facing: jump to the Cadence Operate/Improve dashboard (live monitor, KPIs, lab). */}
+          <Link
+            href="/operate"
+            className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 hover:bg-neutral-50"
+          >
+            Operator dashboard →
+          </Link>
+          {/* Debug toggle — engineer-only; controls visibility of internal decision_act labels. */}
+          <label className="flex items-center gap-1.5 text-xs text-neutral-400">
+            <input
+              type="checkbox"
+              checked={showDebug}
+              onChange={(e) => setShowDebug(e.target.checked)}
+            />
+            debug
+          </label>
+        </div>
       </header>
 
       {/* End screen takes over the whole surface. */}

@@ -656,8 +656,13 @@ async def entrypoint(ctx: Any) -> None:  # pragma: no cover - requires live live
     # here (not at module top) so the plugin deps load only when a worker job actually starts.
     from livekit.plugins import elevenlabs, silero
 
-    stt = elevenlabs.STT(model_id=STT_MODEL_ID, use_realtime=True)
-    tts = elevenlabs.TTS()
+    # The ElevenLabs plugin defaults to the ELEVEN_API_KEY env var, but this project standardizes on
+    # ELEVENLABS_API_KEY (.env / .env.example) — pass it EXPLICITLY so the worker finds the key instead
+    # of crashing the job on "API key is required". Fall back to the plugin's own var name if that's
+    # what's set. (This bug only surfaces on a live call — the entrypoint is not unit-tested.)
+    _eleven_key = os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("ELEVEN_API_KEY")
+    stt = elevenlabs.STT(model_id=STT_MODEL_ID, use_realtime=True, api_key=_eleven_key)
+    tts = elevenlabs.TTS(api_key=_eleven_key)
     vad = silero.VAD.load()
 
     # Stamp version/kb_version so an operator can attribute a live call to the exact config that ran.
