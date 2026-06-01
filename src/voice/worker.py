@@ -48,7 +48,7 @@ from dotenv import load_dotenv
 
 from src.config.settings import AgentConfig, load_config
 from src.core.llm import OpenRouterClient
-from src.kb.embeddings import SentenceTransformerEmbedder
+from src.kb.embeddings import EmbeddingModel, SentenceTransformerEmbedder
 from src.kb.live import build_live_retrieve_hook
 from src.memory.schema import phone_hash as compute_phone_hash
 from src.voice.agent import AGENT_MODEL, STT_MODEL_ID, build_voice_agent
@@ -115,9 +115,11 @@ _MAX_ENDPOINTING_DELAY = float(os.environ.get("VOICE_MAX_ENDPOINTING_DELAY", "6.
 # affirmation -> "yes", a negation -> "no", anything ambiguous -> "unclear" (re-asked once).
 
 # The recording-consent ask the agent SPEAKS at the top of a SIP call (after the AI disclosure).
+# SELF-CONTAINED (AI disclosure + recording + the ask) so the SIP path speaks it ONCE — the
+# entrypoint does NOT also say gate.disclosure_text on the SIP branch (that double-disclosed before).
 SIP_CONSENT_PROMPT = (
-    "Before we continue, this call may be recorded for quality and training. "
-    "Do you consent to this call being recorded? Please say yes or no."
+    "Hi, you're speaking with an AI learning advisor for Nerdy. This call may be recorded for "
+    "quality and training. Do you consent to this call being recorded? Please say yes or no."
 )
 # The single re-ask on an unclear first answer (then we end politely if still unclear).
 SIP_CONSENT_REASK = (
@@ -355,7 +357,8 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
 
 
 def _build_brain(config: AgentConfig, *, consent_gate: ConsentGate,
-                 lead_phone_hash: Optional[str] = None) -> WorkerVoiceAgent:
+                 lead_phone_hash: Optional[str] = None,
+                 embedder: Optional[EmbeddingModel] = None) -> WorkerVoiceAgent:
     """Build the worker's Agent around OUR brain — REUSING build_voice_agent so the VoiceSession is
     wired EXACTLY like the text path (parity), GROUNDED via build_live_retrieve_hook (U5), and
     CONSENT-GATED via the supplied ConsentGate (U13 — the blocking finding's fix).
@@ -366,7 +369,11 @@ def _build_brain(config: AgentConfig, *, consent_gate: ConsentGate,
     handle_user_turn is gated by VoiceSession._require_consent (no record/answer before consent). We
     grab the VoiceSession build_voice_agent produced and re-wrap it in the 1.5.x-correct
     WorkerVoiceAgent (build_voice_agent's own hook signatures predate the installed livekit-agents)."""
-    embedder = SentenceTransformerEmbedder()
+    # Reuse the PREWARMED embedder (loaded once at process start) so the model never loads mid-call —
+    # a lazy first-turn load added a multi-second stall that read as the agent "never replying". Only
+    # build a fresh one if prewarm didn't supply it (e.g. a dev hot-reload edge).
+    if embedder is None:
+        embedder = SentenceTransformerEmbedder()
     retrieve_hook = build_live_retrieve_hook(embedder, kb_version=config.kb_version)
     llm_client = OpenRouterClient(model=AGENT_MODEL)
     base = build_voice_agent(
@@ -650,7 +657,11 @@ async def entrypoint(ctx: Any) -> None:  # pragma: no cover - requires live live
                 jurisdiction, gate.mode, phone_hash_value is not None, seeded, is_sip, gate.state,
                 gate.can_converse)
 
-    agent = _build_brain(config, consent_gate=gate, lead_phone_hash=phone_hash_value)
+    # Reuse the embedder warmed at process start (prewarm) so RAG retrieval never triggers a mid-call
+    # model load. Defensive getattr: fall back to a per-job build if prewarm didn't populate userdata.
+    warm_embedder = getattr(getattr(ctx, "proc", None), "userdata", {}).get("embedder")
+    agent = _build_brain(config, consent_gate=gate, lead_phone_hash=phone_hash_value,
+                         embedder=warm_embedder)
 
     # The live media stack: ElevenLabs Scribe v2 realtime STT, ElevenLabs TTS, Silero VAD. Imported
     # here (not at module top) so the plugin deps load only when a worker job actually starts.
@@ -691,16 +702,20 @@ async def entrypoint(ctx: Any) -> None:  # pragma: no cover - requires live live
         # disclosure (good practice — the caller hears it on the call too). When the gate was SEEDED
         # from the browser-captured consent it is ALREADY can_converse, so the first user turn flows
         # straight to the brain (no deadlock).
-        await session.say(gate.disclosure_text, allow_interruptions=True)
         if is_sip:
-            # SIP / PHONE path (no browser to click consent): ARM the spoken-consent capture and SPEAK
-            # the recording-consent ask. The FIRST user turn(s) are now intercepted by
+            # SIP / PHONE path (no browser to click consent): speak ONE self-contained disclosure +
+            # spoken-consent ask (SIP_CONSENT_PROMPT discloses AI + recording AND asks) and ARM the
+            # capture. We deliberately do NOT also say gate.disclosure_text here — doing both is what
+            # disclosed + asked TWICE on the live call. The FIRST user turn(s) are intercepted by
             # WorkerVoiceAgent.handle_consent_turn (NOT the brain): "yes" -> ready (recorded), "no" ->
             # unrecorded/ended per policy, a minor reply -> need_parental (blocked), unclear -> re-ask
-            # once then end. Once consent resolves to can_converse, subsequent turns hit the brain —
-            # so the phone call works end-to-end instead of deadlocking on a `pending` gate.
+            # once then end. Once consent resolves to can_converse, subsequent turns hit the brain.
             await session.say(agent.arm_spoken_consent(), allow_interruptions=False)
             logger.info("SIP spoken-consent armed for room %r", ctx.room.name)
+        else:
+            # Browser/seeded path: consent was already captured in the UI -> just re-state the
+            # disclosure once (good practice); the first turn flows straight to the brain.
+            await session.say(gate.disclosure_text, allow_interruptions=True)
         logger.info("voice session started + disclosure spoken for room %r (version=%s kb_version=%s)",
                     ctx.room.name, stamp.get("version"), stamp.get("kb_version"))
     except Exception as exc:
@@ -710,14 +725,32 @@ async def entrypoint(ctx: Any) -> None:  # pragma: no cover - requires live live
         raise
 
 
+def prewarm(proc: Any) -> None:  # pragma: no cover - runs once per job subprocess before any call
+    """Load + WARM the BGE embedder ONCE per worker subprocess (before LiveKit assigns it a call) and
+    stash it on proc.userdata, so the first factual turn's RAG retrieval reuses the already-loaded
+    model. Without this the sentence-transformers model loaded LAZILY mid-call (~multi-second stall),
+    which read as the agent never replying before the caller hung up. A warm failure never crashes
+    startup — the entrypoint falls back to a per-job build."""
+    emb = SentenceTransformerEmbedder()
+    try:
+        emb.embed(["warm up the embedding model"])  # forces the lazy model load + encode NOW
+    except Exception as exc:  # noqa: BLE001 - warm is best-effort; don't crash the worker
+        logging.getLogger("voice.worker").warning("embedder prewarm failed: %s", type(exc).__name__)
+    proc.userdata["embedder"] = emb
+
+
 def _worker_options() -> Any:  # pragma: no cover - requires livekit installed + a live registration
     """Build WorkerOptions from env. ws_url/api_key/api_secret default to LIVEKIT_* from the env when
     unset (livekit-agents reads them); we pass them explicitly so a misconfig is a clear error, not a
     silent localhost attempt. agent_name is left empty -> DEFAULT auto-dispatch: the worker joins
-    every room (incl. the token's demo-<session_id> room), which is what the /demo flow needs."""
+    every room (incl. the token's demo-<session_id> room), which is what the /demo flow needs.
+    prewarm_fnc loads the embedder before any call so RAG never stalls mid-call."""
     load_dotenv()
     return WorkerOptions(
         entrypoint_fnc=entrypoint,
+        # prewarm_fnc loads the embedder in the job subprocess BEFORE the entrypoint/first turn (during
+        # call setup), so RAG never triggers a model load mid-conversation (the cause of the silence).
+        prewarm_fnc=prewarm,
         ws_url=os.environ.get("LIVEKIT_URL") or None,
         api_key=os.environ.get("LIVEKIT_API_KEY") or None,
         api_secret=os.environ.get("LIVEKIT_API_SECRET") or None,
