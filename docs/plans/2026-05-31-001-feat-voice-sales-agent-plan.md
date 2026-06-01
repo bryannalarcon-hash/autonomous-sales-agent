@@ -1,8 +1,9 @@
 ---
 title: "feat: Autonomous voice AI sales agent (end-to-end)"
 type: feat
-status: active
+status: done
 date: 2026-05-31
+completed: 2026-05-31  # all 17 units (U1–U17) shipped to main; suite 224 passing
 origin: docs/brainstorms/2026-05-31-autonomous-voice-sales-agent-requirements.md
 ---
 
