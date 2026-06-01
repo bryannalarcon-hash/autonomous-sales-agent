@@ -739,3 +739,52 @@ async def test_sip_consent_does_not_arm_for_web_path():
     sid = agent._pending_speech_id
     assert sid is not None and sid in agent.voice_session.state.pending  # brain ran immediately
     assert agent.voice_session.recorded is True
+
+
+# =============================== LIVE REPLY-PIPELINE WIRING (the dead-air fix) ===================
+# These require livekit-agents installed (the voice extra); they SKIP in the offline suite/CI where
+# livekit is absent. They pin THE live-call "consent works, then dead silence on every answer" bug:
+# livekit-agents skips reply generation entirely when AgentSession.llm is None (agent_activity:
+# `elif self.llm is None: return`), so the brain's buffered reply (surfaced by llm_node) was never
+# spoken. The 322 offline tests missed it precisely because they never exercise livekit's pipeline.
+
+
+def test_passthrough_llm_is_a_valid_livekit_llm():
+    """_passthrough_llm() must be an instance of livekit's llm.LLM so `AgentSession.llm is None` is
+    False — that is the SOLE reason it exists (the brain authors every reply; this llm is inert)."""
+    pytest.importorskip("livekit.agents")
+    from livekit.agents import llm as lkllm
+
+    w = _worker()
+    passthrough = w._passthrough_llm()
+    assert isinstance(passthrough, lkllm.LLM)  # satisfies the `self.llm is None` reply-pipeline gate
+
+
+async def test_make_session_wires_non_none_llm_so_replies_are_spoken():
+    """THE regression guard: _make_session must give the AgentSession a non-None llm. A bare
+    AgentSession() leaves .llm None — the exact condition under which livekit SILENTLY drops every
+    brain reply. If someone removes the llm wiring again, this fails instead of going live-silent.
+    (Async so a running event loop exists — AgentSession.__init__ calls asyncio.get_event_loop.)"""
+    pytest.importorskip("livekit.agents")
+    from livekit.agents import AgentSession
+
+    w = _worker()
+    # The bug shape: no llm -> livekit skips reply generation (llm_node never called).
+    assert AgentSession().llm is None
+    # The fix: the worker's session-builder always wires the inert pass-through llm.
+    session = w._make_session(None, None, None, version="champion_v0", kb_version="kb_v0")
+    assert session.llm is not None
+
+
+async def test_passthrough_llm_chat_is_inert_well_formed_stream():
+    """Defensive: although llm_node fully overrides generation (so chat() is never reached in prod),
+    the stub's chat() must still return a well-formed, EMPTY livekit LLMStream — if some edge path
+    ever invokes it, the turn degrades to no extra tokens rather than crashing."""
+    pytest.importorskip("livekit.agents")
+    from livekit.agents import llm as lkllm
+
+    w = _worker()
+    stream = w._passthrough_llm().chat(chat_ctx=lkllm.ChatContext.empty())
+    assert isinstance(stream, lkllm.LLMStream)
+    chunks = [c async for c in stream]
+    assert chunks == []  # inert: emits nothing

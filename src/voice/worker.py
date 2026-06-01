@@ -2,9 +2,13 @@
 # that registers with LiveKit Cloud, is dispatched into the caller's /demo room, and pipes
 # ElevenLabs Scribe v2 STT -> OUR brain (src.voice.session.VoiceSession via build_voice_agent) ->
 # ElevenLabs TTS, so a caller HEARS the agent and SEES their transcript. PARITY (R37): the reply the
-# caller hears is the one respond() already computed in the VoiceSession — the LiveKit `llm` node only
-# SURFACES that buffered reply, it never re-decides. GROUNDING (U5/R43): the session threads the SAME
-# build_live_retrieve_hook the text demo uses, so voice answers cite the ingested KB.
+# caller hears is the one respond() already computed in the VoiceSession — the LiveKit `llm_node` only
+# SURFACES that buffered reply, it never re-decides. CRITICAL WIRING: AgentSession is given an inert
+# pass-through LLM (_passthrough_llm) because livekit-agents SKIPS reply generation entirely when
+# `AgentSession.llm is None` (agent_activity: `elif self.llm is None: return`) — without it the brain
+# ran but llm_node was never called, so every answer was DEAD SILENCE on a live call. GROUNDING
+# (U5/R43): the session threads the SAME build_live_retrieve_hook the text demo uses, so voice answers
+# cite the ingested KB.
 # COMPLIANCE (U13/R33/R40/R41): the entrypoint builds a ConsentGate (jurisdiction from room metadata,
 # RefusalPolicy from env), threads it into the VoiceSession via build_voice_agent (so every turn is
 # gated by VoiceSession._require_consent EXACTLY like /api/chat), and SPEAKS the AI+recording
@@ -33,8 +37,10 @@
 # core imports this file. Run it with:
 #     PYTHONPATH=. python3 -m src.voice.worker dev      # connects + registers to LIVEKIT_URL
 # Built against livekit-agents 1.5.15 (AgentSession / WorkerOptions / cli.run_app / JobContext APIs
-# were read from the installed package, not guessed): on_user_turn_completed(turn_ctx, new_message),
-# llm_node yields a str, SpeechHandle.add_done_callback gates commit-vs-discard on .interrupted.
+# were read from the installed package, not guessed): on_user_turn_completed(turn_ctx, new_message)
+# runs the brain + buffers the reply, the AgentSession (with a non-None pass-through llm) then calls
+# llm_node which returns that buffered str, SpeechHandle.add_done_callback gates commit-vs-discard on
+# .interrupted.
 from __future__ import annotations
 
 import asyncio
@@ -73,6 +79,7 @@ try:  # pragma: no cover - exercised only when livekit-agents is installed
         cli,
     )
     from livekit.agents import llm as lkllm
+    from livekit.agents import DEFAULT_API_CONNECT_OPTIONS
 
     LIVEKIT_AVAILABLE = True
 except ImportError:  # the offline-suite case: livekit-agents not installed
@@ -84,6 +91,7 @@ except ImportError:  # the offline-suite case: livekit-agents not installed
     WorkerOptions = None  # type: ignore[assignment]
     cli = None  # type: ignore[assignment]
     lkllm = None  # type: ignore[assignment]
+    DEFAULT_API_CONNECT_OPTIONS = None  # type: ignore[assignment]
     LIVEKIT_AVAILABLE = False
 
 logger = logging.getLogger("voice.worker")
@@ -354,6 +362,53 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
             return ""
         pending = self.voice_session.state.pending.get(sid)
         return pending.reply_text if pending is not None else ""
+
+
+def _passthrough_llm() -> Any:  # pragma: no cover - requires livekit-agents installed
+    """Build the INERT pass-through LLM the AgentSession needs so its reply pipeline actually RUNS.
+
+    THE live-call "dead silence" fix. livekit-agents SKIPS response generation entirely when
+    `AgentSession.llm is None` — in agent_activity, right after awaiting on_user_turn_completed:
+    `elif self.llm is None: return  # skip response if no llm is set`. Our brain runs INSIDE
+    on_user_turn_completed and buffers the reply, but with no llm the pipeline returned BEFORE calling
+    llm_node, so the buffered reply was never surfaced to TTS: the caller heard the consent line (an
+    explicit session.say) and then nothing on every actual answer. This LLM exists ONLY to make
+    `self.llm is not None` true so the pipeline proceeds to WorkerVoiceAgent.llm_node (which returns
+    the brain's pre-computed reply). Its chat() is NEVER used for inference — R37 parity holds: the
+    brain decides every word, this LLM contributes none. Defined lazily (lkllm is None offline)."""
+    class _PassthroughStream(lkllm.LLMStream):  # type: ignore[misc,valid-type]
+        async def _run(self) -> None:
+            return  # emits no chunks; never reached — llm_node fully overrides generation.
+
+    class _PassthroughLLM(lkllm.LLM):  # type: ignore[misc,valid-type]
+        def chat(self, *, chat_ctx: Any, tools: Any = None,
+                 conn_options: Any = DEFAULT_API_CONNECT_OPTIONS, **_: Any) -> Any:
+            return _PassthroughStream(self, chat_ctx=chat_ctx, tools=tools or [],
+                                      conn_options=conn_options)
+
+    return _PassthroughLLM()
+
+
+def _make_session(stt: Any, tts: Any, vad: Any, *, version: str = "",
+                  kb_version: str = "") -> Any:  # pragma: no cover - real AgentSession needs livekit
+    """Construct the AgentSession with the media stack + the REQUIRED non-None pass-through llm.
+
+    Extracted as a seam so the wiring that matters most — `llm=_passthrough_llm()` is present — is
+    unit-asserted (test_worker): livekit-agents SILENTLY skips reply generation when llm is None, so
+    dropping the llm here would make the agent stop speaking on every turn. Barge-in / endpointing
+    knobs (R5/R10) are applied here too. The brain still authors every reply (R37 parity); the llm is
+    inert (never invoked for inference)."""
+    return AgentSession(
+        stt=stt,
+        tts=tts,
+        vad=vad,
+        llm=_passthrough_llm(),
+        userdata={"version": version, "kb_version": kb_version},
+        allow_interruptions=True,
+        min_interruption_duration=_MIN_INTERRUPTION_DURATION,
+        min_endpointing_delay=_MIN_ENDPOINTING_DELAY,
+        max_endpointing_delay=_MAX_ENDPOINTING_DELAY,
+    )
 
 
 def _build_brain(config: AgentConfig, *, consent_gate: ConsentGate,
@@ -674,21 +729,13 @@ async def entrypoint(ctx: Any) -> None:  # pragma: no cover - requires live live
     _eleven_key = os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("ELEVEN_API_KEY")
     stt = elevenlabs.STT(model_id=STT_MODEL_ID, use_realtime=True, api_key=_eleven_key)
     tts = elevenlabs.TTS(api_key=_eleven_key)
-    vad = silero.VAD.load()
+    # Reuse the VAD warmed at process start (prewarm); only load fresh if prewarm didn't supply it.
+    vad = getattr(getattr(ctx, "proc", None), "userdata", {}).get("vad") or silero.VAD.load()
 
     # Stamp version/kb_version so an operator can attribute a live call to the exact config that ran.
     stamp = config.stamp()
-    session = AgentSession(
-        stt=stt,
-        tts=tts,
-        vad=vad,
-        userdata={"version": stamp.get("version", ""), "kb_version": stamp.get("kb_version", "")},
-        # Adaptive barge-in / turn-taking (R5/R10): natural interruption + endpointing windows.
-        allow_interruptions=True,
-        min_interruption_duration=_MIN_INTERRUPTION_DURATION,
-        min_endpointing_delay=_MIN_ENDPOINTING_DELAY,
-        max_endpointing_delay=_MAX_ENDPOINTING_DELAY,
-    )
+    session = _make_session(stt, tts, vad, version=stamp.get("version", ""),
+                            kb_version=stamp.get("kb_version", ""))
 
     # Wire commit-on-uninterrupted-playout (the only state writer + escalation/tier capture). Register
     # call persistence BEFORE session.start so an early STT/TTS/connect failure still persists what was
@@ -726,17 +773,28 @@ async def entrypoint(ctx: Any) -> None:  # pragma: no cover - requires live live
 
 
 def prewarm(proc: Any) -> None:  # pragma: no cover - runs once per job subprocess before any call
-    """Load + WARM the BGE embedder ONCE per worker subprocess (before LiveKit assigns it a call) and
-    stash it on proc.userdata, so the first factual turn's RAG retrieval reuses the already-loaded
-    model. Without this the sentence-transformers model loaded LAZILY mid-call (~multi-second stall),
-    which read as the agent never replying before the caller hung up. A warm failure never crashes
-    startup — the entrypoint falls back to a per-job build."""
+    """Load + WARM the per-call HEAVY assets ONCE per worker subprocess (before LiveKit assigns it a
+    call) and stash them on proc.userdata, so call SETUP is fast and the first factual turn's RAG
+    retrieval reuses the already-loaded model. Combined with num_idle_processes>=1, this moves the
+    ~10s of cold model/plugin loading OFF the call path (a cold first call rang ~20s before the caller
+    heard anything, so they hung up). Warms two things:
+      - the BGE embedder (RAG): without it the sentence-transformers model loaded LAZILY mid-call.
+      - the Silero VAD: VAD.load() is several hundred ms+ of model load; reused across calls.
+    Every warm step is best-effort — a failure never crashes the subprocess; the entrypoint falls back
+    to a per-job build for whatever is missing."""
+    log = logging.getLogger("voice.worker")
     emb = SentenceTransformerEmbedder()
     try:
         emb.embed(["warm up the embedding model"])  # forces the lazy model load + encode NOW
     except Exception as exc:  # noqa: BLE001 - warm is best-effort; don't crash the worker
-        logging.getLogger("voice.worker").warning("embedder prewarm failed: %s", type(exc).__name__)
+        log.warning("embedder prewarm failed: %s", type(exc).__name__)
     proc.userdata["embedder"] = emb
+    try:
+        from livekit.plugins import silero
+
+        proc.userdata["vad"] = silero.VAD.load()  # reused per call (entrypoint falls back if absent)
+    except Exception as exc:  # noqa: BLE001 - VAD warm is best-effort
+        log.warning("vad prewarm failed: %s", type(exc).__name__)
 
 
 def _worker_options() -> Any:  # pragma: no cover - requires livekit installed + a live registration
@@ -748,9 +806,23 @@ def _worker_options() -> Any:  # pragma: no cover - requires livekit installed +
     load_dotenv()
     return WorkerOptions(
         entrypoint_fnc=entrypoint,
-        # prewarm_fnc loads the embedder in the job subprocess BEFORE the entrypoint/first turn (during
-        # call setup), so RAG never triggers a model load mid-conversation (the cause of the silence).
+        # prewarm_fnc loads the embedder + VAD in the job subprocess BEFORE the entrypoint/first turn,
+        # so RAG never triggers a model load mid-conversation and call setup is fast.
         prewarm_fnc=prewarm,
+        # KEEP A WARM PROCESS READY. The dev default is 0 idle processes, so EVERY call cold-started a
+        # subprocess (embedder + plugin load ~10s) — the caller heard ~20s of dead ring and hung up
+        # before the agent ever spoke ("no warmed process available" in the logs). One warm process
+        # pays that cost up front. Run the worker in `start` mode (production) so idle processes are
+        # stable — `dev` mode's hot-reload conflicts with them. ~700MB/process, so default to 1.
+        num_idle_processes=int(os.environ.get("VOICE_IDLE_PROCESSES", "1")),
+        # The cold prewarm (SentenceTransformer load ~5.5s + a HuggingFace hub check) EXCEEDED
+        # livekit's 10s default initialize_process_timeout on the first call, so the first job's
+        # process was KILLED and re-initialized — adding ~20s to call setup before the caller heard
+        # anything. Give the subprocess room to warm. Overridable via env for slower/faster hosts.
+        initialize_process_timeout=float(os.environ.get("VOICE_INIT_TIMEOUT", "45")),
+        # The BGE embedder + torch put steady-state RSS ~700MB; the 500MB default flooded the log with
+        # "process memory usage is high" every 5s, drowning the real turn events. Raise the warn line.
+        job_memory_warn_mb=float(os.environ.get("VOICE_MEM_WARN_MB", "1500")),
         ws_url=os.environ.get("LIVEKIT_URL") or None,
         api_key=os.environ.get("LIVEKIT_API_KEY") or None,
         api_secret=os.environ.get("LIVEKIT_API_SECRET") or None,

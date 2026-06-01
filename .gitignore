@@ -39,3 +39,6 @@ handoff/
 
 # Design handoff raw archive (extracted into docs/design/cadence-handoff/)
 auto-sales-agent.zip
+
+# Playwright E2E screenshots (regenerable, not repo content)
+tests/e2e/shots/

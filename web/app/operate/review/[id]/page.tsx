@@ -7,7 +7,7 @@
 // labels are pre-translated by the backend (no driver slug / internal index renders).
 'use client';
 
-import { use, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useEffect } from 'react';
 import { Icon } from '@/components/cadence/Icon';
 import { Ring } from '@/components/cadence/Spark';
@@ -18,8 +18,10 @@ function driverValue(b: BeliefSnapshot | null, key: string): number | null {
   return b?.primary_drivers.find((d) => d.key === key)?.value ?? null;
 }
 
-export default function ReviewPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params);
+// Next.js 14 App Router: route `params` is a PLAIN object (the Promise+`use()` shape is Next 15+).
+// Passing a plain object to React.use() throws "unsupported type" — so destructure params directly.
+export default function ReviewPage({ params }: { params: { id: string } }) {
+  const { id } = params;
   const [ep, setEp] = useState<EpisodeDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [cur, setCur] = useState(0);
