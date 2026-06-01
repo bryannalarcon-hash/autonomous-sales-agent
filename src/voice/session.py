@@ -1,12 +1,16 @@
-# The TESTABLE voice-session orchestrator (plan U12) — the per-call state + per-turn orchestration
-# the LiveKit hooks (src/voice/agent.py) delegate to. Imports the brain (src.core.respond), the KB
-# retriever seam, config, and the memory schema, but NEVER livekit — so it is fully unit-testable
-# and CANNOT leak a LiveKit type into src/core. PARITY (R37) is achieved by calling the WHOLE
-# respond() as ONE unit (never re-splitting dst/decide/realize) and building history dicts in the
-# EXACT shape src.sim.selfplay builds — so a scripted voice session and the equivalent text session
-# produce the same decisions. SIDE-EFFECT SAFETY under speculative/preemptive generation: each turn
-# is buffered in `pending[speech_id]` and commit_turn() is the ONLY path that writes session state;
+# The TESTABLE voice-session orchestrator (plan U12/U13) — the per-call state + per-turn
+# orchestration the LiveKit hooks (src/voice/agent.py) delegate to. Imports the brain
+# (src.core.respond), the KB retriever seam, config, the memory schema, and the compliance core
+# (src.voice.consent), but NEVER livekit — so it is fully unit-testable and CANNOT leak a LiveKit
+# type into src/core. PARITY (R37) is achieved by calling the WHOLE respond() as ONE unit (never
+# re-splitting dst/decide/realize) and building history dicts in the EXACT shape src.sim.selfplay
+# builds — so a scripted voice session and the equivalent text session produce the same decisions.
+# SIDE-EFFECT SAFETY under speculative/preemptive generation: each turn is buffered in
+# `pending[speech_id]` and commit_turn() is the ONLY path that writes session state;
 # discard_speculative()/on_barge_in() drop a pending turn with NO state write (R5/R10 self-recover).
+# CONSENT/PII (U13): an optional ConsentGate gates handle_user_turn/commit_turn (no record/log
+# until consent allows); captured Turn.text is PII-scrubbed (scrub_pii) BEFORE it is stored; the
+# session carries the assigned sticky TTS voice (R3).
 from __future__ import annotations
 
 import re
@@ -20,11 +24,24 @@ from src.core.policy import Decision
 from src.core.respond import respond
 from src.kb.embeddings import EmbeddingModel
 from src.memory.schema import Turn
+from src.voice.consent import ConsentGate, scrub_pii
 
 # A retrieve hook: (query, *, kb_version, k) -> a sequence of grounding facts (Chunks or strings).
 # Injected so the session is DB-free in tests (a local FakeEmbedder hook) yet wires to the real
 # kb.retriever.retrieve in production. The session threads the result straight into respond().
 RetrieveHook = Callable[..., Sequence[Any]]
+
+
+class ConsentError(RuntimeError):
+    """Raised when a turn is attempted before the ConsentGate permits conversation (U13/R33/R41).
+
+    The API layer maps this to HTTP 409 (consent not satisfied). Carries the gate's current state
+    so the caller can tell pending/need_parental/ended apart without re-reading the gate.
+    """
+
+    def __init__(self, state: str, message: Optional[str] = None) -> None:
+        self.state = state
+        super().__init__(message or f"consent not satisfied (state={state!r})")
 
 # Intent gating for PROACTIVE retrieval (R43): retrieve BEFORE generation only when the user's turn
 # is factual (a KB lookup will help). Non-factual acknowledgements / chit-chat skip retrieval so the
@@ -124,12 +141,20 @@ class VoiceSession:
         *,
         kb_chunks_or_retrieve_hook: Optional[RetrieveHook] = None,
         seed: int = 0,
+        consent_gate: Optional[ConsentGate] = None,
+        assigned_voice: Optional[str] = None,
+        lead_phone_hash: Optional[str] = None,
     ) -> None:
         self.config = config
         self.llm_client = llm_client
         self.embedder = embedder
         self.seed = seed
         self._retrieve_hook = kb_chunks_or_retrieve_hook
+        # U13 compliance: an optional ConsentGate gates recording/logging; the assigned sticky voice
+        # (R3) and the lead phone-hash key (R42 — raw phone NEVER stored) ride on the session.
+        self.consent_gate = consent_gate
+        self.assigned_voice = assigned_voice
+        self.lead_phone_hash = lead_phone_hash
         stamp = config.stamp()
         belief = BeliefState.fresh()
         self.state = VoiceSessionState(
@@ -143,6 +168,20 @@ class VoiceSession:
         self._speech_to_turn: dict[str, int] = {}
         self._turn_to_speech: dict[int, str] = {}
         self._next_turn_id = 0
+
+    # --- consent gating (U13) -------------------------------------------------------------------
+
+    def _require_consent(self) -> None:
+        """Raise ConsentError unless the attached ConsentGate permits conversation. No gate attached
+        (e.g. the headless parity tests) means consent is not in scope -> allow."""
+        gate = self.consent_gate
+        if gate is not None and not gate.can_converse:
+            raise ConsentError(gate.state)
+
+    @property
+    def recorded(self) -> bool:
+        """Whether this call is being recorded — False when no gate is attached or consent refused."""
+        return bool(self.consent_gate and self.consent_gate.recorded)
 
     # --- retrieval (intent-gated, BEFORE generation) -------------------------------------------
 
@@ -171,7 +210,12 @@ class VoiceSession:
         unit) against the CURRENT committed belief/history, (3) buffer (decision, reply, new_belief,
         facts) in pending[speech_id] — NO state write. Returns the PendingTurn so the LiveKit
         llm_node can emit reply_text for this speech_id.
+
+        CONSENT GATE (U13): if a ConsentGate is attached and does not yet permit conversation
+        (state not in ready/unrecorded), raise ConsentError WITHOUT generating — the brain never
+        runs and nothing is recorded until consent allows.
         """
+        self._require_consent()
         facts = await self._maybe_retrieve(user_text)
         decision, reply_text, new_belief = await respond(
             self.state.belief,
@@ -211,11 +255,13 @@ class VoiceSession:
         self.state.belief = pending.new_belief
         self.state.committed = pending.new_belief
 
-        # 2. Capture the user turn (transcript) + history dict (selfplay shape).
+        # 2. Capture the user turn (transcript) + history dict (selfplay shape). The TRANSCRIPT body
+        #    is PII-scrubbed BEFORE it is stored (U13/R42); the history dict (a parity artifact fed
+        #    back into respond()) keeps the verbatim text so decisions stay identical to text mode.
         user_turn_id = self._next_turn_id
         self._next_turn_id += 1
         self.state.turns.append(
-            Turn(turn_id=user_turn_id, speaker="prospect", text=pending.user_text)
+            Turn(turn_id=user_turn_id, speaker="prospect", text=scrub_pii(pending.user_text))
         )
         self.state.history.append({"role": "user", "text": pending.user_text})
 
@@ -226,7 +272,7 @@ class VoiceSession:
         agent_turn = Turn(
             turn_id=agent_turn_id,
             speaker="agent",
-            text=pending.reply_text,
+            text=scrub_pii(pending.reply_text),  # scrub any echoed PII before storing (U13/R42)
             decision=pending.decision.act,
             rationale=pending.decision.rationale,
             belief=pending.new_belief.to_snapshot(),

@@ -1,0 +1,19 @@
+/* Global stylesheet — Tailwind layers + a couple of base resets for the console.
+   Kept intentionally minimal; the demo surface relies on Tailwind utilities, and the LiveKit
+   prebuilt component styles are imported where the voice UI mounts (not globally). */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  @apply bg-neutral-50 text-neutral-900 antialiased;
+}

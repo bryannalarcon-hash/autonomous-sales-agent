@@ -1,0 +1,29 @@
+{
+  "name": "auto-sales-agent-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Demo + operator console for the autonomous voice sales agent (U13/U15/U16).",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@livekit/components-react": "^2.6.9",
+    "@livekit/components-styles": "^1.1.4",
+    "livekit-client": "^2.7.5",
+    "next": "14.2.35",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.5.10",
+    "tailwindcss": "^3.4.15",
+    "typescript": "^5.6.3"
+  }
+}
