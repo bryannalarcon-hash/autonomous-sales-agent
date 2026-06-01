@@ -1,6 +1,8 @@
 # Async datastore (plan U2) over Postgres+pgvector via asyncpg. Persists/queries the unified
-# Episode schema, per-lead memory (upsert merges slots by phone-hash), and version lineage
-# (record/champion/lineage). Reads DATABASE_URL from the environment (.env via python-dotenv).
+# Episode schema, per-lead memory (upsert merges slots by phone-hash), version lineage
+# (record/champion/lineage), and the ESCALATION REVIEW QUEUE (save/get/list escalation_log rows;
+# the deferred-extreme-moment records U14 writes — dashboard P5). Reads DATABASE_URL from the
+# environment (.env via python-dotenv).
 # A module-level connection pool is created lazily and reused. JSONB columns are (de)serialized
 # with a datetime-aware encoder so created_at round-trips. NO LiveKit/voice imports — sim, text,
 # and voice channels all write through this one interface (plan R26 single-shape guarantee).
@@ -14,7 +16,7 @@ from typing import Any, Optional
 import asyncpg
 from dotenv import load_dotenv
 
-from src.memory.schema import Episode, Lead, VersionLineage
+from src.memory.schema import Episode, EscalationLog, Lead, VersionLineage
 
 # Load .env once at import so DATABASE_URL is available without an explicit call.
 load_dotenv()
@@ -340,6 +342,94 @@ def _row_to_lineage(row: asyncpg.Record) -> VersionLineage:
             "kb_version": d.get("kb_version", ""),
             "kpi": d.get("kpi") or {},
             "is_champion": d.get("is_champion", False),
+            "created_at": d.get("created_at"),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Escalation review queue (U14/R10 — the deferred-extreme-moment records)
+# ---------------------------------------------------------------------------
+async def save_escalation(escalation: EscalationLog) -> str:
+    """Insert or replace an escalation_log row (upsert on escalation_id). Returns the escalation_id.
+
+    This IS the review queue's write side: U14's handle_escalation persists the deferred moment here
+    so the dashboard escalation queue (P5) can list/review it later. The escalation_log row FKs to an
+    existing episode (migrations/001_init.sql) — the caller must have saved that episode first.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO escalation_log (
+                escalation_id, episode_id, reason, moment, turn_id, lifecycle, created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (escalation_id) DO UPDATE SET
+                episode_id = EXCLUDED.episode_id,
+                reason = EXCLUDED.reason,
+                moment = EXCLUDED.moment,
+                turn_id = EXCLUDED.turn_id,
+                lifecycle = EXCLUDED.lifecycle,
+                created_at = EXCLUDED.created_at
+            """,
+            escalation.escalation_id,
+            escalation.episode_id,
+            escalation.reason,
+            escalation.moment,
+            escalation.turn_id,
+            escalation.lifecycle,
+            escalation.created_at,
+        )
+    return escalation.escalation_id
+
+
+async def get_escalation(escalation_id: str) -> Optional[EscalationLog]:
+    """Fetch one escalation by id, or None if absent."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM escalation_log WHERE escalation_id = $1", escalation_id
+        )
+    if row is None:
+        return None
+    return _row_to_escalation(row)
+
+
+async def list_escalations(
+    *, lifecycle: Optional[str] = None, limit: int = 100
+) -> list[EscalationLog]:
+    """Read the escalation review queue (oldest first), optionally filtered by lifecycle.
+
+    The dashboard escalation queue (P5) reads this: pass lifecycle="unreviewed" for the pending items
+    an operator still has to triage. Ordered created_at ASC so the queue is FIFO; `limit` caps the page.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if lifecycle is None:
+            rows = await conn.fetch(
+                "SELECT * FROM escalation_log ORDER BY created_at ASC LIMIT $1", limit
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM escalation_log WHERE lifecycle = $1 "
+                "ORDER BY created_at ASC LIMIT $2",
+                lifecycle,
+                limit,
+            )
+    return [_row_to_escalation(r) for r in rows]
+
+
+def _row_to_escalation(row: asyncpg.Record) -> EscalationLog:
+    d = dict(row)
+    return EscalationLog.from_dict(
+        {
+            "escalation_id": d["escalation_id"],
+            "episode_id": d["episode_id"],
+            "reason": d.get("reason"),
+            "moment": d.get("moment"),
+            "turn_id": d.get("turn_id"),
+            "lifecycle": d.get("lifecycle", "unreviewed"),
             "created_at": d.get("created_at"),
         }
     )
