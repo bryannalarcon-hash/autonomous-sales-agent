@@ -14,10 +14,23 @@ dependencies = [
     "python-dotenv>=1",
     "anthropic>=0.40",
     "httpx>=0.27",
+    # The demo/dashboard API service (deployable surface) — needed by `python -m uvicorn src.api.server:app`.
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.30",
 ]
 
 [project.optional-dependencies]
-voice = ["livekit-agents", "livekit-plugins-deepgram", "livekit-plugins-elevenlabs"]
+# Live LiveKit voice worker (src/voice/worker.py): ElevenLabs Scribe STT + ElevenLabs TTS + silero VAD
+# + the openai plugin for the LLM node. Deepgram was DROPPED (ElevenLabs does STT); keep it out.
+voice = [
+    "livekit-agents>=1.5",
+    "livekit-plugins-elevenlabs>=1.5",
+    "livekit-plugins-silero>=1.5",
+    "livekit-plugins-openai>=1.5",
+]
+# Live grounded RAG: the local sentence-transformers embedder (BAAI/bge-small-en-v1.5). Tests use the
+# deterministic FakeEmbedder and do NOT need this; the deployed product with live_rag=True does.
+rag = ["sentence-transformers>=3"]
 sim = ["openai>=1.40"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.11"]
 

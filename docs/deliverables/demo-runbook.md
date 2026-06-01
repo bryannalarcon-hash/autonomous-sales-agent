@@ -60,7 +60,7 @@ done
 pip install -e .
 ```
 
-Installs the backend (pydantic, pyyaml, asyncpg, pgvector, python-dotenv, anthropic, httpx — see `pyproject.toml`). Add `pip install -e '.[dev]'` for pytest, or `'.[voice]'` for the LiveKit plugins, or `'.[sim]'` for the OpenAI client.
+Installs the backend incl. the FastAPI/uvicorn API service (pydantic, pyyaml, asyncpg, pgvector, python-dotenv, anthropic, httpx, fastapi, uvicorn — see `pyproject.toml`). Add extras as needed: `pip install -e '.[dev]'` (pytest/ruff), `'.[voice]'` (LiveKit + ElevenLabs/silero/openai plugins for the live voice worker), `'.[rag]'` (the sentence-transformers embedder for live grounded RAG — the test suite uses a fake embedder and does **not** need it), `'.[sim]'` (the OpenAI client). For the full live product: `pip install -e '.[voice,rag]'`.
 
 ---
 
@@ -192,10 +192,49 @@ Read endpoints are injectable (`read_store=`); for a DB-free dashboard demo, pas
 
 ---
 
-## 10. Where live VOICE differs from text
+## 10. Live VOICE — running the worker (and where it differs from text)
 
 - **Text** (`/demo` text console, `/api/chat`) works against the running API with **no voice creds**.
 - **Live voice** additionally requires **LiveKit credentials** on the backend (`LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`) and `ELEVENLABS_API_KEY` for STT (Scribe v2 Realtime) + TTS. Without them, `/api/livekit/token` returns 503 and the UI falls back to text. Real turn-taking / barge-in / ASR recovery are verified **manually at demo time** (not in CI).
+
+### 10.1 Install the voice plugins (one-time)
+
+The runnable worker needs the LiveKit plugin set (NOT pulled in by `pip install -e .`):
+
+```bash
+pip install --user livekit-plugins-elevenlabs livekit-plugins-silero livekit-plugins-openai
+python3 -c "from livekit.plugins import elevenlabs, silero, openai; print('plugins OK')"
+```
+
+**Verified (this environment):** installed `livekit-plugins-{elevenlabs,silero,openai}` **1.5.15** (matching `livekit-agents` 1.5.15) and they import cleanly. These plugins are isolated to the worker — `PYTHONPATH=. python3 -m pytest tests -q` still reports **241 passed** (the worker's heavy imports never leak into `src/core` or the suite).
+
+### 10.2 Start the voice worker
+
+The worker (`src/voice/worker.py`) registers with LiveKit Cloud and is **auto-dispatched** into the caller's `/demo` room. Run it from the repo root in its own shell:
+
+```bash
+PYTHONPATH=. python3 -m src.voice.worker dev
+```
+
+What it does on boot: loads `.env`, loads config `champion_v0` (override with `WORKER_CONFIG_VERSION`), builds **our brain** via `build_voice_agent(...)` — a real `OpenRouterClient(model=AGENT_MODEL)` + a real `SentenceTransformerEmbedder` + `build_live_retrieve_hook(...)` so voice answers are **grounded in the ingested KB** — wires ElevenLabs Scribe v2 realtime STT + ElevenLabs TTS + Silero VAD, and registers with LiveKit Cloud.
+
+**Verified (this environment) — it registers with LiveKit Cloud:**
+
+```
+INFO  livekit.agents  starting worker  {"version": "1.5.15", "rtc-version": "1.1.8"}
+INFO  livekit.agents  registered worker  {"agent_name": "", "id": "AW_********", "url": "wss://sales-agent-********.livekit.cloud", "region": "US Central", "protocol": 17}
+```
+
+(Worker URL/id masked above.) **The actual audio loop — STT → brain → TTS → audible reply + live transcript — is a MANUAL check; it needs a real caller in `/demo` and cannot be CI-tested.**
+
+### 10.3 End-to-end demo flow (worker + web)
+
+1. Backend API up (§6) + the **voice worker** running (§10.2), web console up (§8).
+2. `/demo` → satisfy consent (`ready`/`unrecorded`) → **Start voice call** → browser calls `POST /api/livekit/token` (room `demo-<session_id>`) and joins it.
+3. The running worker auto-dispatches into that room: STT transcribes the caller → the `VoiceSession`/`respond()` decides + grounds (same brain as text) → ElevenLabs TTS speaks → `VoiceRoom.tsx` shows the live transcript and plays the agent audio.
+4. On hang-up / room close the worker persists the voice **Episode** (channel `"voice"`) via the same `src/api/persistence.persist_call_end` path, so the call appears in `/operate`.
+
+> **Cost note:** every live voice call **spends ElevenLabs credit** (STT + TTS) **and LiveKit Cloud minutes**, plus OpenRouter tokens for each agent turn. Stop the worker (`Ctrl-C`) when not demoing.
 
 ---
 
