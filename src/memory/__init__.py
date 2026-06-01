@@ -1,10 +1,12 @@
-# Memory package (plan U2) — the single Postgres+pgvector datastore for the sales agent.
+# Memory package (plan U2/U6) — the single Postgres+pgvector datastore for the sales agent.
 # Re-exports the typed episode/lead/lineage models (schema.py, pure stdlib), the phone_hash
-# helper, and — LAZILY — the async store API (store.py) so callers do
-# `from src.memory import Episode, save_episode, ...`. The store re-exports are loaded on first
-# access via module __getattr__ so that importing only the schema models (which the transport-
-# agnostic core/ depends on) never drags in asyncpg/DB deps. No LiveKit/voice imports here:
-# sim and voice channels share this one schema.
+# helper, and — LAZILY — the async store API (store.py) plus the cross-call hydration bridge
+# (hydrate.py: hydrate_belief / persist_lead_after_call / seed_slots) so callers do
+# `from src.memory import Episode, save_episode, hydrate_belief, ...`. The store/hydrate re-exports
+# are loaded on first access via module __getattr__ so that importing only the schema models (which
+# the transport-agnostic core/ depends on) never drags in asyncpg/DB deps. No LiveKit/voice imports
+# here: sim and voice channels share this one schema. hydrate.py is the only seam touching BOTH
+# core (belief_state) and the store — core/ itself stays DB-free.
 from __future__ import annotations
 
 from typing import Any
@@ -35,13 +37,26 @@ _STORE_EXPORTS = (
     "upsert_lead_by_phone",
 )
 
+# Names served lazily from src.memory.hydrate (the cross-call bridge). Also deferred because it
+# imports the store (asyncpg) — schema-only / DB-free core consumers never trigger that import.
+_HYDRATE_EXPORTS = (
+    "hydrate_belief",
+    "persist_lead_after_call",
+    "seed_slots",
+    "HYDRATED_SLOT_CONFIDENCE",
+)
+
 
 def __getattr__(name: str) -> Any:
-    """Lazily forward store-API names to src.memory.store on first access (PEP 562)."""
+    """Lazily forward store/hydrate-API names to their modules on first access (PEP 562)."""
     if name in _STORE_EXPORTS:
         from src.memory import store
 
         return getattr(store, name)
+    if name in _HYDRATE_EXPORTS:
+        from src.memory import hydrate
+
+        return getattr(hydrate, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -66,4 +81,9 @@ __all__ = [
     "record_version",
     "save_episode",
     "upsert_lead_by_phone",
+    # hydrate bridge (U6)
+    "hydrate_belief",
+    "persist_lead_after_call",
+    "seed_slots",
+    "HYDRATED_SLOT_CONFIDENCE",
 ]

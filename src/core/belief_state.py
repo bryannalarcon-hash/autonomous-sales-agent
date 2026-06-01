@@ -3,9 +3,12 @@
 # (trust / need_intensity / price_sensitivity / urgency / purchase_intent / bail_risk) as levels in
 # [0,1], plus deterministically-DERIVED trend/velocity factors, and Layer C dialogue-control meta
 # (stage, active_objection, last_user_act, decision_confidence, open_question, turn_count,
-# escalation_imminent). Converts to/from src.memory.schema.BeliefSnapshot so logged trajectories
-# persist consistently — the snapshot is the stored projection; this object carries the extra
-# meta (last_user_act, open_question, turn_count) the snapshot does not persist. NO LiveKit imports.
+# escalation_imminent), plus a working-only `meta` dict for out-of-band / cross-call context the
+# bridge (src/memory/hydrate.py) attaches at call start (assigned_voice, persona_read,
+# prior_objections, returning_caller). Converts to/from src.memory.schema.BeliefSnapshot so logged
+# trajectories persist consistently — the snapshot is the stored projection; this object carries the
+# extra working-only state (last_user_act, open_question, turn_count, meta) the snapshot does not
+# persist. NO LiveKit imports; `meta` is a plain dict and adds NO DB dependency (core stays DB-free).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -68,6 +71,13 @@ class BeliefState:
     turn_count: int = 0
     escalation_imminent: bool = False
 
+    # Cross-call / out-of-band context that is NOT a belief layer and is NOT persisted in the stored
+    # snapshot: hydrated per-lead memory the bridge (src/memory/hydrate.py) attaches at call start
+    # (e.g. assigned_voice, persona_read, prior_objections, returning_caller) so the opener/voice
+    # adapter can use it without polluting Layer-A slots or setting active_objection. Pure dict —
+    # adds no DB dependency, keeping this module DB-free; intentionally dropped by to_snapshot().
+    meta: dict[str, Any] = field(default_factory=dict)
+
     @classmethod
     def fresh(cls) -> "BeliefState":
         """A new belief state at the start of a call: empty slots, neutral drivers, greeting stage."""
@@ -77,6 +87,7 @@ class BeliefState:
             trends={f"{d}_velocity": 0.0 for d in DRIVERS},
             stage=GREETING_STAGE,
             turn_count=0,
+            meta={},
         )
 
     # --- slot helpers ---------------------------------------------------------------------------
@@ -150,7 +161,7 @@ class BeliefState:
         )
 
     def copy(self) -> "BeliefState":
-        """Deep-enough copy for an immutable-style DST update (slots/drivers/trends duplicated)."""
+        """Deep-enough copy for an immutable-style DST update (slots/drivers/trends/meta duplicated)."""
         return BeliefState(
             slots={k: dict(v) for k, v in self.slots.items()},
             drivers=dict(self.drivers),
@@ -162,4 +173,5 @@ class BeliefState:
             open_question=self.open_question,
             turn_count=self.turn_count,
             escalation_imminent=self.escalation_imminent,
+            meta=dict(self.meta),
         )
