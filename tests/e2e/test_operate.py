@@ -59,6 +59,15 @@ class FakeReadStore:
         rows.sort(key=lambda e: e.created_at)
         return rows[:limit]
 
+    async def update_escalation_lifecycle(self, escalation_id: str, lifecycle: str) -> bool:
+        if lifecycle not in {"unreviewed", "reviewed", "resolved", "dismissed"}:
+            raise ValueError(f"invalid lifecycle {lifecycle!r}")
+        for e in self._escalations:
+            if e.escalation_id == escalation_id:
+                e.lifecycle = lifecycle
+                return True
+        return False
+
 
 def _belief(trust: float, bail: float, stage: str, imminent: bool = False) -> BeliefSnapshot:
     return BeliefSnapshot(
@@ -425,3 +434,18 @@ def test_live_snapshot_stale_zero_turn_in_progress_is_not_active():
     started = _episode("CALL-LIVE", outcome="in_progress", tier=0, version="v", cohort="live",
                        persona="anxious_parent", qualified=False, minutes_ago=120, turn_count=2)
     assert live_snapshot(started)["active"] is True
+
+
+def test_escalation_lifecycle_update_advances_state():
+    """P5 triage WRITE: POST /api/escalations/{id}/lifecycle advances an escalation's state so the
+    queue's Mark-reviewed/Resolve buttons drive a real workflow (was a GET-only queue with dead
+    buttons). 400 on an unknown lifecycle, 404 on an unknown id."""
+    client = _seeded_client()
+    r = client.post("/api/escalations/ESC-204/lifecycle", json={"lifecycle": "reviewed"})
+    assert r.status_code == 200, r.text
+    assert r.json()["lifecycle"] == "reviewed"
+    # It now appears under "reviewed" and the unreviewed count dropped.
+    rev = client.get("/api/escalations?lifecycle=reviewed").json()
+    assert any(e["escalation_id"] == "ESC-204" for e in rev["escalations"])
+    assert client.post("/api/escalations/ESC-204/lifecycle", json={"lifecycle": "bogus"}).status_code == 400
+    assert client.post("/api/escalations/NOPE/lifecycle", json={"lifecycle": "resolved"}).status_code == 404

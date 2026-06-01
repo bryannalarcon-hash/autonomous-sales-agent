@@ -479,6 +479,32 @@ async def list_escalations(
     return [_row_to_escalation(r) for r in rows]
 
 
+# Valid escalation lifecycle states (P5 triage workflow): the queue moves unreviewed -> reviewed ->
+# resolved, or dismissed. Guarded so an arbitrary string can't be written into the lifecycle column.
+_ESCALATION_LIFECYCLES = frozenset({"unreviewed", "reviewed", "resolved", "dismissed"})
+
+
+async def update_escalation_lifecycle(escalation_id: str, lifecycle: str) -> bool:
+    """Advance one escalation's lifecycle (P5 operator triage). Returns True if a row was updated.
+
+    The write side of the review queue's triage workflow: an operator marks an item reviewed/resolved/
+    dismissed from the dashboard. Rejects an unknown lifecycle (ValueError) so only the four valid
+    states reach the column; returns False when no escalation matches the id (caller -> 404)."""
+    if lifecycle not in _ESCALATION_LIFECYCLES:
+        raise ValueError(
+            f"invalid escalation lifecycle {lifecycle!r}; expected one of {sorted(_ESCALATION_LIFECYCLES)}"
+        )
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        status = await conn.execute(
+            "UPDATE escalation_log SET lifecycle = $1 WHERE escalation_id = $2",
+            lifecycle,
+            escalation_id,
+        )
+    # asyncpg returns e.g. "UPDATE 1" — the trailing count is the rows affected.
+    return status.rsplit(" ", 1)[-1] != "0"
+
+
 def _row_to_escalation(row: asyncpg.Record) -> EscalationLog:
     d = dict(row)
     return EscalationLog.from_dict(

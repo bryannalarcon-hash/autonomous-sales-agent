@@ -16,10 +16,17 @@ from datetime import datetime, timezone
 from typing import Any, Optional, Protocol, Sequence
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 from src.api import labels
 from src.loop import grading
 from src.memory.schema import BeliefSnapshot, Episode, EscalationLog, Turn
+
+
+class _LifecycleUpdate(BaseModel):
+    """Body for POST /api/escalations/{id}/lifecycle — the new triage state (validated in the store)."""
+
+    lifecycle: str
 
 # ---------------------------------------------------------------------------
 # Injectable data layer
@@ -47,6 +54,8 @@ class ReadStore(Protocol):
         self, *, lifecycle: Optional[str] = None, limit: int = 100
     ) -> list[EscalationLog]: ...
 
+    async def update_escalation_lifecycle(self, escalation_id: str, lifecycle: str) -> bool: ...
+
 
 class _StoreBackedReadStore:
     """Default ReadStore that forwards to the module-level async functions in src.memory.store.
@@ -67,6 +76,9 @@ class _StoreBackedReadStore:
 
     async def list_escalations(self, **kw: Any) -> list[EscalationLog]:
         return await self._store.list_escalations(**kw)
+
+    async def update_escalation_lifecycle(self, escalation_id: str, lifecycle: str) -> bool:
+        return await self._store.update_escalation_lifecycle(escalation_id, lifecycle)
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +445,18 @@ def create_operate_router(read_store: Optional[ReadStore] = None) -> APIRouter:
             "count": len(rows),
             "counts": counts,
         }
+
+    @router.post("/api/escalations/{escalation_id}/lifecycle")
+    async def update_escalation_ep(escalation_id: str, req: _LifecycleUpdate) -> dict[str, Any]:
+        """P5 triage WRITE: advance one escalation's lifecycle (reviewed / resolved / dismissed) so the
+        operator can work the queue. 400 on an unknown lifecycle, 404 when the id doesn't exist."""
+        try:
+            ok = await rs.update_escalation_lifecycle(escalation_id, req.lifecycle)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"unknown escalation {escalation_id!r}")
+        return {"escalation_id": escalation_id, "lifecycle": req.lifecycle}
 
     @router.get("/api/live")
     async def live_ep() -> dict[str, Any]:
