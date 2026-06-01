@@ -214,6 +214,9 @@ async def run_episode(
 
     last_agent_text = greeting
     last_agent_act: Optional[str] = "greeting"
+    # The tier the agent last offered (only set when it attempts a close) — the prospect commits
+    # ONLY in response to a close offer, at this tier (U7 close-triggered buy-gate).
+    last_agent_tier: Optional[str] = None
 
     outcome: str = _RELEASED[0]
     ladder_tier: int = _RELEASED[1]
@@ -223,8 +226,11 @@ async def run_episode(
     turn_count = 0
 
     while True:
-        # 1. Prospect responds to the agent's last utterance + act (commit/walk decided inside).
-        pt: ProspectTurn = await prospect.respond(last_agent_text, last_agent_act, prospect_llm)
+        # 1. Prospect responds to the agent's last utterance + act + offered tier (commit/walk
+        #    decided inside; a commitment fires ONLY when last_agent_act was a close, at that tier).
+        pt: ProspectTurn = await prospect.respond(
+            last_agent_text, last_agent_act, prospect_llm, agent_tier=last_agent_tier
+        )
         clean_text = pt.text
 
         # 2. REALISM corruption applied to the prospect text BEFORE the agent ever sees it.
@@ -277,6 +283,7 @@ async def run_episode(
         turn_id += 1
         last_agent_text = reply
         last_agent_act = decision.act
+        last_agent_tier = decision.tier  # the offered rung (set by the policy for attempt_close)
 
         # 5. Terminal: the agent escalated (deferred to a specialist).
         if decision.act == "escalate":

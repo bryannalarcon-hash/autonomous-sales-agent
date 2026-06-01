@@ -1,10 +1,11 @@
 # The honest hidden-utility ProspectSimulator (U7) — the synthetic counterparty the agent practices
 # against in self-play. Its INTEGRITY is the point: the sim LLM (a different model family than the
 # agent; mocked in tests) drives only the prospect's TALK and proposes BOUNDED deltas to the SOFT
-# drivers (trust/need/urgency/purchase_intent); commit/walk is decided by buy_gate(), a PURE,
-# DETERMINISTIC numeric gate on the TRUE hidden drivers + the persona's hard ceiling (R31). budget
-# and qualified/disqualifier are STRUCTURAL FACTS the LLM may NEVER mutate by talking — so a
-# no_budget prospect can never cross the budget gate no matter how fluent the agent is. Robust like
+# drivers (trust/need/urgency/purchase_intent). A commitment is NEVER spontaneous: it happens ONLY
+# when the agent attempts a close, and only at the tier the agent OFFERS — decided by buy_gate(), a
+# PURE, DETERMINISTIC numeric gate on the TRUE hidden drivers + the offered tier + the persona's hard
+# ceiling (R31). budget and qualified/disqualifier are STRUCTURAL FACTS the LLM may NEVER mutate by
+# talking — so a no_budget prospect can never cross the budget gate no matter how fluent the agent is. Robust like
 # the DST: malformed/missing JSON -> no delta; unknown/structural keys ignored. Headless + pure:
 # NO LiveKit, NO DB, NO src.memory, NO src.core.respond/policy imports (the prospect is the
 # independent counterparty; episodes are logged later by U8). Collaborators: src.sim.personas,
@@ -105,8 +106,9 @@ class ProspectTurn:
 # --- THE DETERMINISTIC BUY-GATE (the honesty backbone, R31) -----------------------------------
 # Per-tier thresholds on the TRUE hidden drivers. budget is a HARD gate per tier (an immutable
 # structural fact), so no_budget personas can NEVER cross enrollment/trial. The agent's fluency
-# cannot change these — only the true drivers + the persona's ceiling decide. Tiers strongest ->
-# weakest; we return the HIGHEST tier whose thresholds are ALL met AND <= the persona ceiling.
+# cannot change these — only the true drivers + the OFFERED tier + the persona's ceiling decide. A
+# prospect commits ONLY to a tier the agent OFFERS (closes at): the gate checks that one tier's
+# thresholds (and the ceiling), never auto-selecting a rung the agent didn't ask for.
 _TIER_THRESHOLDS: dict[str, dict[str, float]] = {
     # tier:          need   trust  intent budget  (+urgency/patience where it matters)
     "enrollment": {"need": 0.7, "trust": 0.7, "purchase_intent": 0.7, "budget": 0.6},
@@ -136,22 +138,31 @@ def _meets(state: ProspectState, thresholds: dict[str, float]) -> bool:
     return True
 
 
-def buy_gate(state: ProspectState, persona: Persona) -> Optional[str]:
-    """PURE, DETERMINISTIC commit decision: the highest ladder tier whose driver+budget thresholds
-    are ALL met AND whose strength is <= the persona's hard ceiling, else None. Depends ONLY on the
-    true hidden drivers + the immutable budget + the persona ceiling — NEVER on how fluent the agent
-    was. This is the honesty invariant: talk moves soft drivers, but the GATE is the arbiter.
+def buy_gate(
+    state: ProspectState,
+    persona: Persona,
+    *,
+    offered_tier: Optional[str] = None,
+) -> Optional[str]:
+    """PURE, DETERMINISTIC commit decision. A prospect commits ONLY to a tier the agent OFFERS (the
+    rung it attempts to close at) — commitment is NEVER spontaneous. Returns `offered_tier` iff:
+    (a) the agent is actually offering a known tier, (b) that tier is within the persona's hard
+    ceiling, and (c) the TRUE hidden drivers + immutable budget clear that tier's thresholds; else
+    None (no offer, an over-ceiling offer, or a declined offer the drivers don't support).
+
+    Depends ONLY on the true drivers + immutable budget + persona ceiling + the OFFERED tier — NEVER
+    on how fluent the agent was (R31). offered_tier=None (the agent did not attempt to close this
+    turn) always yields None: discovery, pitching, and talk never trigger a commitment. Over-offering
+    (closing at a rung the drivers don't support, e.g. enrollment when only consultation is earned)
+    is declined — so the agent's close-TIMING and TIER choice genuinely matter.
     """
+    if offered_tier is None or offered_tier not in _TIER_THRESHOLDS:
+        return None  # no close attempt (or an unknown tier) -> no commit
     ceiling = _ceiling_rank(persona.max_commitment)
-    if ceiling < 0:
-        return None  # a "none" persona can never commit
-    # Walk the ladder strongest -> weakest; return the first (highest) tier that both clears its
-    # thresholds AND is allowed by the ceiling.
-    for tier in LADDER:  # ("enrollment","trial","consultation","callback")
-        if _TIER_RANK[tier] > ceiling:
-            continue  # above the persona's hard cap — not reachable
-        if _meets(state, _TIER_THRESHOLDS[tier]):
-            return tier
+    if ceiling < 0 or _TIER_RANK[offered_tier] > ceiling:
+        return None  # a "none" persona, or an offer above the persona's hard cap -> can't commit
+    if _meets(state, _TIER_THRESHOLDS[offered_tier]):
+        return offered_tier
     return None
 
 
@@ -274,11 +285,17 @@ class ProspectSimulator:
         agent_act: Optional[str],
         llm_client: LLMClient,
         *,
+        agent_tier: Optional[str] = None,
         model: Optional[str] = None,
     ) -> ProspectTurn:
         """One prospect turn. Order: advance turn + deplete patience -> (walk if exhausted) ->
         sim-LLM talk + clamped SOFT deltas -> deterministic buy_gate -> outcome. Budget/qualified
-        are never mutated. Returns a ProspectTurn; also records the terminal state on self.state."""
+        are never mutated. Returns a ProspectTurn; also records the terminal state on self.state.
+
+        `agent_act`/`agent_tier` describe the agent's move this turn: a commitment fires ONLY when
+        `agent_act == "attempt_close"`, against the offered `agent_tier` (defaulting to the lowest
+        substantive rung, "consultation", if the close carried no explicit tier — mirroring the
+        policy's own default). Any non-close act offers nothing, so the buy_gate returns None."""
         self.state.turns_elapsed += 1
         self._deplete_patience(agent_act)
 
@@ -313,8 +330,10 @@ class ProspectSimulator:
         if not self.persona.qualified and self.persona.disqualifier and not disqualifier_signaled:
             disqualifier_signaled = _mentions_disqualifier(utterance, self.persona.disqualifier)
 
-        # THE GATE: a PURE function of the true drivers + ceiling. Talk never decides this.
-        tier = buy_gate(self.state, self.persona)
+        # THE GATE: a prospect commits ONLY in response to a close attempt, to the OFFERED tier, and
+        # only if its TRUE drivers clear it. Discovery/pitch/talk offer nothing -> buy_gate -> None.
+        offered = (agent_tier or "consultation") if agent_act == "attempt_close" else None
+        tier = buy_gate(self.state, self.persona, offered_tier=offered)
         if tier is not None:
             self.state.committed_tier = tier
             return ProspectTurn(

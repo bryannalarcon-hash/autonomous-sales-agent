@@ -132,18 +132,17 @@ def _prospect_mock(*, big_push: bool = False, walk_hint: bool = False) -> MockLL
 # --- Personas (explicit so outcomes are deterministic, independent of population sampling) ------
 
 
-# Ladder outcomes a committing prospect can terminate at (the honest buy-gate fires at the LOWEST
-# rung it reaches as drivers climb — so a cold prospect commits at callback/consultation, not
-# necessarily enrollment). Used by the commit assertions below.
+# Ladder outcomes a committing prospect can terminate at. The honest buy-gate is OFFER-gated: a
+# prospect commits ONLY when the agent attempts a close, at the tier offered, and only if its true
+# drivers clear it. The commit-path tests therefore drive the agent mock with act="attempt_close".
 _COMMIT_OUTCOMES = {"enrolled", "trial_booked", "consult_booked", "callback_scheduled"}
 
 
 def _hot_qualified() -> Persona:
     """A qualified persona with high budget/need + low starting trust so big_push prospect turns
-    climb the soft drivers across the buy gate within a few turns. The honest gate commits at the
-    LOWEST reachable rung as drivers climb (purchase_intent always starts at 0.1 in the engine), so
-    this terminates at a real ladder commit (callback/consultation/trial) — a terminal ladder
-    outcome, which is exactly the U8 verification."""
+    climb the soft drivers across a consultation close within a couple of turns. Commitment is
+    offer-gated, so the agent mock must CLOSE (attempt_close at a tier) for this to terminate at a
+    real ladder commit — which is exactly the U8 verification."""
     return Persona(
         persona_id="hot_0001",
         archetype="anxious_parent",
@@ -182,14 +181,16 @@ async def test_selfplay_run_terminates_and_logs_one_episode():
     episode with version tag set and qualified == persona ground truth. Round-trip via get_episode."""
     config = load_config("champion_v0")
     persona = _hot_qualified()
-    agent_llm = _agent_mock()
+    # The agent CLOSES at a consultation each turn; big_push climbs the prospect's drivers so the
+    # offered consultation gate clears within a couple of turns -> a deterministic ladder commit.
+    agent_llm = _agent_mock(act="attempt_close", target_slot=None, tier="consultation")
     prospect_llm = _prospect_mock(big_push=True)
 
     ep = await selfplay.run_episode(
         persona, agent_llm, prospect_llm, config, seed=1, cohort="training", max_turns=24
     )
 
-    # Terminal at a real ladder commit outcome (the honest gate fires at the lowest reachable rung).
+    # Terminal at a real ladder commit outcome (offer-gated: the agent closed and the drivers cleared).
     assert ep.outcome in _COMMIT_OUTCOMES
     assert ep.ladder_tier >= 1  # a genuine commitment rung (not 0 = none/walked/escalated/released)
     assert ep.channel == "sim"
@@ -305,9 +306,10 @@ async def test_batch_runs_persist_and_outcome_distribution():
     n = len(personas)
 
     # Factories: a FRESH LLM client per episode so MockLLMClient call-state never collides across
-    # concurrent runs. Hot personas push, impatient ones walk; both terminate deterministically.
+    # concurrent runs. The agent CLOSES at a consultation; hot personas clear the offered gate and
+    # commit, impatient ones exhaust patience and walk first — both terminate deterministically.
     def agent_factory() -> MockLLMClient:
-        return _agent_mock()
+        return _agent_mock(act="attempt_close", target_slot=None, tier="consultation")
 
     def prospect_factory() -> MockLLMClient:
         return _prospect_mock(big_push=True)

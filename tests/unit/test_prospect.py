@@ -92,7 +92,11 @@ async def test_buy_gate_requires_thresholds_regardless_of_talk():
 
     committed = False
     for _ in range(6):
-        turn = await sim_low.respond("You will LOVE this, sign up now!", "attempt_close", enthusiastic)
+        # The agent repeatedly CLOSES (offers consultation), yet the sub-threshold drivers never
+        # clear it — proving the offer-gated buy_gate honors thresholds, not eagerness.
+        turn = await sim_low.respond(
+            "You will LOVE this, sign up now!", "attempt_close", enthusiastic, agent_tier="consultation"
+        )
         if turn.committed_tier is not None:
             committed = True
             break
@@ -100,51 +104,58 @@ async def test_buy_gate_requires_thresholds_regardless_of_talk():
             break
     assert not committed, "sub-threshold prospect committed on talk alone (gate not honest)"
 
-    # Already-over-threshold: true drivers above the enrollment gate -> commits on the first turn,
-    # even with a flat (zero-delta) LLM, because the gate reads the TRUE drivers.
+    # Already-over-threshold: true drivers clear the offered gate -> when the agent CLOSES, it
+    # commits, because the gate reads the TRUE drivers (a well-timed close on a ready prospect).
     high = _qualified_persona(
         utility={"budget": 0.9, "need": 0.85, "trust": 0.85, "urgency": 0.6, "patience": 1.0},
     )
     flat = MockLLMClient(_enthusiasm_callable({"purchase_intent": 0.2}))
     sim_high = ProspectSimulator(high, seed=1)
-    # purchase_intent starts low (~0.1); a couple of bounded turns lift it past the gate.
+    # purchase_intent starts low (~0.1); a couple of bounded turns lift it past the consultation gate.
     tier = None
     for _ in range(5):
-        turn = await sim_high.respond("Here is how we get results.", "pitch", flat)
+        turn = await sim_high.respond(
+            "Ready to book a consultation?", "attempt_close", flat, agent_tier="consultation"
+        )
         if turn.committed_tier is not None:
             tier = turn.committed_tier
             break
-    assert tier is not None, "a genuinely-qualified, over-threshold prospect should commit"
+    assert tier is not None, "a genuinely-qualified, over-threshold prospect should commit when closed"
     assert tier in LADDER
 
 
 def test_buy_gate_is_pure_and_deterministic():
-    """buy_gate is a pure function of state + persona: identical inputs -> identical output,
-    never depends on talk. Crossing all enrollment thresholds returns 'enrollment'."""
+    """buy_gate is a pure function of state + persona + offered tier: identical inputs -> identical
+    output, never depends on talk. With NO offer it returns None (no spontaneous commit); offered
+    'enrollment' with every enrollment threshold met returns 'enrollment'."""
     persona = _qualified_persona()
     state = ProspectState.initial(persona)
     state.trust = 0.8
     state.need = 0.8
     state.urgency = 0.6
     state.purchase_intent = 0.8
-    # budget is read from persona.utility (immutable), here 0.9 -> enrollment gate met.
-    t1 = buy_gate(state, persona)
-    t2 = buy_gate(state, persona)
+    # No close offer this turn -> the prospect never commits spontaneously.
+    assert buy_gate(state, persona, offered_tier=None) is None
+    # budget is read from persona.utility (immutable), here 0.9 -> enrollment gate met when OFFERED.
+    t1 = buy_gate(state, persona, offered_tier="enrollment")
+    t2 = buy_gate(state, persona, offered_tier="enrollment")
     assert t1 == "enrollment"
     assert t1 == t2
 
 
 def test_buy_gate_respects_max_commitment_ceiling():
-    """A persona capped at 'callback' never returns a tier above callback even when every higher
-    threshold is numerically met (the ceiling is a HARD cap)."""
+    """A persona capped at 'callback' declines any offer above callback even when every higher
+    threshold is numerically met (the ceiling is a HARD cap); it accepts a callback offer."""
     persona = _qualified_persona(max_commitment="callback")
     state = ProspectState.initial(persona)
     state.trust = 0.95
     state.need = 0.95
     state.urgency = 0.9
     state.purchase_intent = 0.95
-    tier = buy_gate(state, persona)
-    assert tier == "callback"
+    # Offered enrollment -> above the callback ceiling -> declined; offered callback -> accepted.
+    assert buy_gate(state, persona, offered_tier="enrollment") is None
+    assert buy_gate(state, persona, offered_tier="consultation") is None
+    assert buy_gate(state, persona, offered_tier="callback") == "callback"
 
     none_persona = _qualified_persona(max_commitment="none")
     state2 = ProspectState.initial(none_persona)
@@ -152,7 +163,9 @@ def test_buy_gate_respects_max_commitment_ceiling():
     state2.need = 0.95
     state2.urgency = 0.9
     state2.purchase_intent = 0.95
-    assert buy_gate(state2, none_persona) is None
+    # A "none" persona declines EVERY offer, even the lowest rung.
+    assert buy_gate(state2, none_persona, offered_tier="callback") is None
+    assert buy_gate(state2, none_persona, offered_tier="enrollment") is None
 
 
 # --- unqualified: immutable structural disqualifier -------------------------------------------
@@ -178,7 +191,13 @@ async def test_unqualified_no_budget_never_commits_and_signals_disqualification(
     bought = False
     signaled = False
     for _ in range(12):
-        turn = await sim.respond("This will transform your child's grades, let's enroll today!", "attempt_close", pushy)
+        # The agent keeps trying to close the SALE (enrollment); the no_budget gate refuses it.
+        turn = await sim.respond(
+            "This will transform your child's grades, let's enroll today!",
+            "attempt_close",
+            pushy,
+            agent_tier="enrollment",
+        )
         if turn.committed_tier in ("enrollment", "trial"):
             bought = True
             break
@@ -242,7 +261,9 @@ async def test_budget_and_qualified_immutable_to_talk():
     sim = ProspectSimulator(persona, seed=2)
 
     for _ in range(5):
-        turn = await sim.respond("Let's just enroll, you can afford it!", "attempt_close", cheater)
+        turn = await sim.respond(
+            "Let's just enroll, you can afford it!", "attempt_close", cheater, agent_tier="enrollment"
+        )
         # budget is never mutated into state and stays read from the immutable persona utility.
         assert sim.state.budget == pytest.approx(original_budget)
         assert "budget" not in turn.state_snapshot or turn.state_snapshot["budget"] == pytest.approx(original_budget)
@@ -305,12 +326,13 @@ def test_disqualifier_iff_unqualified():
 async def test_reproducible_outcome_for_fixed_persona_and_script():
     """Same persona + same scripted agent turns + same seed, run twice -> identical
     (committed_tier, walked, turns_elapsed). The U7 verification: deterministic outcomes."""
+    # (utterance, act, offered_tier) — tier is set only on close attempts (mirrors the harness).
     agent_turns = [
-        ("Hi, tell me about your goals.", "ask_discovery"),
-        ("Here's how we get results.", "pitch"),
-        ("We can be flexible on scheduling.", "handle_objection"),
-        ("Ready to get started?", "attempt_close"),
-        ("Let's lock it in.", "attempt_close"),
+        ("Hi, tell me about your goals.", "ask_discovery", None),
+        ("Here's how we get results.", "pitch", None),
+        ("We can be flexible on scheduling.", "handle_objection", None),
+        ("Ready to get started?", "attempt_close", "consultation"),
+        ("Let's lock it in.", "attempt_close", "consultation"),
     ]
     deltas = json.dumps(
         {"utterance": "That makes sense.", "deltas": {"trust": 0.15, "need": 0.15, "purchase_intent": 0.2}}
@@ -323,8 +345,8 @@ async def test_reproducible_outcome_for_fixed_persona_and_script():
         # Fresh scripted list each run so the two runs see identical LLM replies.
         llm = MockLLMClient([deltas for _ in agent_turns])
         sim = ProspectSimulator(persona, seed=42)
-        for utt, act in agent_turns:
-            last = await sim.respond(utt, act, llm)
+        for utt, act, tier in agent_turns:
+            last = await sim.respond(utt, act, llm, agent_tier=tier)
             if last.walked or last.committed_tier is not None:
                 break
         return (sim.state.committed_tier, sim.state.walked, sim.state.turns_elapsed)
@@ -332,3 +354,25 @@ async def test_reproducible_outcome_for_fixed_persona_and_script():
     out_a = await run_once()
     out_b = await run_once()
     assert out_a == out_b
+
+
+# --- commitment requires a close OFFER (never spontaneous) ------------------------------------
+
+async def test_no_commit_without_a_close_offer():
+    """A hot, fully-qualified prospect driven through NON-close acts (ask/pitch) never commits — a
+    commitment fires ONLY when the agent actually attempts a close. This pins the offer-gated model:
+    discovery/pitch/talk, however effective, advance drivers but never themselves close the deal."""
+    persona = _qualified_persona(
+        utility={"budget": 0.9, "need": 0.85, "trust": 0.85, "urgency": 0.6, "patience": 1.0},
+    )
+    # Talk that drives every soft driver up to the ceiling — yet without a close offer, no commit.
+    pusher = MockLLMClient(_enthusiasm_callable({"trust": 0.2, "need": 0.2, "purchase_intent": 0.2}))
+    sim = ProspectSimulator(persona, seed=1)
+
+    for act in ("ask", "pitch", "ask", "pitch", "ask"):
+        turn = await sim.respond("Tell me more / here's how we help.", act, pusher)
+        assert turn.committed_tier is None, f"committed on a non-close act ({act}) — gate not offer-driven"
+
+    # Drivers are now hot; the moment the agent CLOSES at a tier they clear, it commits.
+    closed = await sim.respond("Shall we book a consultation?", "attempt_close", pusher, agent_tier="consultation")
+    assert closed.committed_tier == "consultation"
