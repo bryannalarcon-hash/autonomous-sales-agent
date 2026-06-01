@@ -3,6 +3,9 @@
 # returns the ALLOWED/OVERRIDDEN Decision — gates have FINAL say over the LLM proposal (neuro-
 # symbolic: LLM proposes, gates decide). apply_gates() chains them in priority order.
 #   skip_known          — never ask a slot already filled at/above lock confidence.
+#   address_direct_input— a live objection or a direct question (from the DST intent classifier)
+#                         pre-empts a discovery/pitch act (-> handle_objection / answer_via_kb) so the
+#                         agent never ignores what the prospect just asked to keep doing discovery.
 #   must_clear_objection— forbid pivot-to-close while active_objection is set (-> handle_objection).
 #   price_gate          — don't open price/budget before a trust event (prospect asked unprompted
 #                         OR a value-ack/trust threshold OR required discovery slots filled).
@@ -65,6 +68,42 @@ def skip_known(decision: Any, belief: BeliefState, config: AgentConfig) -> Any:
         out = decision.copy()
         out.act = "confirm_known"
         out.rationale = f"skip_known: {decision.target_slot} already known; confirming not re-asking"
+        return out
+    return decision
+
+
+# --- address_direct_input ---------------------------------------------------------------------
+
+# Discovery/pitch acts that must yield to an unanswered question or a live objection (R35 discovery
+# is good, but never at the cost of ignoring what the prospect just said).
+_DEFERRABLE_ACTS = frozenset({"ask", "confirm_known", "pitch"})
+
+
+def address_direct_input(decision: Any, belief: BeliefState, config: AgentConfig) -> Any:
+    """Ensure a direct question or objection is ADDRESSED this turn — not ignored to keep doing
+    discovery. This is the fix for the agent looping "what grade?" at a prospect who asked "how much?"
+    or objected "why not Khan Academy?": the DST now classifies the utterance (active_objection /
+    open_question / price_inquiry), and this gate routes a discovery/pitch proposal accordingly —
+    handle_objection when an objection is live, answer_via_kb when they asked a question. Acts that
+    already address the prospect (answer_via_kb, handle_objection) or advance/close/escalate/disqualify
+    are left to the close-path + escalation gates."""
+    if decision.act not in _DEFERRABLE_ACTS:
+        return decision
+    if belief.active_objection:
+        out = decision.copy()
+        out.act = "handle_objection"
+        out.target_slot = None
+        out.tier = None
+        out.rationale = (
+            f"address_direct_input: prospect raised '{belief.active_objection}'; "
+            "handling it before any more discovery"
+        )
+        return out
+    if belief.open_question and belief.last_user_act in ("question", "price_inquiry"):
+        out = decision.copy()
+        out.act = "answer_via_kb"
+        out.tier = None
+        out.rationale = "address_direct_input: prospect asked a direct question; answering before more discovery"
         return out
     return decision
 
@@ -297,7 +336,8 @@ def apply_gates(
 
     Order matters: escalation is checked FIRST and LAST — first so an EXTREME moment short-circuits
     everything, and again last so an override another gate produced still can't slip past an extreme
-    trigger. Between them: skip_known -> must_clear_objection -> price_gate -> pushiness_cap.
+    trigger. Between them: skip_known -> address_direct_input -> must_clear_objection -> price_gate
+    -> pushiness_cap.
     """
     # Extreme moments dominate: nothing else matters if we must defer.
     escalated = escalation_triggers(decision, belief, config, history=history)
@@ -305,6 +345,7 @@ def apply_gates(
         return escalated
 
     d = skip_known(decision, belief, config)
+    d = address_direct_input(d, belief, config)  # answer/handle what they just said before discovery
     d = must_clear_objection(d, belief, config)
     d = price_gate(d, belief, config)
     d = pushiness_cap(d, belief, config, history=history)

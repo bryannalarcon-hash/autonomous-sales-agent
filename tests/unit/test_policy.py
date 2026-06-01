@@ -540,3 +540,34 @@ async def test_nlg_returns_filler_on_httpx_error():
     reply = await realize(decision, b, cfg, llm)  # must not raise
     assert isinstance(reply, str)
     assert reply.strip(), "realize() must return a non-empty filler on call failure"
+
+
+# --- address_direct_input (M2: never ignore a direct question/objection for discovery) ---------
+
+def test_address_direct_input_routes_objection_to_handle_objection():
+    """A live objection pre-empts a discovery/pitch act -> handle_objection (was: agent looped 'what
+    grade?' at a prospect who objected). Close/escalate/already-addressing acts are left alone."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.active_objection = "diy_free"
+    for proposed in (
+        gates.address_direct_input(Decision(act="ask", target_slot="grade_level"), b, cfg),
+        gates.address_direct_input(Decision(act="pitch"), b, cfg),
+        gates.address_direct_input(Decision(act="confirm_known"), b, cfg),
+    ):
+        assert proposed.act == "handle_objection"
+    # An attempt_close is NOT rerouted here (must_clear_objection / pushiness own the close path).
+    assert gates.address_direct_input(Decision(act="attempt_close", tier="trial"), b, cfg).act == "attempt_close"
+
+
+def test_address_direct_input_routes_open_question_to_answer_via_kb():
+    """A direct question (open_question + question/price_inquiry) pre-empts discovery -> answer_via_kb,
+    so the agent answers what was asked instead of re-asking a discovery slot."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.open_question = "How much per month?"
+    b.last_user_act = "price_inquiry"
+    out = gates.address_direct_input(Decision(act="ask", target_slot="grade_level"), b, cfg)
+    assert out.act == "answer_via_kb"
+    # With no question and no objection, a discovery ask is untouched.
+    assert gates.address_direct_input(Decision(act="ask", target_slot="goal"), BeliefState.fresh(), cfg).act == "ask"

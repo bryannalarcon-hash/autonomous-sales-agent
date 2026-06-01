@@ -79,11 +79,15 @@ def _build_messages(
         for name, slot in belief.slots.items()
         if slot.get("value") is not None
     }
+    # Surface what the prospect actually asked so answer_via_kb answers THAT (not "remind me what you
+    # wanted to know") and handle_objection addresses the specific objection.
+    open_q = getattr(belief, "open_question", None)
     parts = [
         f"NEXT_ACT: {decision.act}",
         f"TARGET_SLOT: {decision.target_slot}" if decision.target_slot else "",
         f"COMMITMENT_TIER: {decision.tier}" if decision.tier else "",
         f"WHAT_TO_DO: {guidance}",
+        f"PROSPECT_ASKED: {open_q!r}" if open_q else "",
         f"KNOWN_SO_FAR: {known}" if known else "",
         f"ACTIVE_OBJECTION: {belief.active_objection}" if belief.active_objection else "",
         _grounding_block(retrieved_facts),

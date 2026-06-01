@@ -276,3 +276,39 @@ async def test_turn_count_and_last_user_act_meta_update():
     b = await update(b, "ask_grade", "She's in 11th grade.", flat, last_user_act="inform")
     assert b.turn_count == 1
     assert b.last_user_act == "inform"
+
+
+# --- deterministic intent / objection classification (M2) -------------------------------------
+
+def test_classify_intent_objections_questions_inquiry_human_statement():
+    """The deterministic classifier fills the signals the policy/gates/NLG need to ADDRESS the
+    prospect (objection / open question / price inquiry / human request) instead of looping discovery."""
+    from src.core.dst import _classify_intent
+
+    # Objections map to the canonical keys (mirroring the config rebuttals + kb objection corpus).
+    assert _classify_intent("why not just use Khan Academy?")[1] == "diy_free"
+    assert _classify_intent("that's too expensive")[1] == "price"
+    assert _classify_intent("I need to check with my husband first")[1] == "decision_maker"
+    # A bare price question is a price_inquiry (not an objection) and captures the open question.
+    act, obj, q = _classify_intent("How much does it cost per month?")
+    assert act == "price_inquiry" and obj is None and q
+    # A generic question -> question + open_question = the utterance.
+    act, obj, q = _classify_intent("What subjects do you offer?")
+    assert act == "question" and obj is None and q == "What subjects do you offer?"
+    # Explicit human request.
+    assert _classify_intent("can I talk to a real person?")[0] == "human_request"
+    # A plain statement trips nothing.
+    assert _classify_intent("My daughter is in tenth grade.") == (None, None, None)
+
+
+async def test_update_sets_intent_signals_on_the_belief():
+    """update() runs the classifier so the returned belief carries active_objection / open_question /
+    last_user_act (previously always None, which left the policy blind)."""
+    nb = await update(
+        BeliefState.fresh(), last_agent_act="greet",
+        user_utterance="that sounds expensive, why not use Khan Academy?",
+        llm_client=MockLLMClient([json.dumps({})]),
+    )
+    assert nb.active_objection == "diy_free"
+    assert nb.open_question and "Khan" in nb.open_question
+    assert nb.last_user_act == "objection"

@@ -110,26 +110,36 @@ def test_respond_does_not_leak_livekit_types():
                 assert "livekit" not in (node.module or "").lower(), f"{name} imports from livekit"
 
 
-# --- AE2: price raised before trust -> re-anchor value, no quote ------------------------------
+# --- AE2: prospect asks price before trust -> answer it, never ask THEIR budget ---------------
 
-async def test_respond_ae2_price_before_trust_does_not_open_price():
-    """AE2: trust is low and the LLM tries to open budget; respond() re-anchors to value, no quote."""
+async def test_respond_ae2_price_inquiry_is_answered_not_budget_asked():
+    """AE2 (evolved for M2): when the prospect ASKS about price before trust, the agent ADDRESSES the
+    question (answer_via_kb, grounded in the value-framed pricing KB) instead of ignoring it to keep
+    doing discovery — and it still never ASKS the prospect's budget prematurely. The 'don't ask budget
+    before trust' property is enforced by price_gate and unit-tested in
+    test_policy.test_price_gate_blocks_opening_price_before_trust; here we assert the prospect's direct
+    price question is not dodged (the M2 fix: address_direct_input routes the discovery proposal to
+    answer_via_kb)."""
     cfg = make_config(trust_gate_open_price=0.6, discovery_slots_required=3)
     b = BeliefState.fresh()
     b.drivers["trust"] = 0.25
-    # DST keeps trust low; policy proposes opening budget; gate must re-anchor.
+    # DST keeps trust low; policy proposes asking budget; the prospect ASKED price, so the gate routes
+    # to answering their question (never to asking THEIR budget).
     llm = MockLLMClient(
         [
             json.dumps({"trust": 0.0, "price_sensitivity": 0.1}),  # dst deltas
-            _policy_json(act="ask", target_slot="budget", rationale="quote price"),  # policy
-            "Before we get to pricing, let me show you how we'd actually help.",  # nlg
+            _policy_json(act="ask", target_slot="budget", rationale="ask budget"),  # policy
+            "Our memberships are tiered, so I can walk you through what fits.",  # nlg
         ]
     )
     decision, reply, new_belief = await respond(
         b, history=[], user_utterance="How much does this cost?", llm_client=llm, config=cfg
     )
+    # Never ask the prospect's budget before trust...
     assert not (decision.act == "ask" and decision.target_slot == "budget")
-    assert decision.act == "pitch"
+    # ...and ADDRESS the price question rather than loop discovery / cold-deflect (M2).
+    assert decision.act == "answer_via_kb"
+    assert new_belief.last_user_act == "price_inquiry"
 
 
 # --- AE3: no-budget prospect -> graceful release, not a forced close --------------------------

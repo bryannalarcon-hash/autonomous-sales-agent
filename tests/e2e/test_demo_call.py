@@ -504,7 +504,10 @@ def test_chat_done_flag_reflects_terminal_act(act, tier, expected_done):
     client = TestClient(app)
     sid = _start(client, channel="text")["session_id"]
     _grant(client, sid)
-    r = client.post("/api/chat", json={"session_id": sid, "text": "Can we move forward?"})
+    # A neutral prospect STATEMENT (not a question/objection) so a discovery `ask` proposal is not
+    # legitimately rerouted by the address_direct_input gate — this test pins the done-flag per
+    # forced act, not the question/objection routing (covered by test_respond's M2 tests).
+    r = client.post("/api/chat", json={"session_id": sid, "text": "I'd like to keep going."})
     assert r.status_code == 200, r.text
     payload = r.json()
     assert payload["decision_act"] == act

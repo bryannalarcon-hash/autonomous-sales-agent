@@ -163,6 +163,62 @@ def _extract_slots(belief: BeliefState, utterance: str) -> None:
         # else: weaker conflicting evidence — ignored.
 
 
+# --- Deterministic intent / objection classification -----------------------------------------
+# Why deterministic (no LLM): the policy is BLIND without these signals — it loops discovery and
+# ignores direct questions/objections (a real prospect who asks "how much?" or "why not Khan
+# Academy?" got re-asked "what grade?"). A keyword classifier is zero-latency, testable, and
+# parity-clean (text + voice get the same signals). The objection taxonomy mirrors the config
+# rebuttals + the kb_chunk `objections#*` corpus the agent grounds on.
+
+# Objection cues -> the canonical objection key (priority order: first match wins). Word-boundaried.
+_OBJECTION_PATTERNS: list[tuple[Any, str]] = [
+    (re.compile(r"\b(khan|youtube|free|do it myself|on my own|google it|self[- ]?study)\b", re.I), "diy_free"),
+    (re.compile(r"\b(my (husband|wife|spouse|partner)|other parent|check with|talk to my|discuss (it )?with|run it by)\b", re.I), "decision_maker"),
+    (re.compile(r"\b(will it (really )?(work|help)|does it (really )?(work|help)|worth it|actually help|guarantee|skeptic)\b", re.I), "efficacy_doubt"),
+    (re.compile(r"\b(right time|too early|too late|not sure (if )?now|maybe later|wait (a|until)|down the road)\b", re.I), "timing"),
+    (re.compile(r"\b(expensive|too much|can'?t afford|pricey|out of (our|my) budget|cost(s|ly)? too)\b", re.I), "price"),
+]
+# A bare price/cost question (not necessarily an objection) -> opens price talk via the gate.
+_PRICE_INQUIRY_RE = re.compile(r"\b(how much|what(?:'s| is| does it) cost|price|pricing|per (month|hour|session)|monthly|fees?|rates?)\b", re.I)
+# An explicit ask for a human — routes to escalate via the escalation gate.
+_HUMAN_REQUEST_RE = re.compile(r"\b(speak|talk|connect me) (to|with) (a |an )?(human|person|representative|rep|agent|advisor|someone)\b|real (person|human)", re.I)
+# A question at all: a trailing '?' or a leading interrogative/request-to-explain.
+_QUESTION_RE = re.compile(r"\?|\b(what|how|when|where|why|who|which|can you|could you|do you|are there|is there|tell me about)\b", re.I)
+
+
+def _classify_intent(utterance: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Classify a prospect utterance into (last_user_act, active_objection, open_question).
+
+    Deterministic + zero-latency. `active_objection` is one of the canonical keys (price /
+    efficacy_doubt / diy_free / timing / decision_maker) when an objection cue fires. `open_question`
+    carries the trimmed utterance when the prospect asked something (so NLG knows WHAT to answer and
+    the price_gate's substring check can fire). `last_user_act` is the coarse intent the gates read:
+    human_request > objection > price_inquiry > question > statement (None when nothing fires)."""
+    text = (utterance or "").strip()
+    if not text:
+        return None, None, None
+    is_question = bool(_QUESTION_RE.search(text))
+    open_question = text[:300] if is_question else None
+
+    if _HUMAN_REQUEST_RE.search(text):
+        return "human_request", None, open_question
+
+    objection: Optional[str] = None
+    for pat, key in _OBJECTION_PATTERNS:
+        if pat.search(text):
+            objection = key
+            break
+    # A bare price question with no complaint cue is a price INQUIRY, not a price objection.
+    if objection is None and _PRICE_INQUIRY_RE.search(text):
+        return "price_inquiry", None, open_question or text[:300]
+    if objection is not None:
+        # A price objection still counts as price talk the gate should open.
+        return ("price_inquiry" if objection == "price" else "objection"), objection, open_question
+    if is_question:
+        return "question", None, open_question
+    return None, None, None
+
+
 # --- LLM latent-driver delta-update -----------------------------------------------------------
 
 _DRIVER_RUBRIC = (
@@ -272,9 +328,14 @@ async def update(
     # 3. Deterministically-derived trends from the logged trajectory (prior -> updated levels).
     _derive_trends(prior, updated)
 
-    # 4. Meta bookkeeping.
+    # 4. Meta bookkeeping + deterministic intent/objection classification. The classifier fills the
+    #    signals the policy/gates/NLG need to ADDRESS the prospect (objection, open question,
+    #    price-inquiry) instead of looping discovery; an explicit last_user_act passed in (an upstream
+    #    NLU label) still wins over the keyword classifier.
     updated.turn_count = prior.turn_count + 1
-    if last_user_act is not None:
-        updated.last_user_act = last_user_act
+    classified_act, objection, open_question = _classify_intent(user_utterance)
+    updated.last_user_act = last_user_act if last_user_act is not None else classified_act
+    updated.active_objection = objection
+    updated.open_question = open_question
 
     return updated
