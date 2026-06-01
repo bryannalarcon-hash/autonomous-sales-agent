@@ -1,9 +1,10 @@
 // The SHARED Cadence dashboard shell — left nav rail (two modes: Operate / Improve + their
 // destinations) + global top bar — that wraps BOTH modes. U15 (Operate) builds it; U16 (Improve)
-// reuses it unchanged: add Improve pages under /improve/* and they drop into this chrome. The route
-// registry (NAV) is the single source of truth for label/title/icon/badge per destination and maps
-// 1:1 to App Router paths. Active nav state derives from the pathname (the Call Review detail keeps
-// "Calls" highlighted). Operator-facing titles are human-readable — NO internal P-id ever renders.
+// reuses it unchanged: the Improve pages now live at /improve/{lab,approvals,kb,versions} and drop
+// into this chrome. The route registry (NAV) is the single source of truth for label/title/icon/
+// badge per destination and maps 1:1 to App Router paths. Active nav state derives from the pathname
+// (the Call Review detail keeps "Calls" highlighted). Operator-facing titles are human-readable —
+// NO internal P-id ever renders.
 // The top bar carries the champion-version chip, persona chip, and the Sandbox/Live environment
 // toggle (local UI state). Pure chrome: pages render as {children} inside .main.
 'use client';
@@ -14,8 +15,7 @@ import { useState, type ReactNode } from 'react';
 import { Icon, type IconName } from './Icon';
 
 interface NavDest {
-  href: string; // where the rail item navigates TODAY (real page, or the /improve placeholder)
-  target?: string; // the dedicated route U16 will split this into (Improve items only)
+  href: string; // the App Router path the rail item navigates to (1:1 with a page)
   label: string; // operator-facing rail label
   title: string; // operator-facing top-bar title
   icon: IconName;
@@ -31,15 +31,13 @@ const NAV: NavDest[] = [
   { href: '/operate/calls', label: 'Calls', title: 'Calls List', icon: 'list', group: 'operate' },
   { href: '/operate/kpi', label: 'KPI Views', title: 'KPI Views', icon: 'chart', group: 'operate' },
   { href: '/operate/escalations', label: 'Escalations', title: 'Escalation Queue', icon: 'alert', group: 'operate', badge: 3 },
-  // Improve destinations live in the rail NOW so the two-mode IA is complete, but their dedicated
-  // pages are U16's deliverable. Until then every Improve item points at the existing /improve
-  // placeholder (no broken links); `target` records the route U16 will split it into. When U16 adds
-  // /improve/{lab,approvals,kb,versions}, swap each `href` to its `target` — the rest of the shell
-  // (active-state, mode switch, badges) already keys off these entries unchanged.
-  { href: '/improve', target: '/improve/lab', label: 'Experiment Lab', title: 'Experiment Lab', icon: 'flask', group: 'improve' },
-  { href: '/improve', target: '/improve/approvals', label: 'Approvals', title: 'Approval Queue', icon: 'badge', group: 'improve', badge: 2, amber: true },
-  { href: '/improve', target: '/improve/kb', label: 'KB / Playbook', title: 'KB / Playbook Editor', icon: 'book', group: 'improve' },
-  { href: '/improve', target: '/improve/versions', label: 'Versions', title: 'Version History', icon: 'branch', group: 'improve' },
+  // Improve destinations now point at their dedicated U16 pages under /improve/* (the `target` the
+  // U15 scaffold recorded is now the live `href`). The rest of the shell (active-state, mode switch,
+  // badges) keys off these entries unchanged.
+  { href: '/improve/lab', label: 'Experiment Lab', title: 'Experiment Lab', icon: 'flask', group: 'improve' },
+  { href: '/improve/approvals', label: 'Approvals', title: 'Approval Queue', icon: 'badge', group: 'improve', badge: 2, amber: true },
+  { href: '/improve/kb', label: 'KB / Playbook', title: 'KB / Playbook Editor', icon: 'book', group: 'improve' },
+  { href: '/improve/versions', label: 'Versions', title: 'Version History', icon: 'branch', group: 'improve' },
 ];
 
 // The Call Review detail screen (no rail entry of its own) keeps "Calls" highlighted + shows a
@@ -64,7 +62,7 @@ function GlobalControls() {
   const [live, setLive] = useState(false);
   return (
     <>
-      <Link href="/improve" className="gctl" title="Champion version — open Version History (U16)">
+      <Link href="/improve/versions" className="gctl" title="Champion version — open Version History">
         <Icon name="shield" size={15} />
         <span>
           Champion <b>v12</b>
@@ -125,7 +123,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
               <Icon name="broadcast" size={15} />
               Operate
             </button>
-            <button className={mode === 'improve' ? 'on' : ''} onClick={() => router.push('/improve')}>
+            <button className={mode === 'improve' ? 'on' : ''} onClick={() => router.push('/improve/lab')}>
               <Icon name="flask" size={15} />
               Improve
             </button>

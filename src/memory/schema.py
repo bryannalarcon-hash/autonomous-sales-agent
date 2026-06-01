@@ -1,6 +1,7 @@
 # Typed models for the unified memory store (plan U2): Episode (ordered turns + outcome + version
 # tags + channel), Lead (per-caller memory keyed by a HASHED phone number — raw phone is NEVER
-# stored), VersionLineage (champion/challenger parent links + KPI), plus EscalationLog and the
+# stored), VersionLineage (champion/challenger parent links + KPI), ExperimentRecord (a persisted
+# champion-vs-challenger run — dashboard P6 lab / P7 approvals), plus EscalationLog and the
 # belief-snapshot/turn sub-models. Fields are the union of the U2 spec and every field the
 # dashboard data contract (docs/design/dashboard-ia-spec.md, pages P1–P9) says it reads, so the
 # dashboard never needs a schema retrofit. Stdlib dataclasses only (matches src/config/settings.py).
@@ -325,5 +326,108 @@ class EscalationLog:
             moment=data.get("moment"),
             turn_id=data.get("turn_id"),
             lifecycle=str(data.get("lifecycle", "unreviewed") or "unreviewed"),
+            created_at=created or _utcnow(),
+        )
+
+
+# Experiment lifecycle states (dashboard P6 lab chips / P7 queue). `blocked` IS the
+# PromotionDecision "pending_approval" — an extreme challenger that passed the bar but needs a human
+# (R19). `draft`/`running` are in-flight; `passed` cleared the bar non-extreme; `promoted` shipped
+# as champion (auto or post-approval); `rejected`/`paused` are terminal/halted.
+EXPERIMENT_STATES = ("draft", "running", "passed", "blocked", "promoted", "rejected", "paused")
+# Guardrail verdict for an experiment arm (mirrors the prototype's pass/warn/trip chips).
+GUARDRAIL_VERDICTS = ("pass", "warn", "trip")
+
+
+@dataclass
+class ExperimentRecord:
+    """A persisted champion-vs-challenger experiment (plan U16; dashboard P6 lab / P7 approvals).
+
+    The loop (src.loop.experiment.run_experiment) returns an in-memory ExperimentResult; this is the
+    DURABLE record the dashboard reads. It carries the BEFORE/AFTER comparison (champion_kpi vs
+    challenger_kpi, delta + delta_ci + challenger_better — the significant-lift decision), the
+    guardrail verdict, the per-arm qualification accuracy (R29), the single declared diff (R17), the
+    is_extreme flag (R19), and a lifecycle `state` ∈ EXPERIMENT_STATES. A KB/playbook editor SAVE
+    persists a NEW record in `running` state (a DRAFT CHALLENGER) WITHOUT touching version_lineage —
+    so the live champion is never mutated by an edit (R20).
+    """
+
+    experiment_id: str
+    challenger_version: str
+    parent_version: Optional[str] = None
+    name: str = ""
+    dimension: str = ""
+    # The minimal one-dimension diff, as the namespaced labels declared_diff() returns (R17).
+    declared_diff: list[str] = field(default_factory=list)
+    diff_description: str = ""
+    population: str = ""
+    n: int = 0
+    target: int = 0
+    kb_version: str = ""
+    # --- before/after comparison (grading.ComparisonResult fields) ---
+    champion_kpi: float = 0.0
+    challenger_kpi: float = 0.0
+    delta: float = 0.0
+    delta_ci: list[float] = field(default_factory=lambda: [0.0, 0.0])
+    challenger_better: bool = False
+    # Same-call enrollment delta (challenger − champion), distinct from the ladder delta above.
+    enroll_delta: float = 0.0
+    # Significance ∈ 0..1 (1 − the alpha at which the delta CI excludes 0; surfaced as a % chip).
+    significance: float = 0.0
+    # --- guardrail + qualification (R24/R29) ---
+    guardrail: str = "pass"  # pass | warn | trip
+    guardrail_reason: Optional[str] = None
+    champion_qual_acc: float = 1.0
+    challenger_qual_acc: float = 1.0
+    # --- gate + lifecycle (R19) ---
+    is_extreme: bool = False
+    state: str = "running"
+    created_at: datetime = field(default_factory=_utcnow)
+
+    def __post_init__(self) -> None:
+        if self.state not in EXPERIMENT_STATES:
+            raise ValueError(f"state must be one of {EXPERIMENT_STATES}, got {self.state!r}")
+        if self.guardrail not in GUARDRAIL_VERDICTS:
+            raise ValueError(
+                f"guardrail must be one of {GUARDRAIL_VERDICTS}, got {self.guardrail!r}"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["created_at"] = self.created_at
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ExperimentRecord":
+        data = dict(data or {})
+        created = data.get("created_at")
+        if isinstance(created, str):
+            created = datetime.fromisoformat(created)
+        ci = data.get("delta_ci") or [0.0, 0.0]
+        return cls(
+            experiment_id=str(data["experiment_id"]),
+            challenger_version=str(data["challenger_version"]),
+            parent_version=data.get("parent_version"),
+            name=str(data.get("name", "") or ""),
+            dimension=str(data.get("dimension", "") or ""),
+            declared_diff=list(data.get("declared_diff", []) or []),
+            diff_description=str(data.get("diff_description", "") or ""),
+            population=str(data.get("population", "") or ""),
+            n=int(data.get("n", 0) or 0),
+            target=int(data.get("target", 0) or 0),
+            kb_version=str(data.get("kb_version", "") or ""),
+            champion_kpi=float(data.get("champion_kpi", 0.0) or 0.0),
+            challenger_kpi=float(data.get("challenger_kpi", 0.0) or 0.0),
+            delta=float(data.get("delta", 0.0) or 0.0),
+            delta_ci=[float(ci[0]), float(ci[1])],
+            challenger_better=bool(data.get("challenger_better", False)),
+            enroll_delta=float(data.get("enroll_delta", 0.0) or 0.0),
+            significance=float(data.get("significance", 0.0) or 0.0),
+            guardrail=str(data.get("guardrail", "pass") or "pass"),
+            guardrail_reason=data.get("guardrail_reason"),
+            champion_qual_acc=float(data.get("champion_qual_acc", 1.0) or 1.0),
+            challenger_qual_acc=float(data.get("challenger_qual_acc", 1.0) or 1.0),
+            is_extreme=bool(data.get("is_extreme", False)),
+            state=str(data.get("state", "running") or "running"),
             created_at=created or _utcnow(),
         )

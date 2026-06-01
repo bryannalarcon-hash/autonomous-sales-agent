@@ -1,8 +1,9 @@
 # Async datastore (plan U2) over Postgres+pgvector via asyncpg. Persists/queries the unified
 # Episode schema, per-lead memory (upsert merges slots by phone-hash), version lineage
-# (record/champion/lineage), and the ESCALATION REVIEW QUEUE (save/get/list escalation_log rows;
-# the deferred-extreme-moment records U14 writes — dashboard P5). Reads DATABASE_URL from the
-# environment (.env via python-dotenv).
+# (record/champion/lineage), the ESCALATION REVIEW QUEUE (save/get/list escalation_log rows;
+# the deferred-extreme-moment records U14 writes — dashboard P5), and the EXPERIMENT records
+# (save/get/list experiment rows — the persisted champion-vs-challenger runs the dashboard P6 lab /
+# P7 approval queue read; U16). Reads DATABASE_URL from the environment (.env via python-dotenv).
 # A module-level connection pool is created lazily and reused. JSONB columns are (de)serialized
 # with a datetime-aware encoder so created_at round-trips. NO LiveKit/voice imports — sim, text,
 # and voice channels all write through this one interface (plan R26 single-shape guarantee).
@@ -16,7 +17,7 @@ from typing import Any, Optional
 import asyncpg
 from dotenv import load_dotenv
 
-from src.memory.schema import Episode, EscalationLog, Lead, VersionLineage
+from src.memory.schema import Episode, EscalationLog, ExperimentRecord, Lead, VersionLineage
 
 # Load .env once at import so DATABASE_URL is available without an explicit call.
 load_dotenv()
@@ -469,6 +470,153 @@ def _row_to_escalation(row: asyncpg.Record) -> EscalationLog:
             "moment": d.get("moment"),
             "turn_id": d.get("turn_id"),
             "lifecycle": d.get("lifecycle", "unreviewed"),
+            "created_at": d.get("created_at"),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Experiment records (U16 — the persisted champion-vs-challenger runs; dashboard P6/P7)
+# ---------------------------------------------------------------------------
+async def save_experiment(experiment: ExperimentRecord) -> str:
+    """Insert or replace an experiment row (upsert on experiment_id). Returns the experiment_id.
+
+    This is the lab/approvals write side: the loop's in-memory ExperimentResult is flattened into a
+    durable ExperimentRecord (before/after comparison + guardrail + declared diff + state) and stored
+    here so the Experiment Lab (P6) can list it and the Approval Queue (P7) can act on the `blocked`
+    ones. The declared_diff list + delta_ci pair serialize to JSONB. Mirrors save_escalation's shape.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO experiment (
+                experiment_id, name, challenger_version, parent_version, dimension,
+                declared_diff, diff_description, population, n, target,
+                champion_kpi, challenger_kpi, delta, delta_ci, challenger_better,
+                enroll_delta, significance, guardrail, guardrail_reason,
+                champion_qual_acc, challenger_qual_acc, is_extreme, state, kb_version, created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                    $18, $19, $20, $21, $22, $23, $24, $25)
+            ON CONFLICT (experiment_id) DO UPDATE SET
+                name = EXCLUDED.name,
+                challenger_version = EXCLUDED.challenger_version,
+                parent_version = EXCLUDED.parent_version,
+                dimension = EXCLUDED.dimension,
+                declared_diff = EXCLUDED.declared_diff,
+                diff_description = EXCLUDED.diff_description,
+                population = EXCLUDED.population,
+                n = EXCLUDED.n,
+                target = EXCLUDED.target,
+                champion_kpi = EXCLUDED.champion_kpi,
+                challenger_kpi = EXCLUDED.challenger_kpi,
+                delta = EXCLUDED.delta,
+                delta_ci = EXCLUDED.delta_ci,
+                challenger_better = EXCLUDED.challenger_better,
+                enroll_delta = EXCLUDED.enroll_delta,
+                significance = EXCLUDED.significance,
+                guardrail = EXCLUDED.guardrail,
+                guardrail_reason = EXCLUDED.guardrail_reason,
+                champion_qual_acc = EXCLUDED.champion_qual_acc,
+                challenger_qual_acc = EXCLUDED.challenger_qual_acc,
+                is_extreme = EXCLUDED.is_extreme,
+                state = EXCLUDED.state,
+                kb_version = EXCLUDED.kb_version,
+                created_at = EXCLUDED.created_at
+            """,
+            experiment.experiment_id,
+            experiment.name,
+            experiment.challenger_version,
+            experiment.parent_version,
+            experiment.dimension,
+            experiment.declared_diff,
+            experiment.diff_description,
+            experiment.population,
+            experiment.n,
+            experiment.target,
+            experiment.champion_kpi,
+            experiment.challenger_kpi,
+            experiment.delta,
+            experiment.delta_ci,
+            experiment.challenger_better,
+            experiment.enroll_delta,
+            experiment.significance,
+            experiment.guardrail,
+            experiment.guardrail_reason,
+            experiment.champion_qual_acc,
+            experiment.challenger_qual_acc,
+            experiment.is_extreme,
+            experiment.state,
+            experiment.kb_version,
+            experiment.created_at,
+        )
+    return experiment.experiment_id
+
+
+async def get_experiment(experiment_id: str) -> Optional[ExperimentRecord]:
+    """Fetch one experiment by id, or None if absent."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM experiment WHERE experiment_id = $1", experiment_id
+        )
+    if row is None:
+        return None
+    return _row_to_experiment(row)
+
+
+async def list_experiments(
+    *, state: Optional[str] = None, limit: int = 200
+) -> list[ExperimentRecord]:
+    """List experiments newest-first for the lab (P6); pass state='blocked' for the approval queue (P7).
+
+    Ordered created_at DESC so the freshest run leads; `limit` caps the page. `state` filters to one
+    lifecycle bucket (the only hot filter the lab tabs + approval queue need).
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if state is None:
+            rows = await conn.fetch(
+                "SELECT * FROM experiment ORDER BY created_at DESC LIMIT $1", limit
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM experiment WHERE state = $1 ORDER BY created_at DESC LIMIT $2",
+                state,
+                limit,
+            )
+    return [_row_to_experiment(r) for r in rows]
+
+
+def _row_to_experiment(row: asyncpg.Record) -> ExperimentRecord:
+    d = dict(row)
+    return ExperimentRecord.from_dict(
+        {
+            "experiment_id": d["experiment_id"],
+            "name": d.get("name", ""),
+            "challenger_version": d["challenger_version"],
+            "parent_version": d.get("parent_version"),
+            "dimension": d.get("dimension", ""),
+            "declared_diff": d.get("declared_diff") or [],
+            "diff_description": d.get("diff_description", ""),
+            "population": d.get("population", ""),
+            "n": d.get("n", 0),
+            "target": d.get("target", 0),
+            "champion_kpi": d.get("champion_kpi", 0.0),
+            "challenger_kpi": d.get("challenger_kpi", 0.0),
+            "delta": d.get("delta", 0.0),
+            "delta_ci": d.get("delta_ci") or [0.0, 0.0],
+            "challenger_better": d.get("challenger_better", False),
+            "enroll_delta": d.get("enroll_delta", 0.0),
+            "significance": d.get("significance", 0.0),
+            "guardrail": d.get("guardrail", "pass"),
+            "guardrail_reason": d.get("guardrail_reason"),
+            "champion_qual_acc": d.get("champion_qual_acc", 1.0),
+            "challenger_qual_acc": d.get("challenger_qual_acc", 1.0),
+            "is_extreme": d.get("is_extreme", False),
+            "state": d.get("state", "running"),
+            "kb_version": d.get("kb_version", ""),
             "created_at": d.get("created_at"),
         }
     )

@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from src.api.improve import ImproveStore, create_improve_router
 from src.api.operate import ReadStore, create_operate_router
 from src.config.settings import AgentConfig, load_config
 from src.core.llm import LLMClient
@@ -131,6 +132,7 @@ def create_app(
     cors_origins: Optional[list[str]] = None,
     token_builder: Optional[TokenBuilder] = None,
     read_store: Optional[ReadStore] = None,
+    improve_store: Optional[ImproveStore] = None,
 ) -> FastAPI:
     """Build the demo + operator API app. Everything network/DB-bound is injectable so tests run
     offline.
@@ -139,8 +141,9 @@ def create_app(
     a MockLLMClient factory). embedder/retrieve_hook wire RAG (defaults: FakeEmbedder, no retrieve).
     lead_voice_lookup reuses a returning caller's stored sticky voice (U6 hydrate). read_store is the
     dashboard's READ data layer (U15 Operate pages): defaults to the Postgres-backed src.memory.store,
-    tests pass a seeded in-memory fake so the read endpoints run DB-free. The app keeps an in-memory
-    session store; consent gates /api/chat and /api/livekit/token.
+    tests pass a seeded in-memory fake so the read endpoints run DB-free. improve_store is the
+    Improve-mode (U16) data layer (experiments + lineage read/write): same injection pattern. The app
+    keeps an in-memory session store; consent gates /api/chat and /api/livekit/token.
     """
     app = FastAPI(title="auto-sales-agent demo + operator API", version="0.1.0")
     app.add_middleware(
@@ -319,6 +322,16 @@ def create_app(
     # Operate-mode read endpoints (U15 dashboard): /api/episodes, /api/episodes/{id}, /api/kpis,
     # /api/escalations, /api/live. The read_store is injected here (default Postgres; tests fake it).
     app.include_router(create_operate_router(read_store=read_store))
+
+    # Improve-mode endpoints (U16 dashboard): /api/experiments, /api/approvals(+approve/reject),
+    # /api/kb, /api/playbook, /api/versions(+rollback). improve_store + the champion config provider
+    # are injected (default Postgres store + load_config; tests fake them) so this runs DB-free too.
+    app.include_router(
+        create_improve_router(
+            improve_store=improve_store,
+            champion_config_provider=(lambda: cfg),
+        )
+    )
 
     return app
 
