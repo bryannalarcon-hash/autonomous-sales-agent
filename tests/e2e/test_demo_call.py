@@ -68,6 +68,17 @@ def _start(client: TestClient, jurisdiction="CA", channel="voice") -> dict[str, 
     return r.json()
 
 
+async def _noop_call_end(session: Any, **kw: Any):
+    """A DB-free call-end hook that just maps the session to an Episode (no store write), so a /end
+    test can assert persistence + eviction without Postgres."""
+    from src.api.persistence import episode_from_session
+
+    return episode_from_session(
+        session, config=kw["config"], channel=kw["channel"],
+        phone_hash=kw.get("phone_hash"), last_tier=kw.get("last_tier"),
+    )
+
+
 # =============================== AE9: DISCLOSURE + CONSENT GATE ==================================
 
 
@@ -97,13 +108,14 @@ def test_chat_is_refused_until_consent_then_proceeds():
     assert r.status_code == 200, r.text
     assert r.json()["state"] == "ready"
 
-    # AFTER consent -> proceeds
+    # AFTER consent -> proceeds. The default mock acts `ask` (a non-terminal discovery turn), so the
+    # call is NOT done (done is only True on a terminal act — see test_chat_done_flag_*).
     r = client.post("/api/chat", json={"session_id": sid, "text": "Hi, my daughter needs algebra help."})
     assert r.status_code == 200, r.text
     payload = r.json()
     assert "reply" in payload and payload["reply"]
-    assert "decision_act" in payload
-    assert payload["done"] in (True, False)
+    assert payload["decision_act"] == "ask"
+    assert payload["done"] is False
 
 
 # =============================== REFUSAL PATH (R41) =============================================
@@ -157,6 +169,45 @@ def test_suspected_minor_blocks_until_parental_consent():
     assert r.status_code == 200, r.text
     assert r.json()["state"] == "ready"
 
+    r = client.post("/api/chat", json={"session_id": sid, "text": "I need algebra help."})
+    assert r.status_code == 200, r.text
+
+
+def test_minor_detected_from_chat_text_blocks_on_need_parental():
+    """detect_minor runs on the user's text INDEPENDENT of req.is_minor (R40): a caller who never
+    flagged is_minor but whose first turn self-reports as a school-aged student calling for themselves
+    is detected, the gate flips to need_parental, and /api/chat is GATED (409) until parental consent."""
+    client = _client()
+    body = _start(client, jurisdiction="NY")
+    sid = body["session_id"]
+
+    # consent granted, is_minor NOT set — the caller looks like an adult so far.
+    r = client.post("/api/consent/respond", json={
+        "session_id": sid, "ai_acknowledged": True, "recording_consent": True,
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "ready"
+
+    # first turn self-reports as a minor caller -> detect_minor fires -> gate need_parental -> 409.
+    r = client.post("/api/chat", json={
+        "session_id": sid, "text": "I'm a sophomore calling for myself about SAT prep.",
+    })
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["state"] == "need_parental"
+
+    # the gate is now blocked on parental consent (subsequent chat stays 409).
+    r = client.get(f"/api/session/{sid}")
+    assert r.json()["state"] == "need_parental"
+    r = client.post("/api/chat", json={"session_id": sid, "text": "still me, the student."})
+    assert r.status_code == 409, r.text
+
+    # resolving parental consent unblocks conversation.
+    r = client.post("/api/consent/respond", json={
+        "session_id": sid, "ai_acknowledged": True, "recording_consent": True,
+        "is_minor": True, "parental_consent": True,
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "ready"
     r = client.post("/api/chat", json={"session_id": sid, "text": "I need algebra help."})
     assert r.status_code == 200, r.text
 
@@ -323,3 +374,185 @@ def test_text_channel_one_party_jurisdiction_consent_flow():
     })
     r = client.post("/api/chat", json={"session_id": sid, "text": "What subjects do you tutor?"})
     assert r.status_code == 200, r.text
+
+
+# =============================== /api/chat done FLAG (terminal acts) ============================
+
+
+def _grant(client: TestClient, sid: str) -> None:
+    r = client.post("/api/consent/respond", json={
+        "session_id": sid, "ai_acknowledged": True, "recording_consent": True,
+    })
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.parametrize(
+    "act,tier,expected_done",
+    [
+        ("attempt_close", "enrollment", True),   # an enrollment close ENDS the call
+        ("attempt_close", "trial", False),       # a trial close is a step, NOT the end
+        ("escalate", None, True),                # escalate is terminal (handed to a specialist)
+        ("disqualify", None, True),              # disqualify is terminal (not a fit)
+        ("ask", "goal", False),                  # discovery continues
+    ],
+)
+def test_chat_done_flag_reflects_terminal_act(act, tier, expected_done):
+    """`done` is True ONLY for a terminal act: an enrollment close, an escalate, or a disqualify. A
+    non-enrollment close (trial) and ordinary discovery (ask) keep the call open (done False). This
+    replaces the prior vacuous `done in (True, False)` assertion with the exact contract."""
+    app = create_app(llm_client_factory=lambda: _agent_mock(act=act, tier=tier), live_rag=False)
+    client = TestClient(app)
+    sid = _start(client, channel="text")["session_id"]
+    _grant(client, sid)
+    r = client.post("/api/chat", json={"session_id": sid, "text": "Can we move forward?"})
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    assert payload["decision_act"] == act
+    assert payload["done"] is expected_done
+
+
+# =============================== ESCALATION MOMENT PII-SCRUBBED (R42) ===========================
+
+
+def test_escalation_moment_is_pii_scrubbed():
+    """An escalate on a turn containing an email/phone records a PII-SCRUBBED moment on the
+    EscalationLog (R42) — the raw email/phone must never reach the review queue."""
+    captured: list[Any] = []
+
+    async def escalation_persist_hook(log: Any) -> None:
+        captured.append(log)
+
+    app = create_app(
+        llm_client_factory=lambda: _agent_mock(
+            act="escalate",
+            reply="I'll have a specialist email you at advisor@nerdy.com or call 555-867-5309.",
+        ),
+        escalation_persist_hook=escalation_persist_hook,
+        live_rag=False,
+    )
+    client = TestClient(app)
+    sid = _start(client, channel="text")["session_id"]
+    _grant(client, sid)
+    r = client.post("/api/chat", json={"session_id": sid, "text": "I want a human now."})
+    assert r.status_code == 200, r.text
+    assert r.json()["decision_act"] == "escalate"
+
+    assert len(captured) == 1
+    moment = captured[0].moment or ""
+    # the raw PII is gone; the redaction placeholders are present.
+    assert "advisor@nerdy.com" not in moment
+    assert "555-867-5309" not in moment
+    assert "[EMAIL]" in moment and "[PHONE]" in moment
+
+
+# =============================== SESSION EVICTION ON /end (bounded store) =======================
+
+
+def test_session_is_evicted_after_end():
+    """A finished call is durable in the store, so /end EVICTS its in-memory session (the bounded
+    session dict shrinks): a subsequent GET /api/session/{id} 404s. A repeat /end stays idempotent
+    (already_ended) from the small ended-results cache rather than 404-ing."""
+    app = create_app(
+        llm_client_factory=lambda: _agent_mock(act="ask", target_slot="goal"),
+        # capture call-end so this stays DB-free.
+        call_end_persist_hook=_noop_call_end,
+        live_rag=False,
+    )
+    client = TestClient(app)
+    sid = _start(client, channel="text")["session_id"]
+    _grant(client, sid)
+    client.post("/api/chat", json={"session_id": sid, "text": "Tell me about tutoring."})
+
+    # session is live before /end
+    assert client.get(f"/api/session/{sid}").status_code == 200
+
+    r = client.post(f"/api/session/{sid}/end", json={"session_id": sid})
+    assert r.status_code == 200, r.text
+    assert r.json()["persisted"] is True
+
+    # EVICTED: the in-memory session is gone (the dict shrank) -> GET 404.
+    assert client.get(f"/api/session/{sid}").status_code == 404
+
+    # but a repeat /end is idempotent (already_ended), not a 404.
+    r2 = client.post(f"/api/session/{sid}/end", json={"session_id": sid})
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["outcome"] == "already_ended"
+    assert r2.json()["persisted"] is False
+
+
+# =============================== OPERATOR AUTH ON WRITE ENDPOINTS ===============================
+
+
+def test_write_endpoint_401_without_token_when_operator_token_set(monkeypatch):
+    """With OPERATOR_TOKEN set, an Improve write endpoint (POST /api/kb) 401s without the header and
+    200s with the right X-Operator-Token. (Auth is applied at the router-INCLUDE site, not inside
+    the router.)"""
+    monkeypatch.setenv("OPERATOR_TOKEN", "s3cret-operator")
+    client = _client()
+
+    # POST a KB draft WITHOUT the token -> 401.
+    r = client.post("/api/kb", json={"name": "draft"})
+    assert r.status_code == 401, r.text
+
+    # WITH the right token -> the auth gate passes (no longer 401).
+    r = client.post(
+        "/api/kb",
+        json={"name": "draft"},
+        headers={"X-Operator-Token": "s3cret-operator"},
+    )
+    assert r.status_code != 401, r.text
+
+
+def test_require_operator_allows_when_token_unset(monkeypatch):
+    """When OPERATOR_TOKEN is UNSET, require_operator ALLOWS every request (local-demo convenience):
+    the dependency returns without raising even with no header. Tested on the dependency directly so
+    it does not reach the real store (the full endpoint would hit Postgres)."""
+    from src.api.server import _make_require_operator
+
+    monkeypatch.delenv("OPERATOR_TOKEN", raising=False)
+    require_operator = _make_require_operator()
+    # no header, no auth -> must NOT raise (returns None).
+    assert require_operator(x_operator_token=None, authorization=None) is None
+
+
+def test_require_operator_accepts_bearer_token(monkeypatch):
+    """require_operator accepts the token via either X-Operator-Token OR a Bearer Authorization
+    header, and 401s (HTTPException) on a wrong/absent token when OPERATOR_TOKEN is set."""
+    from fastapi import HTTPException
+
+    from src.api.server import _make_require_operator
+
+    monkeypatch.setenv("OPERATOR_TOKEN", "s3cret-operator")
+    require_operator = _make_require_operator()
+    # right token via header -> ok
+    assert require_operator(x_operator_token="s3cret-operator", authorization=None) is None
+    # right token via Bearer -> ok
+    assert require_operator(x_operator_token=None, authorization="Bearer s3cret-operator") is None
+    # wrong/absent -> 401
+    with pytest.raises(HTTPException) as ei:
+        require_operator(x_operator_token=None, authorization=None)
+    assert ei.value.status_code == 401
+
+
+# =============================== CORS (no wildcard + credentials together) ======================
+
+
+def test_cors_defaults_to_wildcard_without_credentials():
+    """Default CORS (nothing configured) is the permissive local-dev pairing: wildcard origin with
+    credentials DISABLED — never wildcard + credentials together (browsers reject it; it's unsafe)."""
+    from src.api.server import _resolve_cors
+
+    origins, allow_credentials = _resolve_cors(None)
+    assert origins == ["*"]
+    assert allow_credentials is False
+
+
+def test_cors_reads_allowed_origins_env_and_enables_credentials(monkeypatch):
+    """When ALLOWED_ORIGINS is set (comma-separated explicit origins), credentials are ENABLED (no
+    wildcard present)."""
+    from src.api.server import _resolve_cors
+
+    monkeypatch.setenv("ALLOWED_ORIGINS", "https://app.example.com, https://admin.example.com")
+    origins, allow_credentials = _resolve_cors(None)
+    assert origins == ["https://app.example.com", "https://admin.example.com"]
+    assert allow_credentials is True

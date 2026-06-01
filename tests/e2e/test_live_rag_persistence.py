@@ -12,8 +12,10 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Optional, Sequence
 
+import pytest
 from fastapi.testclient import TestClient
 
 from src.api.server import create_app
@@ -301,6 +303,166 @@ def test_returning_caller_hydrates_known_slots():
     )
 
 
-# NOTE: the DB-DEPENDENT ingest_corpus + live-hook retrieve test lives in
+# ============================ (C) escalation is DEFERRED-BUFFERED with no injected hook ===========
+
+
+def test_escalation_with_no_injected_hook_is_buffered_then_persisted_at_end():
+    """With NO escalation_persist_hook injected, an `escalate` during a call is NOT written to the
+    queue mid-call (the runtime store_hook is a no-op because the escalation FKs to an episode that
+    does not exist yet) — it is BUFFERED on the session and appears only after /end, when the call-end
+    persist re-points it onto the now-saved episode (FK-safe). Tested DB-free: the call-end hook
+    mirrors persist_call_end's re-point, and escalation_persist_hook is intentionally absent."""
+    sink: dict[str, Any] = {"episodes": [], "escalations": []}
+
+    async def call_end_persist_hook(session: Any, **kw: Any):
+        from src.api.persistence import episode_from_session
+
+        ep = episode_from_session(
+            session, config=kw["config"], channel=kw["channel"],
+            phone_hash=kw.get("phone_hash"), last_tier=kw.get("last_tier"),
+        )
+        sink["episodes"].append(ep)
+        for log in kw.get("escalation_logs") or []:
+            log.episode_id = ep.episode_id
+            sink["escalations"].append(log)
+        return ep
+
+    app = create_app(
+        llm_client_factory=lambda: _agent_mock(
+            act="escalate", reply="A specialist will follow up with you shortly."
+        ),
+        embedder=FakeEmbedder(),
+        retrieve_hook=lambda q, **k: [_PRICING_CHUNK],
+        live_rag=False,
+        # NO escalation_persist_hook -> the runtime path defers the write to call end.
+        call_end_persist_hook=call_end_persist_hook,
+    )
+    client = TestClient(app)
+    sid = _start(client, channel="text")["session_id"]
+    _grant(client, sid)
+    r = client.post("/api/chat", json={"session_id": sid, "text": "I want a human now."})
+    assert r.status_code == 200, r.text
+    assert r.json()["decision_act"] == "escalate"
+
+    # MID-CALL: nothing in the queue yet (the write was deferred — the episode FK target doesn't exist).
+    assert sink["escalations"] == []
+
+    # AFTER /end: the buffered escalation is re-pointed onto the saved episode and now present.
+    r = client.post(f"/api/session/{sid}/end", json={"session_id": sid})
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "escalated"
+    assert len(sink["escalations"]) == 1
+    ep = sink["episodes"][0]
+    assert sink["escalations"][0].episode_id == ep.episode_id
+
+
+# ============================ (C) /end idempotency + no_conversation =============================
+
+
+def test_end_is_idempotent_already_ended():
+    """A second /end on a session that already ended returns outcome="already_ended", persisted=False
+    (no duplicate persistence), even though the live session was evicted after the first /end."""
+    client, sink = _capture_app(
+        llm_client_factory=lambda: _agent_mock(act="ask", target_slot="goal", reply="Sure.")
+    )
+    sid = _start(client, channel="text")["session_id"]
+    _grant(client, sid)
+    client.post("/api/chat", json={"session_id": sid, "text": "Tell me about tutoring."})
+
+    r1 = client.post(f"/api/session/{sid}/end", json={"session_id": sid})
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["persisted"] is True
+    assert len(sink["episodes"]) == 1
+
+    # second /end -> idempotent already_ended, NOT a second persisted episode.
+    r2 = client.post(f"/api/session/{sid}/end", json={"session_id": sid})
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["outcome"] == "already_ended"
+    assert r2.json()["persisted"] is False
+    assert len(sink["episodes"]) == 1, "a repeat /end must not persist a duplicate episode"
+
+
+def test_end_with_no_conversation_returns_no_conversation():
+    """Ending a session that never reached conversation (no brain session built — e.g. consent never
+    granted, or granted but no chat turn) returns outcome="no_conversation", persisted=False, and
+    persists nothing."""
+    client, sink = _capture_app()
+    sid = _start(client, channel="text")["session_id"]
+    _grant(client, sid)  # consent granted, but NO /api/chat turn -> no VoiceSession built.
+
+    r = client.post(f"/api/session/{sid}/end", json={"session_id": sid})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["outcome"] == "no_conversation"
+    assert out["persisted"] is False
+    assert sink["episodes"] == []
+
+
+# ============================ (B-DB) live_rag=True DEFAULT path grounds after ingest ==============
+# DB-DEPENDENT: with live_rag=True + FakeEmbedder injected but retrieve_hook/hydrate_hook left to
+# DEFAULTS, create_app builds the REAL kb.live retrieve hook over the FakeEmbedder, so a factual
+# /api/chat turn retrieves the ingested pricing chunk from pgvector and the reply is grounded. This
+# proves the real wiring (not a stubbed hook) end-to-end. Skips without DATABASE_URL.
+
+_HAVE_DB = bool(os.environ.get("DATABASE_URL"))
+
+
+@pytest.mark.skipif(not _HAVE_DB, reason="DATABASE_URL not set — DB-dependent live_rag default-path test")
+def test_live_rag_default_path_grounds_after_ingest():
+    """live_rag=True (default retrieve_hook) + FakeEmbedder: ingest the KB, then a factual chat turn
+    runs the REAL kb.live hook against pgvector and the reply is grounded against a real cited chunk."""
+    import asyncio
+
+    from src.kb.ingest import ingest_corpus
+    from src.kb.retriever import grounded
+    from src.memory import store
+
+    emb = FakeEmbedder()
+
+    def _drop_pool_ref() -> None:
+        # DROP the module pool REFERENCE without awaiting a close (a prior test may have left it bound
+        # to a now-closed loop, so close() would raise "Event loop is closed"). Each loop below creates
+        # its OWN fresh pool, and the next DB test's _schema fixture recreates cleanly.
+        store._POOL = None  # type: ignore[attr-defined]
+
+    async def _ingest() -> None:
+        # Own short-lived loop: apply migrations + ingest into pgvector. The pool is created fresh on
+        # THIS loop (we dropped any stale reference first), then dropped so the TestClient recreates it
+        # on ITS loop (avoids the asyncpg cross-loop "operation in progress" trap).
+        _drop_pool_ref()
+        n = await ingest_corpus(kb_version=KB_VERSION, embedder=emb)
+        assert n > 0
+
+    _drop_pool_ref()
+    asyncio.run(_ingest())
+    _drop_pool_ref()
+
+    # A reply phrased from the pricing chunk so the groundedness check can pass against real chunks.
+    app = create_app(
+        llm_client_factory=lambda: _agent_mock(
+            reply="Pricing is a monthly tiered membership billed recurring each month."
+        ),
+        embedder=emb,        # FakeEmbedder injected ...
+        live_rag=True,       # ... but retrieve_hook left to DEFAULT -> real kb.live hook is built.
+        # default config (champion_v0) pins kb_version == KB_VERSION, so the hook queries the right rows.
+    )
+    try:
+        with TestClient(app) as client:  # context-manager runs lifespan; pool binds to this loop.
+            sid = _start(client, channel="text")["session_id"]
+            _grant(client, sid)
+            r = client.post(
+                "/api/chat",
+                json={"session_id": sid, "text": "How much does it cost per month?"},
+            )
+            assert r.status_code == 200, r.text
+            reply = r.json()["reply"]
+            assert reply, "expected a grounded reply"
+    finally:
+        # The TestClient lifespan already closed its pool on shutdown; drop any stale reference so the
+        # next DB-gated test's _schema fixture recreates the pool fresh on its own loop.
+        _drop_pool_ref()
+
+
+# NOTE: the DB-DEPENDENT ingest_corpus + live-hook retrieve test ALSO lives in
 # tests/integration/test_kb.py (it reuses that module's proven per-test _schema fixture, which binds
 # the store pool to each test's own event loop — required for asyncpg under pytest-asyncio).

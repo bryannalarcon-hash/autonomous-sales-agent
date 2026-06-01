@@ -125,15 +125,20 @@ def _build_policy_messages(
 
 
 def _recent_history(history: Sequence[Any], n: int = 6) -> list[dict[str, Any]]:
-    """Project the last n turns to small JSON dicts (role/act/content) for the prompt."""
+    """Project the last n turns to small JSON dicts (role/act/content) for the prompt.
+
+    Every runtime producer (src/sim/selfplay.py, src/voice/session.py) writes the utterance under
+    "text"; older fixtures used "content". Read "text" first, then fall back to "content", so the
+    RECENT_TURNS block the policy LLM sees is actually populated in production (FINDING 1)."""
     out: list[dict[str, Any]] = []
     for turn in list(history)[-n:]:
         if isinstance(turn, dict):
+            content = turn.get("text", turn.get("content", ""))
             out.append(
                 {
                     "role": turn.get("role"),
                     "act": turn.get("act"),
-                    "content": str(turn.get("content", ""))[:200],
+                    "content": str(content)[:200],
                 }
             )
     return out
@@ -194,7 +199,11 @@ async def decide(
     messages = _build_policy_messages(belief, history, config)
     try:
         raw = await llm_client.complete_json(messages)
-    except ValueError:
-        raw = None  # malformed JSON -> safe fallback below
+    except Exception:
+        # FINDING 2: degrade on ANY proposal-call failure, not just bad JSON. ValueError is the
+        # malformed-JSON path; a real OpenRouter outage raises httpx.HTTPStatusError/RequestError
+        # (which outlived the client's bounded retry). Either way we fall back to a safe non-
+        # pressure act rather than crash the turn — the gates still run on the fallback.
+        raw = None
     proposed = _parse_proposal(raw)
     return apply_gates(proposed, belief, config, history=history)

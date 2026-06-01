@@ -22,6 +22,7 @@ from src.loop.experiment import (
 from src.loop.generator import (
     Challenger,
     EXTREME_DIMENSIONS,
+    build_challenger,
     declared_diff,
     generate_challengers,
     is_minimal_diff,
@@ -88,6 +89,7 @@ __all__ = [
     # generator (U10)
     "Challenger",
     "EXTREME_DIMENSIONS",
+    "build_challenger",
     "declared_diff",
     "generate_challengers",
     "is_minimal_diff",

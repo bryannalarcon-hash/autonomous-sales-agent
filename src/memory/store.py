@@ -55,12 +55,29 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
     )
 
 
+# Per-query timeout (seconds) applied to every connection in the pool so a hung/slow statement fails
+# loudly instead of pinning a connection forever. Overridable via DB_COMMAND_TIMEOUT for slow envs.
+def _command_timeout() -> float:
+    try:
+        return float(os.environ.get("DB_COMMAND_TIMEOUT", "30"))
+    except (TypeError, ValueError):
+        return 30.0
+
+
 async def get_pool() -> asyncpg.Pool:
-    """Return the lazily-created shared connection pool."""
+    """Return the lazily-created shared connection pool.
+
+    A `command_timeout` bounds every statement so a stuck query surfaces as a timeout rather than
+    leaking a held connection; min/max sizing keeps a small warm pool for the dashboard read path.
+    """
     global _POOL
     if _POOL is None:
         _POOL = await asyncpg.create_pool(
-            dsn=_database_url(), init=_init_connection, min_size=1, max_size=10
+            dsn=_database_url(),
+            init=_init_connection,
+            min_size=1,
+            max_size=10,
+            command_timeout=_command_timeout(),
         )
     return _POOL
 

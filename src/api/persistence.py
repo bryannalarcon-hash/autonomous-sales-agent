@@ -7,7 +7,10 @@
 #     decision, stamping version+kb_version, persona, channel, lead_phone_hash, and
 #     metrics["recorded"]; pure (no DB) so it is trivially testable.
 #   - persist_call_end(session, ...) saves it via the store in FK-safe order (lead -> episode ->
-#     escalations) and persists per-lead memory (persist_lead_after_call, phone-hash only).
+#     escalations) and persists per-lead memory (persist_lead_after_call, phone-hash only). The lead
+#     key is SINGLE-SOURCED server-side: raw_phone -> schema.phone_hash(raw_phone); a bound-hash call
+#     with no raw_phone upserts a minimal lead so the episode FK target always exists; anonymous ->
+#     lead_phone_hash=None. A client-supplied phone_hash is never trusted as the key on its own.
 #   - the outcome/ladder/escalation derivation helpers the above share.
 # Raw phone is NEVER stored (only the phone-hash key). Collaborators: src.memory.store / .hydrate /
 # .schema, src.voice.session.VoiceSession, src.config.settings. NO LiveKit imports.
@@ -118,34 +121,54 @@ async def persist_call_end(
 ) -> Episode:
     """Persist a finished demo call: lead -> episode -> escalations, plus per-lead memory (U2/U14/U15).
 
-    FK-safe order (migrations/001_init.sql): the lead row must exist before an episode that references
-    its phone-hash, and the episode must exist before any escalation_log row that FKs to it. So we:
-      1. persist_lead_after_call(raw_phone, final belief, ...) — upserts the lead from the FINAL belief
-         (value-only slots, phone-hash key; raw phone never stored). This also creates the lead row the
-         episode's lead_phone_hash references. Skipped for anonymous callers.
-      2. save_episode(episode_from_session(...)) — the call appears in /operate calls + KPIs.
-      3. re-point + save any escalation_logs captured DURING the call onto this episode_id, so they
-         show in /operate/escalations (their FK target now exists).
-    Returns the saved Episode. The store is imported lazily so DB-free imports don't drag in asyncpg.
+    SINGLE-SOURCED LEAD KEY (FK-safe): the episode's lead_phone_hash must reference an EXISTING lead
+    row (migrations/001_init.sql), so the key is derived/guaranteed server-side — a client-supplied
+    `phone_hash` is NEVER trusted as the lead key on its own:
+      - raw_phone present -> the SERVER hash schema.phone_hash(raw_phone) is the key; persist_lead_after_
+        call writes the lead under it (raw phone never stored), and the episode references THAT hash
+        (any client-supplied phone_hash is ignored as the key — server-derived wins).
+      - raw_phone absent but a phone_hash was bound -> upsert a MINIMAL lead by that hash so the FK
+        target exists, then key the episode by it (a bound-hash call no longer dangles -> no FK error).
+      - neither -> lead_phone_hash is None (anonymous call), no lead written.
+    Order (FK-safe): lead first (the episode's FK target), then save_episode (the escalations' FK
+    target), then the buffered escalation_logs re-pointed onto this episode_id. Returns the saved
+    Episode. The store is imported lazily so DB-free imports don't drag in asyncpg.
     """
     from src.memory import store
     from src.memory.hydrate import persist_lead_after_call
+    from src.memory.schema import Lead
+    from src.memory.schema import phone_hash as hash_phone
 
     final_belief = session.state.belief
-    # 1. Lead first (creates the FK target for the episode's lead_phone_hash) + remembers the caller.
+    # 1. Single-source the lead key + guarantee the FK target exists BEFORE the episode is saved.
+    effective_hash: Optional[str] = None
     if raw_phone is not None:
-        await persist_lead_after_call(
+        # Server derives the key (never trust a client hash) + remembers the caller from the belief.
+        lead = await persist_lead_after_call(
             raw_phone,
             final_belief,
             outcome=None,  # outcome is set on the episode; the lead keeps its last_outcome via merge
             assigned_voice=getattr(session, "assigned_voice", None),
         )
+        # persist_lead_after_call returns None only for an unusable phone (no digits); fall back to the
+        # server hash when it stored a lead so the episode references the exact PK that was written.
+        if lead is not None:
+            effective_hash = lead.phone_hash
+        else:
+            try:
+                effective_hash = hash_phone(raw_phone)
+            except (ValueError, TypeError):
+                effective_hash = None
+    elif phone_hash:
+        # A bound-hash call with no raw_phone: upsert a minimal lead so the episode FK is satisfied.
+        await store.upsert_lead_by_phone(Lead(phone_hash=phone_hash))
+        effective_hash = phone_hash
 
     episode = episode_from_session(
         session,
         config=config,
         channel=channel,
-        phone_hash=phone_hash,
+        phone_hash=effective_hash,
         cohort=cohort,
         last_tier=last_tier,
     )

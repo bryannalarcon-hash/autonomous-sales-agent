@@ -9,12 +9,32 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 
 from src.core.belief_state import DRIVERS, BeliefState
 from src.core.dst import update
 from src.core.llm import MockLLMClient
 from src.memory.schema import BeliefSnapshot
+
+
+class _RaisingLLMClient:
+    """An LLMClient stub whose complete()/complete_json() ALWAYS raise a transient httpx error
+    (an OpenRouter 429/5xx/timeout that outlived the retry budget). Proves the DST driver-update
+    degrades to 'no driver change' instead of crashing the turn (FINDING 2)."""
+
+    def __init__(self, exc: Exception | None = None) -> None:
+        request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+        response = httpx.Response(429, request=request)
+        self._exc = exc or httpx.HTTPStatusError(
+            "rate limited", request=request, response=response
+        )
+
+    async def complete(self, messages, *, model=None, response_format=None, **opts):
+        raise self._exc
+
+    async def complete_json(self, messages, *, model=None, **opts):
+        raise self._exc
 
 
 # --- BeliefState shape + snapshot interop -----------------------------------------------------
@@ -163,6 +183,36 @@ async def test_malformed_llm_json_leaves_drivers_unchanged():
     belief.drivers["trust"] = 0.55
     new = await update(belief, "act", "hello", bad)
     assert new.drivers["trust"] == pytest.approx(0.55)
+
+
+async def test_httpx_error_leaves_drivers_unchanged_and_does_not_crash():
+    """FINDING 2: a real OpenRouter failure (httpx.HTTPStatusError, NOT ValueError) during the
+    driver delta-update must degrade exactly like the bad-JSON path — drivers stay at priors, the
+    deterministic slot extraction + meta bookkeeping still happen, and no exception propagates."""
+    belief = BeliefState.fresh()
+    belief.drivers["trust"] = 0.55
+    belief.drivers["price_sensitivity"] = 0.42
+
+    # Slots should still extract deterministically (LLM-independent) despite the driver-call failure.
+    new = await update(belief, "ask_grade", "She is in 11th grade.", _RaisingLLMClient())
+
+    # Drivers untouched (no corruption) — same contract as malformed JSON.
+    assert new.drivers["trust"] == pytest.approx(0.55)
+    assert new.drivers["price_sensitivity"] == pytest.approx(0.42)
+    # Deterministic layers still ran: slot filled + turn advanced.
+    assert new.slots["grade_level"]["value"] == "11"
+    assert new.turn_count == 1
+
+
+async def test_request_error_leaves_drivers_unchanged():
+    """A transport-level RequestError (timeout/connection) likewise leaves drivers at priors."""
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    belief = BeliefState.fresh()
+    belief.drivers["trust"] = 0.6
+    new = await update(
+        belief, "act", "hello", _RaisingLLMClient(exc=httpx.ConnectTimeout("t", request=request))
+    )
+    assert new.drivers["trust"] == pytest.approx(0.6)
 
 
 # --- Deterministically-derived trends (NOT LLM-emitted) ---------------------------------------

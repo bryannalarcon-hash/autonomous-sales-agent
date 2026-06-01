@@ -108,11 +108,16 @@ async def realize(
 
     The decision has ALREADY passed the gates (policy returns the gated decision), so NLG only has
     to phrase it. When retrieved_facts is supplied (U5 KB grounding) the prompt constrains the reply
-    to those facts. The reply is whitespace-trimmed; a blank LLM reply degrades to a safe filler so
-    the caller always gets a non-empty turn.
+    to those facts. The reply is whitespace-trimmed; a blank LLM reply — OR any call failure (a real
+    OpenRouter 429/5xx/timeout that outlived the client's bounded retry, FINDING 2) — degrades to a
+    safe filler so the caller always gets a non-empty turn instead of a crash.
     """
     messages = _build_messages(decision, belief, config, retrieved_facts)
-    text = await llm_client.complete(messages)
+    try:
+        text = await llm_client.complete(messages)
+    except Exception:
+        # FINDING 2: a failed realization call must not crash the turn — fall back to safe filler.
+        text = ""
     reply = (text or "").strip()
     if not reply:
         return "Let me make sure I'm helping you the right way here."

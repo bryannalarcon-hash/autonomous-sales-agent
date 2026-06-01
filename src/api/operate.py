@@ -8,7 +8,7 @@
 # renders. Episodes/escalations are serialized to flat display DTOs the Next.js client types against.
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence
+from typing import Any, Optional, Protocol, Sequence
 
 from fastapi import APIRouter, HTTPException
 

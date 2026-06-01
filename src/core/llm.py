@@ -1,12 +1,14 @@
 # The single LLM seam every unit calls through (plan KTD2/KTD5). Defines the LLMClient protocol
 # (async complete() + a complete_json() helper that tolerates fenced ```json blocks), an
 # OpenRouterClient (OpenAI-compatible: base_url https://openrouter.ai/api/v1, bearer auth from
-# OPENROUTER_API_KEY, default model from AGENT_MODEL; async httpx, non-streaming), and a
+# OPENROUTER_API_KEY, default model from AGENT_MODEL; async httpx, non-streaming, with a BOUNDED
+# deterministic retry-with-backoff on transient 429/5xx/transport errors — FINDING 2), and a
 # MockLLMClient (scripted list OR callable) for deterministic, network-free tests. Keeping every
 # call behind this protocol lets the agent brain (Claude) and the sim/judge (a different family)
 # swap by config without touching core logic, and lets tests inject scripted deltas.
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -20,6 +22,14 @@ Message = dict[str, str]
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _DEFAULT_TIMEOUT_S = 60.0
+
+# Bounded retry policy for transient OpenRouter failures (FINDING 2). A 429 (rate limit) or any 5xx
+# server error, and transport-level errors (timeout/connection), are retried with a DETERMINISTIC
+# exponential backoff (base * 2**attempt) so the behavior is testable — no random jitter. A 4xx
+# client error (bad request / auth) is NOT retried. After the budget is spent the error re-raises.
+_DEFAULT_MAX_RETRIES = 2  # total attempts = 1 + _DEFAULT_MAX_RETRIES (<=3)
+_DEFAULT_RETRY_BACKOFF_BASE_S = 0.5
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 # Pulls a JSON object out of a reply that may be wrapped in a ```json ... ``` fence or surrounded
 # by prose. We match the first balanced-looking object; complete_json validates by json.loads.
@@ -110,6 +120,8 @@ class OpenRouterClient(_JsonHelperMixin):
         base_url: str = OPENROUTER_BASE_URL,
         timeout: float = _DEFAULT_TIMEOUT_S,
         extra_headers: Optional[dict[str, str]] = None,
+        max_retries: int = _DEFAULT_MAX_RETRIES,
+        retry_backoff_base: float = _DEFAULT_RETRY_BACKOFF_BASE_S,
         _load_env: bool = True,
     ) -> None:
         if _load_env:
@@ -123,6 +135,10 @@ class OpenRouterClient(_JsonHelperMixin):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.extra_headers = dict(extra_headers or {})
+        # Bounded retry budget + deterministic backoff base (seconds). max_retries is the number of
+        # RETRIES after the first attempt, so total attempts = 1 + max_retries.
+        self.max_retries = max(0, int(max_retries))
+        self.retry_backoff_base = max(0.0, float(retry_backoff_base))
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -134,6 +150,16 @@ class OpenRouterClient(_JsonHelperMixin):
         }
         headers.update(self.extra_headers)
         return headers
+
+    def _backoff_seconds(self, attempt: int, retry_after: Optional[str]) -> float:
+        """Deterministic backoff for a given retry attempt (0-based). A server-sent Retry-After
+        header (seconds) wins; otherwise base * 2**attempt. No random jitter — kept testable."""
+        if retry_after is not None:
+            try:
+                return max(0.0, float(retry_after))
+            except (TypeError, ValueError):
+                pass  # malformed header -> fall back to computed backoff
+        return self.retry_backoff_base * (2 ** attempt)
 
     async def complete(
         self,
@@ -150,15 +176,39 @@ class OpenRouterClient(_JsonHelperMixin):
         }
         if response_format is not None:
             body["response_format"] = response_format
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout) as client:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions",
-                json=body,
-                headers=self._headers(),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        return data["choices"][0]["message"]["content"]
+
+        # Bounded retry-with-backoff (FINDING 2): retry transient 429/5xx + transport errors with a
+        # deterministic exponential backoff; do NOT retry 4xx client errors; re-raise after the
+        # budget is spent so a persistent outage surfaces (the callers degrade gracefully on it).
+        last_exc: Exception
+        for attempt in range(self.max_retries + 1):
+            try:
+                async with httpx.AsyncClient(
+                    base_url=self.base_url, timeout=self.timeout
+                ) as client:
+                    resp = await client.post(
+                        f"{self.base_url}/chat/completions",
+                        json=body,
+                        headers=self._headers(),
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                return data["choices"][0]["message"]["content"]
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status not in _RETRYABLE_STATUS or attempt >= self.max_retries:
+                    raise  # non-retryable status, or budget exhausted -> surface it
+                last_exc = exc
+                retry_after = exc.response.headers.get("Retry-After")
+                await asyncio.sleep(self._backoff_seconds(attempt, retry_after))
+            except httpx.RequestError as exc:
+                # Transport-level failure (timeout / connection reset) — retry until budget spent.
+                if attempt >= self.max_retries:
+                    raise
+                last_exc = exc
+                await asyncio.sleep(self._backoff_seconds(attempt, None))
+        # Defensive: the loop either returns or raises; this only runs if the range is empty.
+        raise last_exc  # pragma: no cover
 
 
 # A scripted entry is either a precomputed string reply or a callable(messages, **opts) -> str.

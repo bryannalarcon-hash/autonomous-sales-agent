@@ -17,7 +17,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 from src.core.llm import LLMClient, Message
-from src.sim.personas import LADDER, Persona
+# LADDER is re-exported (not used in this module's body): callers/tests do
+# `from src.sim.prospect import LADDER` to reach the commitment-tier vocabulary alongside the engine.
+from src.sim.personas import LADDER, Persona  # noqa: F401  (intentional public re-export)
 
 # The SOFT drivers the sim LLM is permitted to nudge (clamped). budget is intentionally NOT here:
 # it lives only on the immutable persona.utility and can never be moved by talk.

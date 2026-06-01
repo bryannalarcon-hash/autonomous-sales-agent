@@ -317,38 +317,56 @@ async def test_should_play_filler_only_when_kb_lookup_runs():
 # =============================== NO LIVEKIT LEAK =================================================
 
 
+def _fresh_import_pulls_livekit(modules: tuple[str, ...]) -> bool:
+    """In a CLEAN subprocess (immune to whatever the parent test run already imported), import
+    `modules` and report whether `livekit` ended up in that fresh interpreter's sys.modules. This is
+    the TRUE boundary invariant — order- AND install-independent: the dev box may have livekit-agents
+    installed, but importing core/session in a fresh interpreter must still never load it. (The old
+    in-process `livekit not in sys.modules` check was fragile — any earlier test that imported the
+    worker polluted the shared process, making the result depend on collection order.)"""
+    import os
+    import subprocess
+    import sys
+
+    script = (
+        "import sys\n"
+        + "".join(f"import {m}\n" for m in modules)
+        + "leaked = [k for k in sys.modules if k == 'livekit' or k.startswith('livekit.')]\n"
+        + "sys.exit(1 if leaked else 0)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "PYTHONPATH": "."},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode in (0, 1), f"subprocess import errored: {proc.stderr}"
+    return proc.returncode == 1
+
+
 def test_session_module_has_no_livekit_import():
-    """session.py must NEVER IMPORT livekit (so it stays unit-testable AND cannot leak a LiveKit
-    type into core). We assert no import STATEMENT references livekit — the module header may
-    describe the boundary in prose, but no `import livekit` / `from livekit` line may exist."""
+    """session.py must NEVER import livekit (so it stays unit-testable AND cannot leak a LiveKit type
+    into core): a static scan that no `import livekit`/`from livekit` line exists, plus a clean-
+    subprocess check that importing the session in a fresh interpreter pulls no livekit."""
     src = Path("src/voice/session.py").read_text(encoding="utf-8")
     import_lines = [
         ln for ln in src.splitlines()
         if ln.strip().startswith(("import ", "from ")) and "livekit" in ln.lower()
     ]
     assert not import_lines, f"src/voice/session.py must not import livekit: {import_lines}"
-    # Also confirm the module imports cleanly without livekit installed.
-    import sys
-    assert "livekit" not in sys.modules, "importing the session pulled in livekit"
+    assert not _fresh_import_pulls_livekit(("src.voice.session",)), "importing the session pulled in livekit"
 
 
 def test_core_modules_pull_no_livekit():
-    """Importing the brain core (respond/policy/dst/nlg/belief_state) must not pull livekit in —
-    the boundary guarantee. We assert the modules are importable and livekit is absent from
-    sys.modules after importing them in a fresh-ish check."""
-    import importlib
-    import sys
-
-    # importing core should not require or import livekit
-    for mod in (
+    """Importing the brain core (respond/policy/dst/nlg/belief_state) must not pull livekit in — the
+    boundary guarantee — verified in a CLEAN subprocess (order/install-immune) + a static source scan."""
+    assert not _fresh_import_pulls_livekit((
         "src.core.respond",
         "src.core.policy",
         "src.core.dst",
         "src.core.nlg",
         "src.core.belief_state",
-    ):
-        importlib.import_module(mod)
-    assert "livekit" not in sys.modules, "core import pulled in livekit"
+    )), "core import pulled in livekit"
 
     # the core source files themselves contain no livekit import
     for path in (

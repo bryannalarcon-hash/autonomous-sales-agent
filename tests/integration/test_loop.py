@@ -184,6 +184,74 @@ def test_divergence_none_skips_check():
     assert decision.status == "promoted"
 
 
+# === 1b. Degenerate bootstrap-CI guard (compare_versions.challenger_better) ====================
+# The bug: `challenger_better = delta>0 AND delta_ci[0]>0` gives a FALSE pass when the bootstrap CI
+# collapses to a point on a tiny sample (n=1) or constant-but-near-tied arms — the CI cannot express
+# uncertainty, so it always excludes 0 regardless of effect size or evidence. The fix adds a minimum
+# per-arm sample floor (n>=5) AND requires the CI be non-degenerate UNLESS the arms are TOTALLY
+# separated (the strongest possible signal — every challenger episode beat every champion one), so a
+# genuinely dominant challenger on a sufficient sample still clears the bar.
+from src.loop.grading import compare_versions  # noqa: E402
+
+
+def test_single_sample_arms_are_not_challenger_better():
+    """n=1 per arm: the bootstrap CI collapses to a single delta (it cannot resample any spread), so
+    the old rule would auto-pass on ONE observation. The min-sample floor rejects it."""
+    champ = [_ep("c0", ladder_tier=0, outcome="walked", qualified=True)]
+    chal = [_ep("h0", ladder_tier=4, outcome="enrolled", qualified=True)]
+    res = compare_versions(
+        [Episode_like(e) for e in champ], [Episode_like(e) for e in chal], seed=7
+    )
+    assert res.n_champion == 1 and res.n_challenger == 1
+    assert res.challenger_better is False, "a single-sample comparison must never pass the bar"
+
+
+def test_constant_tiny_arms_are_not_challenger_better():
+    """Constant arms below the sample floor (n=4 < 5) collapse the CI to a point; the spec's
+    degenerate 'looks-significant-but-isn't' case. The floor rejects it even though delta>0 and the
+    collapsed CI excludes 0."""
+    champ = [_ep(f"c{i}", ladder_tier=2, outcome="consult_booked", qualified=True) for i in range(4)]
+    chal = [_ep(f"h{i}", ladder_tier=3, outcome="trial_booked", qualified=True) for i in range(4)]
+    res = compare_versions(champ, chal, seed=7)
+    # The collapsed CI excludes 0 (the OLD rule's false pass) ...
+    assert res.delta > 0 and res.delta_ci[0] > 0.0
+    assert res.delta_ci[1] - res.delta_ci[0] == 0.0  # degenerate (constant arms)
+    # ... but the sample floor blocks it.
+    assert res.n_champion < 5 and res.n_challenger < 5
+    assert res.challenger_better is False
+
+
+def test_overlapping_noisy_arms_with_zero_in_ci_are_not_challenger_better():
+    """Sufficient n (>=5) but the arms OVERLAP (champion has a strong episode), so the delta CI does
+    NOT cleanly exclude 0 — the honest 'not statistically separated' rejection the bar already made,
+    preserved unchanged by the guard (this case never relied on a degenerate CI)."""
+    # champ low with ONE tier-4; challenger mid-range -> overlap, lift not separated from noise.
+    champ = [_ep(f"c{i}", ladder_tier=(4 if i == 0 else 0), outcome="walked", qualified=True) for i in range(6)]
+    chal = [_ep(f"h{i}", ladder_tier=(2 if i % 2 else 1), outcome="callback_scheduled", qualified=True) for i in range(6)]
+    res = compare_versions(champ, chal, seed=7)
+    # the CI brackets 0 (overlap) -> not better, regardless of the guard.
+    assert res.delta_ci[0] <= 0.0
+    assert res.challenger_better is False
+
+
+def test_totally_separated_sufficient_arms_are_challenger_better():
+    """The legitimate strong signal the guard must STILL pass: n>=5 per arm AND total separation
+    (every challenger episode strictly above every champion one), even with a constant (degenerate)
+    CI. Full separation is the strongest evidence; the guard's total-separation escape preserves it."""
+    champ = [_ep(f"c{i}", ladder_tier=0, outcome="walked", qualified=True) for i in range(12)]
+    chal = [_ep(f"h{i}", ladder_tier=4, outcome="enrolled", qualified=True) for i in range(12)]
+    res = compare_versions(champ, chal, seed=7)
+    assert res.n_champion >= 5 and res.n_challenger >= 5
+    assert max(int(e.ladder_tier) for e in champ) < min(int(e.ladder_tier) for e in chal)
+    assert res.challenger_better is True, "total separation on a sufficient sample must pass"
+
+
+def Episode_like(ep: Episode) -> Episode:
+    """Identity passthrough kept for readability in the single-sample test (the builder already
+    returns a real Episode); isolates intent without a second episode factory."""
+    return ep
+
+
 # === 2. Minimal-diff containment (R21) =========================================================
 
 
@@ -252,6 +320,44 @@ def test_mutate_threshold_does_not_mutate_input():
     assert champ.thresholds == original  # input not mutated
     assert declared_diff(champ, chal) == {"thresholds.trust_gate_open_price"}
     assert is_minimal_diff(champ, chal) is True
+
+
+# === 2b. Public build_challenger surface (no private cross-module import) ======================
+# improve.py used to reach into generator._build_challenger (underscore-private). The public
+# build_challenger is the supported entry point: same behavior, exported from both the module and the
+# package so callers never import a private name across module boundaries (maintainability).
+
+
+def test_build_challenger_is_public_and_matches_private():
+    """build_challenger is exported from src.loop.generator AND src.loop, and produces the same
+    Challenger the private _build_challenger does (it is the public, supported alias)."""
+    from src.loop import build_challenger as pkg_build_challenger
+    from src.loop.generator import build_challenger as mod_build_challenger
+
+    assert mod_build_challenger is pkg_build_challenger  # one implementation, two export points
+    champ = load_config("champion_v0")
+    chal_cfg = mutate_threshold(champ, "max_concession_band", 0.4)
+    pub = mod_build_challenger(champ, chal_cfg, dimension_hint=None, seed=1)
+    priv = generator_mod._build_challenger(champ, chal_cfg, dimension_hint=None, seed=1)
+    assert pub.challenger_version == priv.challenger_version
+    assert pub.dimension == priv.dimension == "thresholds.max_concession_band"
+    assert pub.is_extreme is priv.is_extreme is True
+
+
+def test_improve_imports_public_not_private_build_challenger():
+    """The Improve API must not import the private generator._build_challenger across modules. It
+    binds the PUBLIC build_challenger instead (the maintainability fix)."""
+    import ast
+    import pathlib
+
+    src = pathlib.Path("src/api/improve.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    imported_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "src.loop.generator":
+            imported_names |= {alias.name for alias in node.names}
+    assert "_build_challenger" not in imported_names, "improve.py must not import the private name"
+    assert "build_challenger" in imported_names, "improve.py must import the public build_challenger"
 
 
 # === 3. is_extreme classification (R19) ========================================================
@@ -506,6 +612,27 @@ def test_experiment_record_from_rejected_when_guardrail_regresses():
     assert rec.guardrail_reason and "guardrail" in rec.guardrail_reason.lower()
 
 
+# --- A cheap, deterministic divergence reporter seam (DB-/network-/LiveKit-free) ---------------
+# run_improvement_round COMPUTES sim-to-real divergence via sim2real.sim_to_real_report when one is
+# not supplied (R36 — the central-risk gate must actually fire). Tests inject this stand-in so the
+# computation is free + deterministic (the real reporter drives self-play + a VoiceSession).
+
+
+def _fake_divergence_reporter(score: float):
+    """A sim_to_real_report stand-in returning a fixed Sim2RealReport with the given mean/max score —
+    lets the round's divergence wiring be exercised without any self-play / voice session."""
+    from src.loop.sim2real import DivergenceReport, Sim2RealReport
+
+    async def reporter(scenarios, config, agent_llm_factory, prospect_llm_factory, **kw):
+        rep = DivergenceReport(
+            decision_disagreement=score, ladder_gap=score, belief_distance=score,
+            divergence_score=score,
+        )
+        return Sim2RealReport(per_scenario=[rep], mean_divergence=score, max_divergence=score)
+
+    return reporter
+
+
 async def test_run_improvement_round_persists_experiment_record():
     """run_improvement_round(persist_experiment=True) with an injected store writes an
     ExperimentRecord retrievable via list_experiments — so running the loop SHOWS in the lab. The
@@ -520,6 +647,7 @@ async def test_run_improvement_round_persists_experiment_record():
         champ, training_episodes=losers + winners, held_out=held,
         agent_llm_factory=lambda: None, prospect_llm_factory=lambda: None, llm=None, seed=7,
         runner=_dominating_runner(champ.version),
+        divergence_reporter=_fake_divergence_reporter(0.0),  # low divergence -> normal bar runs
         persist_experiment=True, experiment_store=store_fake,
     )
     assert rr.challenger is not None and rr.experiment is not None
@@ -552,10 +680,54 @@ async def test_run_improvement_round_no_persist_skips_store_write():
         champ, training_episodes=losers, held_out=held,
         agent_llm_factory=lambda: None, prospect_llm_factory=lambda: None, llm=None, seed=7,
         runner=_dominating_runner(champ.version),
+        divergence_reporter=_fake_divergence_reporter(0.0),
         persist_experiment=False, experiment_store=store_fake,
     )
     assert rr.experiment is not None
     assert await store_fake.list_experiments() == []
+
+
+async def test_run_improvement_round_computes_divergence_and_pauses_on_high(monkeypatch):
+    """R36 WIRING: when no divergence is supplied, the round COMPUTES one via sim2real.sim_to_real_report
+    on a matched-scenario set and feeds it to the gate. A HIGH computed divergence pauses the loop —
+    proving the central-risk gate is live, not dead, on the default path (it was never wired before)."""
+    champ = load_config("champion_v0")
+    losers = [_ep(f"L{i}", ladder_tier=0, outcome="walked", qualified=True) for i in range(4)]
+    winners = [_ep(f"W{i}", ladder_tier=3, outcome="trial_booked", qualified=True) for i in range(4)]
+    held = frozen_held_out(seed=4, n=6, rotation_index=0)
+
+    # Patch the DEFAULT reporter (no reporter injected -> the round must reach for sim_to_real_report).
+    high = _fake_divergence_reporter(0.9)  # >> DIVERGENCE_THRESHOLD (0.2)
+    monkeypatch.setattr(promotion_mod.sim2real, "sim_to_real_report", high)
+
+    rr = await promotion_mod.run_improvement_round(
+        champ, training_episodes=losers + winners, held_out=held,
+        agent_llm_factory=lambda: None, prospect_llm_factory=lambda: None, llm=None, seed=7,
+        runner=_dominating_runner(champ.version),
+        # divergence intentionally NOT supplied -> the round computes it via the (patched) default.
+    )
+    assert rr.decision.status == "paused", rr.decision.reasons
+    assert any("diverg" in r.lower() for r in rr.decision.reasons)
+    assert rr.lineage is None  # nothing promoted while sim and real disagree
+
+
+async def test_run_improvement_round_low_computed_divergence_does_not_pause():
+    """The mirror: a LOW computed divergence does not pause — the normal bar runs and a clean
+    non-extreme challenger still auto-promotes (the gate only fires above threshold)."""
+    champ = load_config("champion_v0")
+    losers = [_ep(f"L{i}", ladder_tier=0, outcome="walked", qualified=True) for i in range(4)]
+    winners = [_ep(f"W{i}", ladder_tier=3, outcome="trial_booked", qualified=True) for i in range(4)]
+    held = frozen_held_out(seed=4, n=6, rotation_index=0)
+
+    rr = await promotion_mod.run_improvement_round(
+        champ, training_episodes=losers + winners, held_out=held,
+        agent_llm_factory=lambda: None, prospect_llm_factory=lambda: None, llm=None, seed=7,
+        runner=_dominating_runner(champ.version),
+        divergence_reporter=_fake_divergence_reporter(0.05),  # well under threshold
+    )
+    assert rr.decision.status != "paused"
+    if rr.challenger is not None and not rr.challenger.is_extreme:
+        assert rr.decision.status == "promoted"
 
 
 # === 7. DB-GATED end-to-end verification (U10) =================================================
@@ -641,6 +813,7 @@ async def test_run_improvement_round_orchestrates_generate_to_promotion(_schema)
         champ, training_episodes=losers + winners, held_out=held,
         agent_llm_factory=lambda: None, prospect_llm_factory=lambda: None, llm=None, seed=7,
         runner=_dominating_runner(champ.version), persist_promotion=True,
+        divergence_reporter=_fake_divergence_reporter(0.0),  # low divergence -> normal bar runs
     )
     assert rr.challenger is not None and rr.experiment is not None
     if not rr.challenger.is_extreme:

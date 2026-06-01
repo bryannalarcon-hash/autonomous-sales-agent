@@ -21,7 +21,7 @@ from src.core.llm import LLMClient
 from src.core.respond import respond
 from src.memory import store
 from src.memory.schema import BeliefSnapshot, Episode, Turn
-from src.sim.personas import LADDER, Persona
+from src.sim.personas import Persona
 from src.sim.prospect import ProspectSimulator, ProspectTurn
 
 # --- The outcome -> ladder_tier mapping (documented in the header) ----------------------------

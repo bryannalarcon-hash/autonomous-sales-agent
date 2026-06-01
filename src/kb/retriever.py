@@ -39,6 +39,25 @@ _STOPWORDS = frozenset(
 _NUMBER_RE = re.compile(r"\$?\d[\d,]*(?:\.\d+)?%?")
 _WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z\-']+")
 
+# Curated high-risk QUALITATIVE promise words (FINDING 3). Like numbers, these are checked STRICTLY:
+# a single one absent from the KB is an invented promise (a fabricated guarantee/refund/credential)
+# and must fail groundedness on its own — it cannot be diluted away by an otherwise on-KB sentence's
+# supported-content-word ratio. A claim word that genuinely appears in the KB still passes.
+CLAIM_TOKENS = frozenset(
+    {
+        "guarantee",
+        "guaranteed",
+        "accredited",
+        "certified",
+        "refund",
+        "free",
+        "proven",
+        "results",
+        "money-back",
+        "best",
+    }
+)
+
 
 @dataclass
 class Chunk:
@@ -279,10 +298,15 @@ def grounded(
 ) -> GroundednessReport:
     """Deterministic groundedness check: is the answer supported by the retrieved chunks?
 
-    Two-part check (plan U5 / R8 — the agent states no fact absent from the KB):
+    Three-part check (plan U5 / R8 — the agent states no fact absent from the KB):
       1. NUMBERS are strict — every number/money/percent token in the answer (prices, windows,
          guarantees) must appear in the support text. An invented figure ($299, 30 days) fails.
-      2. CONTENT WORDS must be MOSTLY supported — at least `min_term_support` of the non-stopword
+      2. CLAIM TOKENS are strict (FINDING 3) — curated high-risk promise words (CLAIM_TOKENS:
+         guarantee, accredited, refund, free, proven, ...) are treated like numbers: ANY one absent
+         from the KB fails groundedness on its own and is surfaced in unsupported_terms, regardless
+         of the content-word ratio. This stops a single invented qualitative promise from slipping
+         through inside an otherwise on-KB sentence.
+      3. CONTENT WORDS must be MOSTLY supported — at least `min_term_support` of the non-stopword
          terms in the answer must have a (stem-matched) counterpart in the support text. Stemming
          lets inflected surface forms (tier/tiered/tiers, month/monthly) match, so ordinary NLG
          phrasing passes while a wholly off-KB claim (an invented feature) still fails.
@@ -301,7 +325,8 @@ def grounded(
         if _normalize_number(tok) not in support_numbers:
             unsupported_numbers.append(tok)
 
-    # 2. Content words must be mostly present (stem-matched against the support vocabulary).
+    # 2./3. Content words: stem-match against the support vocabulary, then split into the strict
+    # claim-token subset and the ordinary-content remainder.
     support_stems = frozenset(_stem(w) for w in _WORD_RE.findall(support))
     terms = [
         w.lower()
@@ -309,22 +334,35 @@ def grounded(
         if w.lower() not in _STOPWORDS
     ]
     unsupported_terms = [t for t in terms if not _term_supported(t, support_stems)]
+
+    # 2. Claim tokens are STRICT (FINDING 3): any unsupported curated promise word fails on its own.
+    unsupported_claims = [t for t in unsupported_terms if t in CLAIM_TOKENS]
+
+    # 3. The remaining ordinary content words only need to be MOSTLY supported (ratio bar).
     if terms:
         supported_ratio = 1.0 - (len(unsupported_terms) / len(terms))
     else:
         supported_ratio = 1.0  # an answer with no content words makes no factual claim
 
+    ratio_failed = supported_ratio < min_term_support
     is_grounded = (
-        not unsupported_numbers and supported_ratio >= min_term_support
+        not unsupported_numbers and not unsupported_claims and not ratio_failed
     )
+
+    # Surface the unsupported terms when the answer failed the ratio bar (full list), OR — even on a
+    # passing ratio — the specific invented claim tokens, so a single strict promise word is never
+    # silently dropped from the report. A fully grounded answer reports a clean (empty) list.
+    if ratio_failed:
+        surfaced_terms = unsupported_terms
+    elif unsupported_claims:
+        surfaced_terms = unsupported_claims
+    else:
+        surfaced_terms = []
+
     return GroundednessReport(
         grounded=is_grounded,
         unsupported_numbers=unsupported_numbers,
-        # Only surface the unsupported terms when the answer actually failed the ratio bar, so a
-        # passing answer reports a clean (empty) term list even with incidental connective words.
-        unsupported_terms=(
-            unsupported_terms if supported_ratio < min_term_support else []
-        ),
+        unsupported_terms=surfaced_terms,
     )
 
 

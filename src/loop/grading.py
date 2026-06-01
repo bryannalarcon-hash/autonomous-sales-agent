@@ -44,6 +44,11 @@ _DEFAULT_BAIL_RISK_CAP = 0.8
 # is the canonical factual act; pitch/handle_objection/confirm_known can also carry KB claims.
 _FACTUAL_ACTS = frozenset({"answer_via_kb", "pitch", "handle_objection", "confirm_known"})
 
+# Minimum episodes PER ARM before a lift is trustworthy enough to clear `challenger_better`. Below this
+# the bootstrap cannot express uncertainty (n=1 collapses the CI to a point), so a positive delta would
+# auto-pass on near-zero evidence — the degenerate false pass this floor blocks (U10 integrity).
+_MIN_ARM_SAMPLE = 5
+
 
 # === 1. Deterministic groundedness (R23) — reuses retriever.grounded, does NOT reimplement it ===
 @dataclass
@@ -353,7 +358,12 @@ class ComparisonResult:
     Carries each arm's KPI (weighted-ladder mean), the per-arm bootstrap CIs, the delta (challenger
     minus champion), the bootstrap CI of the DELTA, and `challenger_better` — the decision rule the
     loop reads. `challenger_better` is True iff delta > 0 AND the delta's bootstrap CI excludes 0
-    (a real, not-noise lift). This is the integrity-critical gate that prevents over-claiming.
+    (a real, not-noise lift) AND each arm has a MINIMUM sample (n>=_MIN_ARM_SAMPLE) AND the lift is
+    trustworthy — either the CI is non-degenerate (has width) OR the arms are TOTALLY separated (every
+    challenger episode strictly above every champion one, the strongest possible signal). This guards
+    against the degenerate-CI false pass: a tiny (n=1) or constant arm collapses the bootstrap CI to a
+    point so it ALWAYS excludes 0 regardless of evidence. This is the integrity-critical gate that
+    prevents over-claiming.
     """
 
     champion_kpi: float
@@ -396,8 +406,13 @@ def compare_versions(
     records the difference; the delta CI is the percentile interval of those differences.
 
     DECISION RULE (`challenger_better`): True iff delta > 0 AND the delta's bootstrap CI EXCLUDES 0
-    (delta_ci[0] > 0). Requiring the CI to exclude 0 means the lift is statistically separated from
-    noise — the conservative, over-claim-resistant rule the U10 promotion gate depends on.
+    (delta_ci[0] > 0) AND each arm has at least _MIN_ARM_SAMPLE episodes AND the lift is trustworthy —
+    either the delta CI is NON-DEGENERATE (has width) OR the arms are TOTALLY separated (every
+    challenger value strictly above every champion one). Requiring the CI to exclude 0 means the lift
+    is statistically separated from noise; the sample floor + non-degenerate/total-separation guard
+    kills the degenerate false pass (a tiny or constant arm collapses the bootstrap CI to a point, so
+    it excludes 0 on near-zero evidence). This is the conservative, over-claim-resistant rule the U10
+    promotion gate depends on.
     """
     champ_vals = [int(ep.ladder_tier) for ep in champion_eps]
     chal_vals = [int(ep.ladder_tier) for ep in challenger_eps]
@@ -412,7 +427,20 @@ def compare_versions(
         champ_vals, chal_vals, seed=seed + 2, n_resamples=n_resamples, alpha=alpha
     )
 
-    challenger_better = delta > 0 and delta_ci[0] > 0.0
+    # The over-claim-resistant decision: a real lift (CI excludes 0) on a SUFFICIENT sample whose CI
+    # is either non-degenerate (carries uncertainty) or reflects TOTAL separation (the strongest
+    # signal — a constant CI is only trusted when every challenger episode beat every champion one).
+    n_champion = len(champ_vals)
+    n_challenger = len(chal_vals)
+    enough_sample = n_champion >= _MIN_ARM_SAMPLE and n_challenger >= _MIN_ARM_SAMPLE
+    non_degenerate_ci = (delta_ci[1] - delta_ci[0]) > 0.0
+    totally_separated = bool(champ_vals) and bool(chal_vals) and max(champ_vals) < min(chal_vals)
+    challenger_better = (
+        delta > 0
+        and delta_ci[0] > 0.0
+        and enough_sample
+        and (non_degenerate_ci or totally_separated)
+    )
 
     return ComparisonResult(
         champion_kpi=champion_kpi,
@@ -422,8 +450,8 @@ def compare_versions(
         challenger_ci=challenger_ci,
         delta_ci=delta_ci,
         challenger_better=challenger_better,
-        n_champion=len(champ_vals),
-        n_challenger=len(chal_vals),
+        n_champion=n_champion,
+        n_challenger=n_challenger,
     )
 
 

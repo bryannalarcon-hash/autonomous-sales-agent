@@ -141,14 +141,24 @@ def _seeded_client() -> TestClient:
             name="ROI-first rebuttal ordering",
             diff_description="Reorder: lead ROI proof before pilot de-risk",
         ),
-        # An EXTREME (pricing-concession) challenger that passed the bar -> blocked (pending approval).
+        # An EXTREME (pricing-concession) challenger that PASSED the bar (clean guardrail, lift,
+        # qual held) but is extreme -> blocked pending human approval (the legitimate approvable case).
         _exp(
             "EXP-29", challenger="v13-c2", parent="v12", dimension="thresholds.max_concession_band",
-            state="blocked", is_extreme=True, guardrail="trip", delta=0.18,
+            state="blocked", is_extreme=True, guardrail="pass", delta=0.18,
             delta_ci=[0.05, 0.31], significance=0.95, enroll_delta=0.11, minutes_ago=20,
             name="Pilot price-floor concession",
-            diff_description="max_concession_band 0.15 -> 0.25",
-            guardrail_reason="Allows 25% pilot discount (cap 0.15)",
+            diff_description="max_concession_band 0.15 -> 0.25 — allows a 25% pilot discount (cap 0.15)",
+        ),
+        # An extreme record stuck in `blocked` that DOES NOT meet the bar (guardrail tripped) — it must
+        # NOT be approvable: the approve re-check (Fix 6) re-asserts the bar and 409s this one.
+        _exp(
+            "EXP-30", challenger="v14-c1", parent="v12", dimension="thresholds.max_concession_band",
+            state="blocked", is_extreme=True, guardrail="trip", delta=0.07,
+            delta_ci=[0.01, 0.14], significance=0.9, enroll_delta=0.02, minutes_ago=15,
+            name="Aggressive concession (guardrail regressed)",
+            diff_description="max_concession_band 0.15 -> 0.30",
+            guardrail_reason="Pushes harder than the champion (pushiness regression)",
         ),
         # A failed challenger (past tab).
         _exp(
@@ -180,7 +190,7 @@ def test_experiments_return_discovery_sequencing_before_after():
     r = client.get("/api/experiments")
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["count"] == 3
+    assert body["count"] == 4
     exp = next(e for e in body["experiments"] if e["experiment_id"] == "EXP-31")
     # BEFORE/AFTER: champion vs challenger KPI + the signed delta.
     assert exp["champion_kpi"] == 3.05
@@ -204,7 +214,7 @@ def test_experiments_filter_by_state():
     client = _seeded_client()
     r = client.get("/api/experiments", params={"state": "blocked"})
     ids = {e["experiment_id"] for e in r.json()["experiments"]}
-    assert ids == {"EXP-29"}
+    assert ids == {"EXP-29", "EXP-30"}
 
 
 def test_experiments_empty_is_not_error():
@@ -275,7 +285,10 @@ def _run_client() -> tuple[TestClient, FakeImproveStore]:
 def test_run_experiment_discovery_reorder_creates_and_persists():
     """POST /api/experiments/run with a discovery-sequence reorder builds + runs + persists a real
     ExperimentRecord (state from the gate), returns the before/after, and it appears in
-    /api/experiments. MockLLM + a dominating runner = free + deterministic."""
+    /api/experiments. MockLLM + a dominating runner = free + deterministic.
+
+    FAIL-CLOSED (R36): the inline run does NOT measure sim-to-real divergence, so an otherwise
+    auto-promote-eligible challenger is routed to the human queue (blocked), never silently shipped."""
     client, store = _run_client()
     champ = load_config("champion_v0")
     seq = list(champ.playbooks["discovery_sequence"])
@@ -291,8 +304,9 @@ def test_run_experiment_discovery_reorder_creates_and_persists():
     assert exp["challenger_kpi"] > exp["champion_kpi"]
     assert exp["delta"] > 0
     assert exp["challenger_better"] is True
-    # a non-extreme clean pass -> promoted (auto), surfaced as a readable label (never a raw slug).
-    assert exp["state"] in ("promoted", "passed")
+    # FAIL-CLOSED: an unmeasured auto-promote lands in the human queue (blocked), not promoted.
+    assert exp["state"] == "blocked"
+    assert r.json()["decision"] == "pending_approval"
     assert exp["dimension_label"] == "Discovery sequencing"
     assert "." not in exp["dimension_label"]
     assert exp["is_extreme"] is False
@@ -302,6 +316,28 @@ def test_run_experiment_discovery_reorder_creates_and_persists():
     body = client.get("/api/experiments").json()
     assert any(e["experiment_id"] == exp["experiment_id"] for e in body["experiments"])
     assert exp["experiment_id"] in store._experiments
+
+
+def test_run_experiment_unmeasured_autopromote_fails_closed_to_pending_approval():
+    """FAIL-CLOSED (R36): a non-extreme challenger that would AUTO-PROMOTE but has NO sim-to-real
+    divergence measured is routed to pending_approval (blocked), NOT silently promoted — the central-
+    risk gate must not be bypassed by the inline run path."""
+    client, store = _run_client()
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+    r = client.post(
+        "/api/experiments/run",
+        json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6},
+    )
+    assert r.status_code == 200, r.text
+    decision = r.json()["decision"]
+    exp = r.json()["experiment"]
+    assert decision == "pending_approval", "an unmeasured auto-promote must fail closed"
+    assert exp["state"] == "blocked"  # not 'promoted'
+    # it surfaces in the approval queue for a human, not shipped.
+    apr = client.get("/api/approvals").json()
+    assert any(e["experiment_id"] == exp["experiment_id"] for e in apr["approvals"])
 
 
 def test_run_experiment_pricing_threshold_blocks_for_approval():
@@ -334,6 +370,23 @@ def test_run_experiment_default_n_is_modest():
     assert exp["n"] == 12  # the documented default when omitted
 
 
+def test_run_experiment_record_target_equals_n():
+    """The persisted record's `target` is the run's effective N (not left at 0): the lab progress
+    chip ('184 / 400') needs a non-zero target, and for a held-out run target == the sampled N."""
+    client, _ = _run_client()
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+    r = client.post(
+        "/api/experiments/run",
+        json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6},
+    )
+    assert r.status_code == 200, r.text
+    exp = r.json()["experiment"]
+    assert exp["n"] == 6
+    assert exp["target"] == 6, "the record's target must equal the effective N, not 0"
+
+
 def test_run_experiment_rejects_unknown_dimension():
     """An unsupported dimension is a 400 (validation at the boundary) — not a crash, not a paid run."""
     client, _ = _run_client()
@@ -357,26 +410,136 @@ def test_run_experiment_rejects_no_op_value():
     assert store._experiments == {}  # nothing persisted
 
 
+def test_run_experiment_n_floor_is_raised_above_one():
+    """COST + statistical floor: even n=1 is bumped to the minimum sample (>=5) so a tiny request can
+    never produce a degenerate single-sample 'significant' comparison (pairs with the grading floor)."""
+    client, _ = _run_client()
+    r = client.post(
+        "/api/experiments/run",
+        json={"dimension": "thresholds.pushiness_cap", "value": 0.5, "n": 1},
+    )
+    assert r.status_code == 200, r.text
+    exp = r.json()["experiment"]
+    assert exp["n"] >= 5, "the run N floor must be at least the minimum trustworthy sample"
+
+
+# =============================== P6 — RUN IS BOUNDED + CONCURRENCY-GUARDED =======================
+# /api/experiments/run awaits a full real self-play A/B inline (minutes, paid in prod). It must be
+# bounded (a timeout returns a clear error instead of hanging) and guarded against concurrent runs
+# (a second concurrent run returns 503 instead of stacking paid work). Tested via the ASGI app on a
+# single event loop with a runner that blocks on an event the test controls.
+
+import asyncio  # noqa: E402
+
+import pytest  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+
+from src.api.improve import create_improve_router  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
+
+
+def _blocking_runner(gate: "asyncio.Event"):
+    """A runner that waits on `gate` before returning episodes — lets a test hold the run 'in flight'
+    so it can drive the timeout / concurrency guard deterministically (no real self-play)."""
+
+    from src.memory.schema import Episode, Turn
+
+    async def runner(personas, agent_llm_factory, prospect_llm_factory, config, **kw):
+        await gate.wait()
+        return [
+            Episode(
+                episode_id=f"{config.version}_{i}",
+                turns=[Turn(turn_id=0, speaker="agent", text="hi", decision="greeting")],
+                outcome="enrolled", ladder_tier=4, qualified=True,
+                version=config.version, kb_version=config.kb_version, channel="sim",
+                cohort="held_out",
+            )
+            for i in range(len(personas))
+        ]
+
+    return runner
+
+
+def _bounded_run_app(*, runner, run_timeout_s: float, run_max_concurrency: int) -> FastAPI:
+    """A bare FastAPI app mounting ONLY the Improve router, with the run budget + concurrency cap
+    injected (server.create_app uses the defaults; the router accepts overrides for testability)."""
+    champ = load_config("champion_v0")
+    app = FastAPI()
+    app.include_router(
+        create_improve_router(
+            improve_store=FakeImproveStore([], []),
+            champion_config_provider=lambda: champ,
+            llm_client_factory=_routed_mock,
+            experiment_runner=runner,
+            run_timeout_s=run_timeout_s,
+            run_max_concurrency=run_max_concurrency,
+        )
+    )
+    return app
+
+
+async def test_run_experiment_times_out_with_clear_error():
+    """A run that exceeds the budget returns a clear timeout error (503), not a hang. The blocking
+    runner never releases; a tiny timeout trips the asyncio.wait_for bound."""
+    gate = asyncio.Event()  # never set -> the runner blocks past the timeout
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+    app = _bounded_run_app(runner=_blocking_runner(gate), run_timeout_s=0.05, run_max_concurrency=2)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6},
+        )
+    assert r.status_code == 503, r.text
+    assert "timed out" in r.json()["detail"].lower()
+
+
+async def test_run_experiment_concurrent_run_returns_503():
+    """A second concurrent run hits the concurrency guard (max 1) and returns 503 — paid work is not
+    stacked. The first run holds the semaphore (blocked on the gate); the second is rejected fast."""
+    gate = asyncio.Event()
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+    # generous timeout so the FIRST run doesn't time out; concurrency cap of 1 forces contention.
+    app = _bounded_run_app(runner=_blocking_runner(gate), run_timeout_s=5.0, run_max_concurrency=1)
+    body = {"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6}
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        first = asyncio.create_task(ac.post("/api/experiments/run", json=body))
+        await asyncio.sleep(0.05)  # let the first run acquire the semaphore + enter the runner
+        second = await ac.post("/api/experiments/run", json=body)  # contends -> 503
+        assert second.status_code == 503, second.text
+        assert "in progress" in second.json()["detail"].lower() or "busy" in second.json()["detail"].lower()
+        gate.set()  # release the first run so it completes cleanly
+        first_resp = await first
+        assert first_resp.status_code == 200, first_resp.text
+
+
 # =============================== P7 — APPROVAL QUEUE (AE6) =======================================
 
 
 def test_extreme_challenger_appears_in_approvals_queue():
-    """AE6: an extreme (guardrail-tripping) challenger that passed the bar is in the approval queue,
-    and shows WHY it's extreme (the guardrail reason)."""
+    """AE6: extreme challengers awaiting a human are in the approval queue. The legitimately approvable
+    one (EXP-29) passed the bar (clean guardrail) and shows WHY it's extreme (the pricing diff)."""
     client = _seeded_client()
     r = client.get("/api/approvals")
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["count"] == 1
-    apr = body["approvals"][0]
-    assert apr["experiment_id"] == "EXP-29"
+    # both blocked extremes surface (EXP-29 passed the bar; EXP-30 is a stuck guardrail-trip).
+    assert body["count"] == 2
+    apr = next(e for e in body["approvals"] if e["experiment_id"] == "EXP-29")
     assert apr["is_extreme"] is True
-    assert apr["guardrail"] == "trip"
-    assert "discount" in (apr["guardrail_reason"] or "").lower()
+    assert apr["guardrail"] == "pass"  # a true extreme pass: no guardrail regression
+    assert "discount" in (apr["diff_description"] or "").lower()
 
 
 def test_approve_promotes_challenger_to_champion():
-    """AE6: ONLY approve promotes the extreme challenger — the champion changes to the challenger."""
+    """AE6: ONLY approve promotes an extreme challenger that PASSED the bar — the champion changes."""
     client = _seeded_client()
     # before: v12 is champion.
     before = client.get("/api/versions").json()
@@ -390,8 +553,24 @@ def test_approve_promotes_challenger_to_champion():
     # after: the challenger is now the live champion (single-champion invariant restored it).
     after = client.get("/api/versions").json()
     assert after["champion_version"] == "v13-c2"
-    # the experiment has left the approval queue (no longer blocked).
-    assert client.get("/api/approvals").json()["count"] == 0
+    # EXP-29 left the queue; the stuck guardrail-trip (EXP-30) is still pending.
+    assert client.get("/api/approvals").json()["count"] == 1
+
+
+def test_approve_rechecks_the_bar_and_409s_a_record_that_does_not_meet_it():
+    """Fix 6: approve RE-ASSERTS the bar before promoting (challenger_better AND guardrail=='pass' AND
+    qualification held AND is_extreme). EXP-30 is blocked but its guardrail TRIPPED, so it does not
+    meet the bar -> 409, and the champion is left unchanged (the gate is not bypassable via approve)."""
+    client = _seeded_client()
+    assert client.get("/api/versions").json()["champion_version"] == "v12"
+
+    r = client.post("/api/approvals/EXP-30/approve")
+    assert r.status_code == 409, r.text
+    assert "bar" in r.json()["detail"].lower() or "guardrail" in r.json()["detail"].lower()
+    # champion unchanged; EXP-30 still blocked.
+    assert client.get("/api/versions").json()["champion_version"] == "v12"
+    exp = client.get("/api/experiments", params={"state": "blocked"}).json()
+    assert any(e["experiment_id"] == "EXP-30" for e in exp["experiments"])
 
 
 def test_reject_leaves_champion_unchanged():
@@ -402,8 +581,8 @@ def test_reject_leaves_champion_unchanged():
     assert r.json()["experiment"]["state"] == "rejected"
     # champion unchanged.
     assert client.get("/api/versions").json()["champion_version"] == "v12"
-    # cleared from the queue.
-    assert client.get("/api/approvals").json()["count"] == 0
+    # cleared from the queue (EXP-30 remains).
+    assert client.get("/api/approvals").json()["count"] == 1
 
 
 def test_approve_only_blocked_experiment():

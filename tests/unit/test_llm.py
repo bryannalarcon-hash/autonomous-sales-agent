@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 
 from src.core.llm import MockLLMClient, OpenRouterClient
@@ -181,3 +182,168 @@ async def test_openrouter_complete_json_parses(monkeypatch):
     client = OpenRouterClient(api_key="sk-test-123", model="m")
     out = await client.complete_json([{"role": "user", "content": "x"}])
     assert out == {"trust": 0.5}
+
+
+# --- FINDING 2: bounded retry-with-backoff on transient httpx errors --------------------------
+
+class _ErrorResponse(_FakeResponse):
+    """An httpx.Response stand-in whose raise_for_status() raises an HTTPStatusError (429/5xx)."""
+
+    def __init__(self, status_code: int, *, headers: dict | None = None):
+        super().__init__({})
+        self.status_code = status_code
+        self.headers = headers or {}
+
+    def raise_for_status(self):
+        request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+        raise httpx.HTTPStatusError(
+            f"server error {self.status_code}", request=request, response=self  # type: ignore[arg-type]
+        )
+
+
+def _scripted_client(responses):
+    """Build a fake AsyncClient class whose successive .post() calls pop from `responses`
+    (each entry is either a callable() -> response, or a response object). Records attempt count."""
+
+    state = {"i": 0, "attempts": 0}
+
+    class _Client:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, *, json=None, headers=None):
+            state["attempts"] += 1
+            item = responses[state["i"]]
+            state["i"] += 1
+            if callable(item):
+                return item()
+            return item
+
+    _Client.state = state  # type: ignore[attr-defined]
+    return _Client
+
+
+async def test_openrouter_retries_then_succeeds_on_transient_5xx(monkeypatch):
+    """A transient 503 is retried (bounded), and a subsequent 200 returns the assistant reply.
+    No real sleeping: asyncio.sleep is patched to record the deterministic backoff durations."""
+    import asyncio as _asyncio
+
+    import src.core.llm as llm_mod
+
+    slept: list[float] = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(llm_mod.asyncio, "sleep", _fake_sleep)
+
+    client_cls = _scripted_client(
+        [
+            _ErrorResponse(503),  # first attempt: transient server error
+            _FakeResponse({"choices": [{"message": {"content": "RECOVERED"}}]}),  # retry succeeds
+        ]
+    )
+    monkeypatch.setattr(llm_mod.httpx, "AsyncClient", client_cls)
+
+    client = OpenRouterClient(api_key="sk-test-123", model="m", retry_backoff_base=0.5)
+    reply = await client.complete([{"role": "user", "content": "x"}])
+
+    assert reply == "RECOVERED"
+    assert client_cls.state["attempts"] == 2  # one failure + one success
+    # Deterministic backoff (NOT random): exactly one sleep before the single retry.
+    assert slept == [0.5]
+
+
+async def test_openrouter_raises_after_exhausting_retries_on_429(monkeypatch):
+    """Persistent 429s exhaust the bounded retry budget (<=3 attempts) and re-raise, never hang."""
+    import src.core.llm as llm_mod
+
+    async def _fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(llm_mod.asyncio, "sleep", _fake_sleep)
+
+    client_cls = _scripted_client([_ErrorResponse(429) for _ in range(5)])
+    monkeypatch.setattr(llm_mod.httpx, "AsyncClient", client_cls)
+
+    client = OpenRouterClient(api_key="sk-test-123", model="m", retry_backoff_base=0.0)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.complete([{"role": "user", "content": "x"}])
+    # Bounded: at most 3 total attempts (1 + 2 retries), never an unbounded loop.
+    assert client_cls.state["attempts"] == 3
+
+
+async def test_openrouter_retries_on_request_error_timeout(monkeypatch):
+    """A transport-level RequestError (timeout/connection) is also retried, then succeeds."""
+    import src.core.llm as llm_mod
+
+    async def _fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(llm_mod.asyncio, "sleep", _fake_sleep)
+
+    def _raise_timeout():
+        raise httpx.ConnectTimeout("timed out")
+
+    client_cls = _scripted_client(
+        [
+            _raise_timeout,  # first attempt: transport error raised inside post()
+            _FakeResponse({"choices": [{"message": {"content": "OK"}}]}),
+        ]
+    )
+    monkeypatch.setattr(llm_mod.httpx, "AsyncClient", client_cls)
+
+    client = OpenRouterClient(api_key="sk-test-123", model="m", retry_backoff_base=0.0)
+    reply = await client.complete([{"role": "user", "content": "x"}])
+    assert reply == "OK"
+    assert client_cls.state["attempts"] == 2
+
+
+async def test_openrouter_honors_retry_after_header(monkeypatch):
+    """A Retry-After header (seconds) overrides the computed backoff for that retry (deterministic)."""
+    import src.core.llm as llm_mod
+
+    slept: list[float] = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(llm_mod.asyncio, "sleep", _fake_sleep)
+
+    client_cls = _scripted_client(
+        [
+            _ErrorResponse(429, headers={"Retry-After": "2"}),
+            _FakeResponse({"choices": [{"message": {"content": "DONE"}}]}),
+        ]
+    )
+    monkeypatch.setattr(llm_mod.httpx, "AsyncClient", client_cls)
+
+    client = OpenRouterClient(api_key="sk-test-123", model="m", retry_backoff_base=0.5)
+    reply = await client.complete([{"role": "user", "content": "x"}])
+    assert reply == "DONE"
+    # Honored Retry-After (2s), NOT the computed 0.5s base backoff.
+    assert slept == [2.0]
+
+
+async def test_openrouter_does_not_retry_on_4xx_client_error(monkeypatch):
+    """A non-retryable 4xx (e.g. 400/401) is NOT retried — it raises immediately (one attempt)."""
+    import src.core.llm as llm_mod
+
+    async def _fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(llm_mod.asyncio, "sleep", _fake_sleep)
+
+    client_cls = _scripted_client([_ErrorResponse(400) for _ in range(3)])
+    monkeypatch.setattr(llm_mod.httpx, "AsyncClient", client_cls)
+
+    client = OpenRouterClient(api_key="sk-test-123", model="m", retry_backoff_base=0.0)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.complete([{"role": "user", "content": "x"}])
+    assert client_cls.state["attempts"] == 1  # 400 is a client error; do not retry

@@ -193,6 +193,31 @@ def _build_challenger(
     )
 
 
+def build_challenger(
+    champion: AgentConfig,
+    challenger_config: AgentConfig,
+    *,
+    dimension_hint: Optional[str],
+    seed: int,
+    diff_description: str = "",
+) -> Challenger:
+    """PUBLIC entry point for wrapping a mutated config as a Challenger (R17 containment).
+
+    Cross-module callers (e.g. the Improve API's run/draft paths) use this instead of reaching into
+    the private _build_challenger, so the package never exposes a leading-underscore name across a
+    module boundary. Thin alias: identical behavior + signature to _build_challenger (derive the
+    single dimension from the declared diff, stamp is_extreme + a deterministic version); raises if
+    the config is not a minimal one-dimension diff.
+    """
+    return _build_challenger(
+        champion,
+        challenger_config,
+        dimension_hint=dimension_hint,
+        seed=seed,
+        diff_description=diff_description,
+    )
+
+
 # === Generation: failure-conditioned + tactic-mined ============================================
 
 

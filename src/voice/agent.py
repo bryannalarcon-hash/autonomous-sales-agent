@@ -7,6 +7,8 @@
 # emit the pending reply for the current speech_id, turn-commit -> session.commit_turn, interruption
 # -> session.on_barge_in; STT/TTS/VAD + adaptive barge-in/turn config + version/kb_version stamping
 # (room metadata + session.userdata + a SessionReport hook) are all behind LIVEKIT_AVAILABLE.
+# COMPLIANCE (U13): build_voice_agent threads an optional ConsentGate (+ assigned_voice/phone-hash)
+# straight into the VoiceSession, so the live worker's turns are consent-gated EXACTLY like /api/chat.
 from __future__ import annotations
 
 import os
@@ -15,6 +17,7 @@ from typing import Any, Optional
 from src.config.settings import AgentConfig
 from src.core.llm import LLMClient
 from src.kb.embeddings import EmbeddingModel
+from src.voice.consent import ConsentGate
 from src.voice.session import RetrieveHook, VoiceSession
 
 # Default model/component ids for the live LiveKit LLM-node wiring (only used when livekit IS
@@ -116,6 +119,9 @@ def build_voice_agent(
     *,
     kb_chunks_or_retrieve_hook: Optional[RetrieveHook] = None,
     seed: int = 0,
+    consent_gate: Optional[ConsentGate] = None,
+    assigned_voice: Optional[str] = None,
+    lead_phone_hash: Optional[str] = None,
     **agent_kwargs: Any,
 ) -> VoiceSalesAgent:
     """Factory: build a VoiceSession (the brain orchestrator) and wrap it in a VoiceSalesAgent.
@@ -124,6 +130,12 @@ def build_voice_agent(
     livekit is installed), then the thin Agent glue around it. The caller supplies the version/
     kb_version-stamped config, the agent LLM client, the KB embedder, and an optional retrieve hook
     (defaults to None -> retrieval is skipped, which keeps the session DB-free for demos/tests).
+
+    COMPLIANCE (U13/R33/R40/R41): the optional `consent_gate` is THREADED INTO the VoiceSession so
+    `handle_user_turn` is gated by `VoiceSession._require_consent` EXACTLY like the /api/chat text
+    path — without it the live worker would run the brain + record with no AI/recording/minor gate
+    (the blocking finding). `assigned_voice`/`lead_phone_hash` ride on the session for sticky-voice
+    (R3) and phone-hash persistence (R42). All default to None so headless parity tests stay gate-free.
     """
     session = VoiceSession(
         config,
@@ -131,5 +143,8 @@ def build_voice_agent(
         embedder,
         kb_chunks_or_retrieve_hook=kb_chunks_or_retrieve_hook,
         seed=seed,
+        consent_gate=consent_gate,
+        assigned_voice=assigned_voice,
+        lead_phone_hash=lead_phone_hash,
     )
     return VoiceSalesAgent(session, **agent_kwargs)

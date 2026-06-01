@@ -6,7 +6,9 @@
 # any failure, blocking EXTREME (pricing-concession/persona) passes for human approval (R19/AE6), and
 # auto-promoting clean non-extreme passes (R19/AE5). promote() records the challenger as the new
 # champion via the single-champion store (R12); run_improvement_round wires generator -> experiment ->
-# gate -> optional promote. Reuses src.loop.grading.guardrails_regressed; async for the store/runner
+# MEASURE sim-to-real divergence (sim2real.sim_to_real_report on a small matched probe, injectable) ->
+# gate -> optional promote, so the R36 pause is LIVE on the default path (not a dead None). Reuses
+# src.loop.grading.guardrails_regressed + src.loop.sim2real; async for the store/runner/reporter
 # seams. NO LiveKit / numpy / scipy / pandas; SEEDED random only.
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence
 
 from src.config.settings import AgentConfig
 from src.core.llm import LLMClient
+from src.loop import sim2real
 from src.loop.experiment import (
     ExperimentResult,
     HeldOutSet,
@@ -23,6 +26,7 @@ from src.loop.experiment import (
 )
 from src.loop.generator import Challenger, generate_challengers
 from src.loop.grading import guardrails_regressed
+from src.loop.sim2real import MatchedScenario, Sim2RealReport
 from src.memory import store
 from src.memory.schema import Episode, ExperimentRecord, VersionLineage
 
@@ -36,8 +40,14 @@ class ExperimentSaver(Protocol):
     async def save_experiment(self, experiment: ExperimentRecord) -> str: ...
 
 # The sim-to-real divergence ceiling: above this the loop PAUSES (R36 — divergence is a GATE, not a
-# report). Fed by U14 later; None at the gate means "not yet measured" -> the pause check is skipped.
+# report). run_improvement_round now MEASURES it via sim2real.sim_to_real_report when a caller doesn't
+# supply one (the gate is live, not dead); None at evaluate_promotion still means "not measured" ->
+# the pause check is skipped (kept for the pure-function gate tests).
 DIVERGENCE_THRESHOLD = 0.2
+# How many held-out personas the round turns into matched sim-vs-voice scenarios to MEASURE divergence
+# (R36) when one wasn't supplied. Kept small: each scenario runs both arms (sim self-play + a voice
+# session), so this is a cheap probe of the channel gap, not a full re-eval.
+_DIVERGENCE_SCENARIO_COUNT = 3
 # Qualification accuracy may dip by at most this much vs the champion before it counts as a regression
 # (small tolerance for resampling noise; a real drop beyond it blocks promotion, R29).
 QUAL_TOLERANCE = 0.02
@@ -181,6 +191,54 @@ async def promote(
     return lineage
 
 
+# A sim_to_real_report-shaped seam (injectable so tests measure divergence without self-play/voice).
+DivergenceReporter = Callable[..., Awaitable[Sim2RealReport]]
+
+
+async def _measure_divergence(
+    champion_config: AgentConfig,
+    held_out: HeldOutSet,
+    agent_llm_factory: Callable[[], LLMClient],
+    prospect_llm_factory: Callable[[], LLMClient],
+    *,
+    seed: int,
+    reporter: DivergenceReporter,
+) -> Optional[float]:
+    """MEASURE sim-to-real divergence on a small matched-scenario probe (plan R36) so the promotion
+    gate's central-risk pause is LIVE on the default round path (it used to pass None -> dead gate).
+
+    Builds up to _DIVERGENCE_SCENARIO_COUNT MatchedScenarios from the FROZEN held-out personas (same
+    population the experiment graded, so the probe matches the eval), then runs the injected reporter
+    (default sim2real.sim_to_real_report — sim self-play vs a voice session on matched inputs) and
+    returns the MEAN divergence. Returns None (skip the gate, don't crash the round) if there are no
+    personas to probe or the reporter raises — fail-OPEN here is acceptable because the experiment's
+    own bar still gates promotion; the divergence pause is an ADDITIONAL safety the round measures when
+    it can. Cheap by construction (a handful of matched scenarios)."""
+    personas = list(held_out.personas)[:_DIVERGENCE_SCENARIO_COUNT]
+    if not personas:
+        return None
+    scenarios = [
+        MatchedScenario(
+            persona=p,
+            prospect_script_or_seed=seed + i,
+            label=f"r{held_out.rotation_index}_{p.persona_id}",
+        )
+        for i, p in enumerate(personas)
+    ]
+    try:
+        report = await reporter(
+            scenarios,
+            champion_config,
+            agent_llm_factory,
+            prospect_llm_factory,
+            seed=seed,
+        )
+    except Exception:
+        # A measurement failure must not crash the round; the experiment bar still gates promotion.
+        return None
+    return report.mean_divergence
+
+
 @dataclass
 class RoundResult:
     """One improvement-round outcome (plan U10): the generated challenger, its graded experiment, the
@@ -203,6 +261,7 @@ async def run_improvement_round(
     seed: int,
     kb_chunks: Optional[Sequence[Any]] = None,
     divergence: Optional[float] = None,
+    divergence_reporter: Optional[DivergenceReporter] = None,
     persist_promotion: bool = False,
     persist_experiment: bool = False,
     experiment_store: Optional[ExperimentSaver] = None,
@@ -210,13 +269,20 @@ async def run_improvement_round(
     runner: Optional[Callable[..., Awaitable[list[Episode]]]] = None,
 ) -> RoundResult:
     """Orchestrate ONE improvement round (plan U10): generate a challenger -> run the experiment on
-    the frozen held-out set -> evaluate the promotion gate -> (if promoted AND persist_promotion)
-    record it as the new champion, and (if persist_experiment) write the round's ExperimentRecord so
-    it SHOWS in the dashboard lab (P6).
+    the frozen held-out set -> MEASURE sim-to-real divergence (R36) -> evaluate the promotion gate ->
+    (if promoted AND persist_promotion) record it as the new champion, and (if persist_experiment)
+    write the round's ExperimentRecord so it SHOWS in the dashboard lab (P6).
 
     `training_episodes` are the mined champion runs the generator clusters (failure-conditioned +
     tactic-mined). `runner` is forwarded to run_experiment (injectable for deterministic tests;
-    defaults to self-play). `divergence` (None = not yet measured) feeds the R36 pause check.
+    defaults to self-play).
+
+    SIM-TO-REAL DIVERGENCE (R36) is now WIRED, not dead: if a caller passes an explicit `divergence`
+    it is used as-is; otherwise the round MEASURES one via `divergence_reporter` (default
+    sim2real.sim_to_real_report) on a small matched-scenario probe of the held-out personas and feeds
+    the mean to the gate, so a sim-vs-real disagreement actually PAUSES the loop. A measurement that
+    can't run (no personas / reporter error) degrades to None (skip the pause); the experiment bar
+    still gates promotion.
 
     PERSISTENCE is opt-in + injectable so DB-free gate tests stay pure: `persist_promotion` writes the
     champion lineage on an auto-promote (existing behavior); `persist_experiment` flattens the graded
@@ -250,6 +316,19 @@ async def run_improvement_round(
         kb_chunks=kb_chunks,
         runner=runner,
     )
+
+    # MEASURE divergence (R36) when the caller didn't supply one, so the central-risk pause is LIVE on
+    # the default path. The reporter defaults to the real sim_to_real_report; tests inject a cheap one.
+    if divergence is None:
+        reporter = divergence_reporter if divergence_reporter is not None else sim2real.sim_to_real_report
+        divergence = await _measure_divergence(
+            champion_config,
+            held_out,
+            agent_llm_factory,
+            prospect_llm_factory,
+            seed=seed,
+            reporter=reporter,
+        )
 
     decision = evaluate_promotion(experiment, is_extreme=challenger.is_extreme, divergence=divergence)
 

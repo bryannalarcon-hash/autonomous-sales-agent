@@ -190,6 +190,35 @@ async def test_grounded_with_no_chunks_rejects_factual_answer(embedder):
     assert not bool(report)
 
 
+async def test_grounded_flags_invented_claim_token_despite_high_ratio(embedder):
+    """FINDING 3: a single invented qualitative PROMISE word ('guarantee') in an otherwise on-KB
+    sentence must fail groundedness and be surfaced in unsupported_terms — claim tokens are STRICT
+    like numbers, not merely diluted by the 60%-supported content-word ratio."""
+    await retriever.ingest(embedder, KB_VERSION)
+    chunks = await retriever.retrieve(
+        "How pricing works monthly tiered membership recurring effective per-hour Core tier",
+        kb_version=KB_VERSION,
+        embedder=embedder,
+        k=4,
+    )
+    assert chunks
+    support_text = " ".join(c.text for c in chunks)
+    assert "guarantee" not in support_text.lower(), (
+        "test precondition: the pricing chunks must NOT themselves contain 'guarantee'"
+    )
+
+    # Otherwise fully on-KB pricing sentence with ONE injected invented promise word.
+    answer_with_claim = (
+        "Pricing is a monthly tiered membership billed recurring; tiers bundle hours at a lower "
+        "effective per-hour rate, and we guarantee it."
+    )
+    report = retriever.grounded(answer_with_claim, chunks)
+    assert not bool(report), "an invented 'guarantee' promise must flip grounded to False"
+    assert "guarantee" in report.unsupported_terms, (
+        f"the invented claim token must be surfaced; unsupported_terms={report.unsupported_terms}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # ingest_corpus entrypoint + the shared live retrieve hook (plan U5 live wiring).
 # ---------------------------------------------------------------------------

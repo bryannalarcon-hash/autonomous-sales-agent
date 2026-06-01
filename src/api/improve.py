@@ -16,6 +16,7 @@
 # index (dimension slug, state slug, version internals) ever renders in operator-facing text.
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Awaitable, Callable, Optional, Protocol
 
 from fastapi import APIRouter, HTTPException
@@ -26,12 +27,12 @@ from src.config.settings import AgentConfig, load_config
 from src.core.llm import LLMClient
 from src.loop.experiment import experiment_record_from, frozen_held_out, run_experiment
 from src.loop.generator import (
-    _build_challenger,
+    build_challenger,
     declared_diff,
     mutate_threshold,
     reorder_discovery,
 )
-from src.loop.promotion import evaluate_promotion
+from src.loop.promotion import QUAL_TOLERANCE, PromotionDecision, evaluate_promotion
 from src.memory.schema import ExperimentRecord, VersionLineage
 
 # ---------------------------------------------------------------------------
@@ -198,7 +199,7 @@ def _draft_challenger_record(
 
     The save forks the champion config via the generator's PURE deep-copy mutators (reorder_discovery
     / mutate a non-pricing playbook / bump kb_version) — the champion AgentConfig is never touched —
-    and wraps it as a Challenger (_build_challenger enforces the R17 minimal one-dimension diff).
+    and wraps it as a Challenger (build_challenger enforces the R17 minimal one-dimension diff).
     The result is persisted as a `running` ExperimentRecord; version_lineage is NEVER written here,
     so get_champion()/the live config are unchanged. Returns the draft record (not yet saved).
     """
@@ -221,7 +222,7 @@ def _draft_challenger_record(
     else:  # pragma: no cover - guarded by the caller
         raise ValueError(f"unknown draft surface {surface!r}")
 
-    challenger = _build_challenger(
+    challenger = build_challenger(
         champion, challenger_config, dimension_hint=None, seed=seed, diff_description=diff_desc
     )
     draft_kb = (
@@ -281,7 +282,7 @@ def _challenger_for(champion: AgentConfig, dimension: str, value: Any, *, seed: 
 
     Supports the two loop-mutable run dimensions via the generator's PURE deep-copy mutators (the
     champion is never touched): "playbooks.discovery_sequence" (value = a reordered slot list, via
-    reorder_discovery) and "thresholds.<key>" (value = a number, via mutate_threshold). _build_challenger
+    reorder_discovery) and "thresholds.<key>" (value = a number, via mutate_threshold). build_challenger
     enforces the R17 minimal one-dimension diff and stamps is_extreme (a pricing threshold is extreme,
     R19). Raises ValueError for an unsupported dimension or a value of the wrong shape (validated at
     the boundary BEFORE any paid run starts)."""
@@ -306,12 +307,12 @@ def _challenger_for(champion: AgentConfig, dimension: str, value: Any, *, seed: 
             "'thresholds.<key>' can be A/B-tested"
         )
     # A value equal to the champion's is a no-op (zero changed dimensions) — reject BEFORE a paid run
-    # instead of surfacing the opaque R17 minimal-diff error from _build_challenger.
+    # instead of surfacing the opaque R17 minimal-diff error from build_challenger.
     if not declared_diff(champion, chal_config):
         raise ValueError(
             f"value for {dimension!r} matches the current champion — nothing to A/B test"
         )
-    return _build_challenger(
+    return build_challenger(
         champion, chal_config, dimension_hint=dimension, seed=seed, diff_description=desc
     )
 
@@ -334,8 +335,20 @@ class SaveDraftRequest(BaseModel):
 # small. Tests inject a MockLLMClient + a deterministic runner (free). Capped so a UI typo can't bill.
 _DEFAULT_RUN_N = 12
 _MAX_RUN_N = 24
+# Minimum per-arm sample. Mirrors grading._MIN_ARM_SAMPLE: below this the bootstrap CI cannot express
+# uncertainty (n=1 collapses to a point), so a tiny run could fabricate a degenerate "significant"
+# comparison. Floor every request to at least this many personas (still capped at _MAX_RUN_N).
+_MIN_RUN_N = 5
 # A fixed held-out seed so a given (dimension, value, n) re-runs the SAME frozen scenarios (R20).
 _RUN_HELD_OUT_SEED = 7
+
+# COST/availability bound for the inline A/B (Fix: it awaits a full real self-play run — minutes,
+# paid — so it must be bounded + serialized rather than hang or stack paid work). The run is wrapped
+# in asyncio.wait_for(_RUN_TIMEOUT_S) and guarded by a semaphore of _RUN_CONCURRENCY permits; a run
+# that exceeds the budget returns 503 (clear timeout), and a concurrent run that can't get a permit
+# returns 503 (busy) instead of starting more paid work. A full job-queue is out of scope here.
+_DEFAULT_RUN_TIMEOUT_S = 180.0
+_DEFAULT_RUN_CONCURRENCY = 1
 
 
 class RunExperimentRequest(BaseModel):
@@ -364,6 +377,8 @@ def create_improve_router(
     champion_config_provider: Optional[Callable[[], AgentConfig]] = None,
     llm_client_factory: Optional[Callable[[], LLMClient]] = None,
     experiment_runner: Optional[Callable[..., Awaitable[list[Any]]]] = None,
+    run_timeout_s: float = _DEFAULT_RUN_TIMEOUT_S,
+    run_max_concurrency: int = _DEFAULT_RUN_CONCURRENCY,
 ) -> APIRouter:
     """Build the /api Improve router. `improve_store` is injectable (default Postgres store, tests
     pass a seeded fake). `champion_config_provider` returns the champion AgentConfig a KB/playbook
@@ -372,9 +387,18 @@ def create_improve_router(
     `llm_client_factory` builds the LLMClient both arms of POST /api/experiments/run use (prod: a REAL
     OpenRouterClient — a run SPENDS CREDIT; tests: a free MockLLMClient). `experiment_runner` is the
     optional run_experiment runner seam (tests inject a deterministic deck so the A/B is reproducible
-    without self-play; prod leaves it None -> real self-play). All endpoints are async."""
+    without self-play; prod leaves it None -> real self-play).
+
+    `run_timeout_s` / `run_max_concurrency` BOUND the paid inline A/B: each run is wrapped in
+    asyncio.wait_for(run_timeout_s) and guarded by a semaphore of run_max_concurrency permits — a run
+    past the budget or a contended concurrent run returns 503 rather than hanging or stacking paid
+    work (server.create_app uses the defaults; tests override them for fast, deterministic coverage).
+    All endpoints are async."""
     store: ImproveStore = improve_store if improve_store is not None else _StoreBackedImproveStore()
     get_config = champion_config_provider or (lambda: load_config("champion_v0"))
+    # One semaphore for the whole router instance bounds concurrent paid runs. Created here (3.10+
+    # binds it to the loop lazily on first use), shared across requests served by this router.
+    run_semaphore = asyncio.Semaphore(max(1, int(run_max_concurrency)))
 
     def _make_llm() -> LLMClient:
         if llm_client_factory is not None:
@@ -411,33 +435,82 @@ def create_improve_router(
         gate, flattens the graded result into an ExperimentRecord (state passed/blocked/etc. per the
         gate), PERSISTS it, and returns it — so the run SHOWS in the lab immediately.
 
+        BOUNDED + SERIALIZED: the inline A/B is a full (paid, minutes-long in prod) self-play run, so
+        it is wrapped in asyncio.wait_for(run_timeout_s) and guarded by a concurrency semaphore — a
+        run past the budget returns 503 (clear timeout) and a contended concurrent run returns 503
+        (busy) instead of hanging or stacking paid work.
+
+        FAIL-CLOSED (R36): the inline run does NOT measure sim-to-real divergence, so an otherwise
+        AUTO-PROMOTE-eligible (clean, non-extreme) result is routed to `pending_approval` rather than
+        silently promoted — the central-risk divergence gate is never bypassed by this path.
+
         COST: in the running app the injected client is a REAL OpenRouterClient, so this spends model
-        credit — `n` is modest by default (and capped). Tests inject a MockLLMClient + a deterministic
-        runner (free). Input is validated at the boundary (400) BEFORE any paid run begins.
+        credit — `n` is modest by default (floored to a minimum sample, capped at the max). Tests
+        inject a MockLLMClient + a deterministic runner (free). Input is validated at the boundary
+        (400) BEFORE any paid run begins.
         """
-        n = max(1, min(int(req.n), _MAX_RUN_N))
+        # Floor N to the minimum trustworthy sample (>=_MIN_RUN_N) and cap it — never run a degenerate
+        # tiny sample that the grading floor would reject anyway, and never let a UI typo bill a huge N.
+        n = max(_MIN_RUN_N, min(int(req.n), _MAX_RUN_N))
         champion = get_config()
         try:
             challenger = _challenger_for(champion, req.dimension, req.value, seed=_RUN_HELD_OUT_SEED)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        held_out = frozen_held_out(seed=_RUN_HELD_OUT_SEED, n=n, rotation_index=0)
-        experiment = await run_experiment(
-            champion,
-            challenger,
-            held_out,
-            _make_llm,
-            _make_llm,
-            seed=_RUN_HELD_OUT_SEED,
-            runner=experiment_runner,
-        )
+        # Concurrency guard: refuse to START a second paid run while one is in flight (no permit ->
+        # 503 busy). acquire is non-blocking via locked() so the contended caller fails fast.
+        if run_semaphore.locked():
+            raise HTTPException(
+                status_code=503,
+                detail="an experiment run is already in progress — retry once it completes",
+            )
+        await run_semaphore.acquire()
+        try:
+            held_out = frozen_held_out(seed=_RUN_HELD_OUT_SEED, n=n, rotation_index=0)
+            try:
+                experiment = await asyncio.wait_for(
+                    run_experiment(
+                        champion,
+                        challenger,
+                        held_out,
+                        _make_llm,
+                        _make_llm,
+                        seed=_RUN_HELD_OUT_SEED,
+                        runner=experiment_runner,
+                    ),
+                    timeout=run_timeout_s,
+                )
+            except asyncio.TimeoutError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"experiment run timed out after {run_timeout_s:g}s — the A/B exceeded the "
+                        "budget; reduce N or retry"
+                    ),
+                ) from exc
+        finally:
+            run_semaphore.release()
+
         decision = evaluate_promotion(experiment, is_extreme=challenger.is_extreme)
+        # FAIL-CLOSED on the unmeasured central risk: a clean non-extreme auto-promote with NO
+        # divergence measured here is downgraded to pending_approval (human queue) — never shipped.
+        if decision.status == "promoted":
+            decision = PromotionDecision(
+                status="pending_approval",
+                promote=False,
+                requires_human=True,
+                reasons=[
+                    "passed the bar but sim-to-real divergence was NOT measured on this inline run "
+                    "(R36) — routed to human approval instead of auto-promoting (fail-closed)"
+                ],
+            )
         record = experiment_record_from(
             experiment,
             decision,
             challenger=challenger,
             n=n,
+            target=n,
             population=f"Held-out · {n} personas",
             name=req.name or challenger.diff_description,
         )
@@ -456,7 +529,13 @@ def create_improve_router(
     async def approve_ep(experiment_id: str) -> dict[str, Any]:
         """Approve a blocked challenger -> PROMOTE it to champion (R19). Records the challenger as the
         new champion via record_version (single-champion invariant demotes the prior champion), then
-        flips the experiment state -> promoted. Only a `blocked` experiment may be approved."""
+        flips the experiment state -> promoted. Only a `blocked` experiment may be approved.
+
+        DEFENSE-IN-DEPTH (Fix): a human approval CANNOT bypass the bar. Before promoting, re-assert the
+        recorded result still meets the promotion bar — challenger_better AND guardrail=='pass' (no
+        regression, R24) AND qualification held within tolerance (R29) AND is_extreme (only an extreme
+        pass should be sitting in the human queue). A record that does not meet the bar (e.g. stuck in
+        `blocked` with a tripped guardrail) is 409'd rather than promoted."""
         exp = await store.get_experiment(experiment_id)
         if exp is None:
             raise HTTPException(status_code=404, detail=f"unknown experiment {experiment_id!r}")
@@ -464,6 +543,23 @@ def create_improve_router(
             raise HTTPException(
                 status_code=409,
                 detail=f"only a blocked experiment can be approved (state={exp.state!r})",
+            )
+        # Re-check the bar BEFORE recording the version (the gate is not bypassable via approve).
+        qual_held = exp.challenger_qual_acc >= exp.champion_qual_acc - QUAL_TOLERANCE
+        meets_bar = (
+            exp.challenger_better
+            and exp.guardrail == "pass"
+            and qual_held
+            and exp.is_extreme
+        )
+        if not meets_bar:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "experiment no longer meets the promotion bar — refusing to promote on approve "
+                    f"(challenger_better={exp.challenger_better}, guardrail={exp.guardrail!r}, "
+                    f"qualification_held={qual_held}, is_extreme={exp.is_extreme})"
+                ),
             )
         # Promote: the challenger becomes the live champion. record_version enforces single-champion.
         lineage = VersionLineage(

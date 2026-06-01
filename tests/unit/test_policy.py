@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 
 from src.config.settings import AgentConfig, Persona
@@ -19,7 +20,27 @@ from src.core.belief_state import BeliefState
 from src.core import gates
 from src.core.gates import apply_gates
 from src.core.llm import MockLLMClient
+from src.core.nlg import realize
 from src.core.policy import Decision, decide
+
+
+class _RaisingLLMClient:
+    """A stub LLMClient whose complete()/complete_json() ALWAYS raise a transient httpx error,
+    simulating an OpenRouter 429/5xx/timeout that survives the client's bounded retry budget.
+    Used to prove the brain degrades gracefully (no exception propagates) — FINDING 2."""
+
+    def __init__(self, exc: Exception | None = None) -> None:
+        request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+        response = httpx.Response(503, request=request)
+        self._exc = exc or httpx.HTTPStatusError(
+            "service unavailable", request=request, response=response
+        )
+
+    async def complete(self, messages, *, model=None, response_format=None, **opts):
+        raise self._exc
+
+    async def complete_json(self, messages, *, model=None, **opts):
+        raise self._exc
 
 
 # --- shared fixtures --------------------------------------------------------------------------
@@ -181,11 +202,12 @@ def test_pushiness_cap_blocks_pressure_on_repeated_pressure_count():
     cfg = make_config(pushiness_pressure_count_cap=2)
     b = BeliefState.fresh()
     # History where the agent has already pressured twice in a row.
+    # Production history shape: utterances live under "text" (selfplay/voice), not "content".
     history = [
         {"role": "assistant", "act": "attempt_close"},
-        {"role": "user", "content": "not sure"},
+        {"role": "user", "text": "not sure"},
         {"role": "assistant", "act": "attempt_close"},
-        {"role": "user", "content": "still not sure"},
+        {"role": "user", "text": "still not sure"},
     ]
     proposed = Decision(act="attempt_close", tier="enrollment", rationale="push again")
     out = gates.pushiness_cap(proposed, b, cfg, history=history)
@@ -207,7 +229,7 @@ def test_pushiness_cap_allows_pressure_when_under_cap():
     cfg = make_config(pushiness_cap=0.7, pushiness_pressure_count_cap=2)
     b = BeliefState.fresh()
     b.drivers["bail_risk"] = 0.2
-    history = [{"role": "assistant", "act": "pitch"}, {"role": "user", "content": "tell me more"}]
+    history = [{"role": "assistant", "act": "pitch"}, {"role": "user", "text": "tell me more"}]
     proposed = Decision(act="attempt_close", tier="enrollment", rationale="first close attempt")
     out = gates.pushiness_cap(proposed, b, cfg, history=history)
     assert out.act == "attempt_close"
@@ -265,7 +287,7 @@ def test_escalation_fires_on_two_consecutive_low_confidence_turns():
     # Prior turn decision was also low-confidence.
     history = [
         {"role": "assistant", "act": "ask", "confidence": 0.25},
-        {"role": "user", "content": "what?"},
+        {"role": "user", "text": "what?"},
     ]
     proposed = Decision(act="ask", target_slot="goal", rationale="confused", confidence=0.2)
     out = gates.escalation_triggers(proposed, b, cfg, history=history)
@@ -279,7 +301,7 @@ def test_escalation_does_not_fire_on_single_low_confidence_turn():
     b.decision_confidence = 0.2
     history = [
         {"role": "assistant", "act": "ask", "confidence": 0.9},  # prior turn was confident
-        {"role": "user", "content": "ok"},
+        {"role": "user", "text": "ok"},
     ]
     proposed = Decision(act="ask", target_slot="goal", rationale="one bad turn", confidence=0.2)
     out = gates.escalation_triggers(proposed, b, cfg, history=history)
@@ -415,9 +437,9 @@ async def test_policy_pushiness_cap_fires_on_repeated_pressure():
     b.drivers["trust"] = 0.7
     history = [
         {"role": "assistant", "act": "attempt_close"},
-        {"role": "user", "content": "no"},
+        {"role": "user", "text": "no"},
         {"role": "assistant", "act": "attempt_close"},
-        {"role": "user", "content": "no again"},
+        {"role": "user", "text": "no again"},
     ]
     llm = MockLLMClient([_proposal_json(act="attempt_close", tier="enrollment", rationale="push")])
     d = await decide(b, history=history, config=cfg, llm_client=llm)
@@ -445,3 +467,76 @@ async def test_policy_malformed_proposal_is_safe():
     assert isinstance(d, Decision)
     # A safe fallback never silently pressures/closes.
     assert d.act not in ("attempt_close",)
+
+
+# --- FINDING 1: the policy LLM must actually SEE the conversation ----------------------------
+
+async def test_policy_user_message_contains_production_history_text():
+    """Regression (FINDING 1): the RECENT_TURNS block sent to the policy LLM must contain the
+    prospect's utterance text under the PRODUCTION history key ("text", what selfplay/voice write),
+    not the stale "content" key. We capture the rendered policy user message via a callable mock
+    and assert the utterance is actually present in the JSON it sends."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.drivers["trust"] = 0.7
+
+    # Production history shape (selfplay.py line 190-192 / voice/session.py): user text under "text".
+    utterance = "My daughter needs SAT math help before finals"
+    history = [
+        {"role": "agent", "act": "greeting", "confidence": None, "text": "Hi, how can I help?"},
+        {"role": "user", "text": utterance},
+    ]
+
+    captured: dict[str, str] = {}
+
+    def responder(messages, **opts):
+        # Record the user-role prompt the policy assembled, then return a benign proposal.
+        captured["user"] = next(m["content"] for m in messages if m["role"] == "user")
+        return _proposal_json(act="pitch", rationale="build value")
+
+    llm = MockLLMClient(responder)
+    await decide(b, history=history, config=cfg, llm_client=llm)
+
+    # The prospect's actual words must reach the policy LLM (else the policy is blind in production).
+    assert utterance in captured["user"], (
+        f"utterance text missing from policy prompt; the RECENT_TURNS block is blind. "
+        f"prompt={captured['user']!r}"
+    )
+
+
+# --- FINDING 2: a transient LLM failure must NOT crash the turn ------------------------------
+
+async def test_policy_degrades_safely_on_httpx_error():
+    """A real OpenRouter failure (httpx.HTTPStatusError, NOT ValueError) must not crash decide();
+    the policy falls back to the SAME safe non-pressure act as the bad-JSON path (FINDING 2)."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.drivers["trust"] = 0.7
+    llm = _RaisingLLMClient()  # complete_json raises httpx.HTTPStatusError
+    d = await decide(b, history=[], config=cfg, llm_client=llm)  # must not raise
+    assert isinstance(d, Decision)
+    # Safe fallback: never silently closes/pressures on a failed proposal.
+    assert d.act not in ("attempt_close",)
+
+
+async def test_policy_degrades_safely_on_request_error():
+    """A transport-level RequestError (timeout/connection) likewise degrades, not crashes."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    llm = _RaisingLLMClient(exc=httpx.ConnectTimeout("timed out", request=request))
+    d = await decide(b, history=[], config=cfg, llm_client=llm)
+    assert isinstance(d, Decision)
+    assert d.act not in ("attempt_close",)
+
+
+async def test_nlg_returns_filler_on_httpx_error():
+    """nlg.realize() must return the safe filler (non-empty turn) when the LLM call fails with a
+    transient httpx error rather than letting the exception propagate (FINDING 2)."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    decision = Decision(act="pitch", rationale="value")
+    llm = _RaisingLLMClient()
+    reply = await realize(decision, b, cfg, llm)  # must not raise
+    assert isinstance(reply, str)
+    assert reply.strip(), "realize() must return a non-empty filler on call failure"

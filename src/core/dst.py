@@ -212,8 +212,12 @@ async def _update_drivers(
     messages = _build_driver_messages(belief, last_agent_act, utterance)
     try:
         deltas = await llm_client.complete_json(messages)
-    except ValueError:
-        return  # malformed JSON -> leave drivers unchanged
+    except Exception:
+        # FINDING 2: degrade on ANY driver-call failure, not just bad JSON. ValueError is the
+        # malformed-JSON path; a real OpenRouter outage raises httpx.HTTPStatusError/RequestError
+        # (outliving the client's bounded retry). Either way leave drivers at their priors — the
+        # deterministic slot extraction + trend derivation still run — so the turn never crashes.
+        return
     if not isinstance(deltas, dict):
         return
     for name, delta in deltas.items():
