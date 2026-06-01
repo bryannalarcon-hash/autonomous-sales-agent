@@ -6,7 +6,10 @@
 // /api/live every few seconds and shows the most-recent call, with a clear "no active call" empty
 // state AND a "Connecting…" state for an active call that has no turns yet (so a just-started call
 // never renders as a wall of dashes). All operator-facing text uses the backend's pre-translated
-// labels (no driver slug / P-id).
+// labels (no driver slug / P-id). N3 FIX: every "LIVE" affordance (transcript-card pill, footer
+// recording dot, and the shell top-title pill the layout renders statically) is now gated on the
+// REAL snap.active flag — when a COMPLETED call is shown (active:false) the surface reads "Most
+// recent call" with no live/recording treatment, instead of contradicting the not-live footer.
 'use client';
 
 import { useEffect, useState } from 'react';
@@ -192,6 +195,23 @@ export default function LivePage() {
     };
   }, []);
 
+  // The shared shell (DashboardShell) renders a STATIC "LIVE" pill in the top-title for this route,
+  // independent of whether a call is actually on the line — which contradicts the not-live footer
+  // when a COMPLETED call is shown. The shell keys the pill off static nav config (not our snapshot),
+  // so we reconcile it here from the page that owns the real signal: hide the title pill whenever
+  // we're not genuinely active, and restore it (and the shell on unmount) otherwise. Toggling
+  // visibility is layout-preserving and reversible; we never remove the node.
+  const titleActive = snap?.active === true;
+  useEffect(() => {
+    const pill = document.querySelector<HTMLElement>('.top-title .live-pill');
+    if (pill) pill.style.display = titleActive ? '' : 'none';
+    return () => {
+      // Leaving the page: restore the shell's pill to its default so other routes are unaffected.
+      const p = document.querySelector<HTMLElement>('.top-title .live-pill');
+      if (p) p.style.display = '';
+    };
+  }, [titleActive]);
+
   if (error && !snap) {
     return (
       <div className="page">
@@ -271,6 +291,18 @@ export default function LivePage() {
           <div className="card lv-tcard">
             <div className="card-head">
               <h3>Transcript</h3>
+              {/* LIVE pill ONLY when the call is genuinely on the line; otherwise a neutral
+                  "Most recent call" tag so a COMPLETED call never wears a live treatment (N3). */}
+              {snap.active ? (
+                <span className="live-pill" style={{ marginLeft: 10 }}>
+                  <i />
+                  LIVE
+                </span>
+              ) : (
+                <span className="tag" style={{ marginLeft: 10 }}>
+                  Most recent call
+                </span>
+              )}
               <span
                 className="row gap8"
                 style={{ marginLeft: 'auto', fontSize: 11.5, color: 'var(--text-3)', fontWeight: 550 }}
@@ -311,7 +343,12 @@ export default function LivePage() {
       {/* ACTION BAR */}
       <div className="lv-actions">
         <span className="lv-rec">
-          <span className="rd" />
+          {/* Pulsing red recording dot ONLY while active; a static neutral dot when showing a
+              completed call, so the footer dot doesn't read as "recording now" off-air (N3). */}
+          <span
+            className="rd"
+            style={snap.active ? undefined : { background: 'var(--text-3)', animation: 'none' }}
+          />
           {snap.active ? `Recording · Turn ${ep.turn_count}` : 'Most recent call (not live)'}
         </span>
         <div className="lv-tl">

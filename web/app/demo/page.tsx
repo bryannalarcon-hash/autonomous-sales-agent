@@ -102,7 +102,10 @@ export default function DemoPage() {
                     showDebug={showDebug}
                   />
                 </div>
-                <VoiceCall sessionId={sessionId} identity="prospect" enabled={callEnabled} />
+                {/* Equal-height wrapper so the voice panel matches the text console (N8 parity). */}
+                <div className="h-[28rem]">
+                  <VoiceCall sessionId={sessionId} identity="prospect" enabled={callEnabled} />
+                </div>
               </div>
             </>
           )}

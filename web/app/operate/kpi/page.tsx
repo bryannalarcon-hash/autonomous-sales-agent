@@ -4,7 +4,10 @@
 // call enrollment rate (share of calls that closed at full enrollment, a 0..100% number) — a config
 // can lift one without the other, so the operator sees both. Version + cohort selectors filter the
 // set; "Compare versions" adds a baseline arm with a bootstrap-CI delta. Secondary panels: ladder-
-// tier distribution + per-archetype conversion. All tier/outcome labels are pre-translated.
+// tier distribution + per-archetype conversion. All tier/outcome labels are pre-translated. The
+// archetype panel humanizes raw persona slugs (lib/labels.archetypeLabel) and filters out NON-
+// archetype rows (the agent's own name "Alex", and "Unknown"/empty). The same-call enrollment tile
+// uses rateValue() so a small-but-nonzero rate (≈0.03%) reads "<0.1"/one-decimal, never a flat "0".
 //
 // The version selector is populated from REAL data: /api/versions (lineage) plus the cohort the
 // episodes are actually tagged with, and it DEFAULTS to a version that has episodes so numbers show
@@ -18,6 +21,7 @@ import { Spark } from '@/components/cadence/Spark';
 import { fetchKpis } from '@/lib/operate-api';
 import { fetchVersions } from '@/lib/improve-api';
 import type { KpiResponse } from '@/lib/operate-types';
+import { archetypeLabel, versionLabel } from '@/lib/labels';
 
 // The cohort the seeded episodes are actually tagged with — the only selection guaranteed to have
 // episodes on a fresh backend, so it is the default and is always present in the selector.
@@ -28,6 +32,25 @@ function pct(v: number): string {
   return `${Math.round(v * 100)}%`;
 }
 
+// The number-only part of a SMALL rate where a flat "0" would read as no-data (the headline tile
+// renders this big, with a separate "%" unit span). A true zero stays "0", a tiny positive (< 0.1%)
+// shows "<0.1", and anything below 10% keeps one decimal (so ≈0.03% isn't shown as 0).
+function rateValue(v: number): string {
+  if (v <= 0) return '0';
+  const p = v * 100;
+  if (p < 0.1) return '<0.1';
+  if (p < 10) return p.toFixed(1);
+  return String(Math.round(p));
+}
+
+// Personas that are NOT real prospect archetypes and must not appear in the archetype panel: the
+// agent's own persona name (mirrors DashboardShell's PERSONA_NAME) and the null/empty fallback the
+// backend labels "Unknown". Compared case-insensitively.
+const NON_ARCHETYPE_LABELS = new Set(['alex', 'unknown', '']);
+function isProspectArchetype(label: string): boolean {
+  return !NON_ARCHETYPE_LABELS.has(label.trim().toLowerCase());
+}
+
 // One selectable version: the raw id sent to the API + the operator-facing label. The hash suffix on
 // a raw id (e.g. "v1-f3798d7a") is an internal index, so the label strips it; the champion is marked.
 interface VersionOption {
@@ -35,16 +58,9 @@ interface VersionOption {
   label: string; // human-readable label shown in the dropdown (no internal hash)
 }
 
-// Strip the internal suffixes from a raw version id for display: the experiment dimension/seq suffix
-// ("champion_v0__playbooks_discovery_sequence__7" -> "champion_v0") and any short hash
-// ("v1-f3798d7a" -> "v1"), then humanize the prefix ("champion_v0" -> "Champion v0"). Never shows the
-// raw internal index to the operator (the raw id is still the value sent to /api/kpis).
-function versionLabel(raw: string): string {
-  let base = raw.split('__')[0];
-  base = base.split('-')[0];
-  if (base.startsWith('champion_')) return `Champion ${base.slice('champion_'.length)}`;
-  return base;
-}
+// versionLabel (strip the `__…__` experiment suffix + short `-hash`, humanize "champion_v0" ->
+// "Champion v0") is imported from lib/labels — never shows the raw internal index to the operator
+// (the raw id is still the value sent to /api/kpis).
 
 function BarRow({
   label,
@@ -216,6 +232,9 @@ export default function KpiPage() {
 
 function Overview({ data }: { data: KpiResponse }) {
   const ladderPctOfMax = data.ladder_max ? data.weighted_ladder_score / data.ladder_max : 0;
+  // Real prospect archetypes only — drop the agent persona name ("Alex") and the "Unknown"/empty
+  // fallback, then humanize the slug for display ("anxious_parent" -> "Anxious parent").
+  const archetypes = data.archetype_conversion.filter((a) => isProspectArchetype(a.label));
   return (
     <>
       {/* primary tiles — the ladder headline AND the DISTINCT enrollment rate, side by side */}
@@ -240,7 +259,7 @@ function Overview({ data }: { data: KpiResponse }) {
             Same-call enrollment
           </div>
           <div className="k-val">
-            {Math.round(data.enrollment_rate * 100)}
+            {rateValue(data.enrollment_rate)}
             <span className="u">%</span>
           </div>
           <div className="k-delta flat">→ closed at enrollment</div>
@@ -305,15 +324,15 @@ function Overview({ data }: { data: KpiResponse }) {
             <h3>Conversion by archetype</h3>
           </div>
           <div className="card-pad">
-            {data.archetype_conversion.length === 0 ? (
+            {archetypes.length === 0 ? (
               <p className="faint" style={{ fontSize: 12 }}>
                 No archetype data for this selection.
               </p>
             ) : (
-              data.archetype_conversion.map((a) => (
+              archetypes.map((a) => (
                 <BarRow
                   key={a.label}
-                  label={`${a.label} · ${a.n}`}
+                  label={`${archetypeLabel(a.label)} · ${a.n}`}
                   value={a.conversion}
                   asPct
                   color={a.conversion < 0.4 ? 'var(--danger)' : a.conversion < 0.65 ? 'var(--warn)' : 'var(--ok)'}

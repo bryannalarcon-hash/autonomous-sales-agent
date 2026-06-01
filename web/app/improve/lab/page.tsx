@@ -8,7 +8,9 @@
 // threshold + new value), see an explicit "this runs N real model calls" cost note, submit to
 // /api/experiments/run, then watch the new card transition running -> result (we poll /api/experiments).
 // Data from /api/experiments; the discovery-sequencing before/after is the headline demo artifact. All
-// semantic labels (state, dimension) arrive pre-translated from the backend — no raw slug renders.
+// semantic labels (state, dimension, version) are humanized before render — no raw slug, `__…__`
+// experiment suffix, or DRAFT-/exp- id renders. Cards/drawer show the human version + change label
+// (lib/labels: versionLabel/dimensionLabel; backend dimension_label preferred via changeLabel()).
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -16,6 +18,13 @@ import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchExperiments, fetchPlaybook, runExperiment } from '@/lib/improve-api';
 import type { Experiment, PlaybookResponse, RunExperimentRequest } from '@/lib/improve-types';
+import { dimensionLabel, versionLabel } from '@/lib/labels';
+
+// Operator-facing "what changed" label for an experiment: prefer the backend's pre-translated
+// dimension_label, else derive a human label from the raw `dimension` slug. Never the raw `__…__` id.
+function changeLabel(e: Experiment): string {
+  return e.dimension_label || dimensionLabel(e.dimension);
+}
 
 // Experiment state -> the tag color class for the chip (the LABEL text comes from the backend).
 const STATE_TAG: Record<Experiment['state'], string> = {
@@ -84,7 +93,7 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
         <div className="card-head">
           <div className="grow">
             <div className="row" style={{ gap: 8, marginBottom: 4 }}>
-              <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-3)' }}>{e.experiment_id}</span>
+              <span className="faint" style={{ fontSize: 11.5, fontWeight: 600 }}>{changeLabel(e)}</span>
               <span className={`tag ${STATE_TAG[e.state]} dot`}>{e.state_label}</span>
             </div>
             <div className="b" style={{ fontSize: 15.5, fontFamily: 'var(--font-display)' }}>{e.name}</div>
@@ -100,8 +109,8 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
               <div className="faint" style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em' }}>
                 Champion
               </div>
-              <div className="b mono" style={{ fontSize: 17, fontFamily: 'var(--font-display)', margin: '4px 0' }}>
-                {e.champion_version ?? '—'}
+              <div className="b" style={{ fontSize: 17, fontFamily: 'var(--font-display)', margin: '4px 0' }}>
+                {versionLabel(e.champion_version)}
               </div>
               <div className="muted" style={{ fontSize: 12 }}>Ladder {e.champion_kpi.toFixed(2)} · current production</div>
             </div>
@@ -112,8 +121,8 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
               <div style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em', color: 'var(--accent-strong)' }}>
                 Challenger
               </div>
-              <div className="b mono" style={{ fontSize: 17, fontFamily: 'var(--font-display)', margin: '4px 0', color: 'var(--accent-strong)' }}>
-                {e.challenger_version}
+              <div className="b" style={{ fontSize: 17, fontFamily: 'var(--font-display)', margin: '4px 0', color: 'var(--accent-strong)' }}>
+                {versionLabel(e.challenger_version)} · {changeLabel(e)}
               </div>
               <div className="muted" style={{ fontSize: 12 }}>Ladder {e.challenger_kpi.toFixed(2)} · {e.population}</div>
             </div>
@@ -162,7 +171,7 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
           {e.state === 'passed' ? (
             <button className="btn btn-primary">
               <Icon name="promote" size={16} />
-              Promote {e.challenger_version} to champion
+              Promote {versionLabel(e.challenger_version)} to champion
             </button>
           ) : e.state === 'blocked' ? (
             <button className="btn btn-primary" onClick={() => router.push('/improve/approvals')}>
@@ -542,7 +551,7 @@ export default function LabPage() {
                 >
                   <div className="card-pad" style={{ paddingBottom: 12 }}>
                     <div className="row" style={{ gap: 8, marginBottom: 9 }}>
-                      <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-3)' }}>{e.experiment_id}</span>
+                      <span className="faint" style={{ fontSize: 11.5, fontWeight: 600 }}>{changeLabel(e)}</span>
                       <span className={`tag ${STATE_TAG[e.state]} dot`}>{e.state_label}</span>
                       {e.state === 'passed' && e.challenger_better && !e.is_extreme ? (
                         <span className="tag ok">
@@ -560,9 +569,9 @@ export default function LabPage() {
                     <div className="b" style={{ fontSize: 15, fontFamily: 'var(--font-display)', letterSpacing: '-0.02em' }}>{e.name}</div>
                     <div className="row" style={{ gap: 8, marginTop: 6 }}>
                       <span className="tag">
-                        {e.champion_version ?? '—'}
+                        {versionLabel(e.champion_version)}
                         <Icon name="arrowR" size={11} />
-                        {e.challenger_version}
+                        {versionLabel(e.challenger_version)} · {changeLabel(e)}
                       </span>
                       <span className="muted" style={{ fontSize: 12 }}>{e.population}</span>
                     </div>

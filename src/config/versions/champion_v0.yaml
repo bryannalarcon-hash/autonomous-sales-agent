@@ -1,6 +1,8 @@
-# Initial champion config (v0 baseline the improvement loop starts from — plan U1/v0 baseline).
-# Prompt/playbook bodies are placeholders here; real content is authored in the brain/KB units
-# (U3–U5). What matters at U1 is that a versioned, typed config loads and stamps episodes.
+# Champion config v0 — the baseline the improvement loop starts from (plan U1/v0 baseline).
+# Carries the agent persona, the per-stage brain prompts (appended to the code's structured guidance
+# in src/core/{policy,nlg}.py — config.prompts.get(...)), the SPIN discovery sequence, KB-grounded
+# objection rebuttal lines (surfaced via /api/playbook; factual claims are double-checked against the
+# live kb_chunk corpus by retriever.grounded()), and the cold-start gate thresholds.
 version: champion_v0
 kb_version: kb_v0
 
@@ -10,20 +12,46 @@ persona:
   style: warm-consultative   # empathetic, educational, low-pressure (R3)
 
 prompts:
-  dst: "PLACEHOLDER — DST extraction prompt (authored in U3)"
-  policy: "PLACEHOLDER — gated policy prompt (authored in U4)"
-  nlg: "PLACEHOLDER — NLG realization prompt (authored in U4)"
+  # These are appended to the code's structured per-turn guidance — concise framing, not the whole
+  # prompt (the act/slot/gate scaffolding lives in src/core/{dst,policy,nlg}.py).
+  dst: >-
+    Update the prospect's belief from their latest message: fill the discovery slots they actually
+    revealed (grade level, subject, goal, timeline, prior tutoring, budget) and adjust the latent
+    drivers (trust, need intensity, price sensitivity, urgency, purchase intent, bail risk). Record
+    only what was said or clearly implied; leave the rest unknown.
+  policy: >-
+    You are the decision policy for Alex, a warm, consultative learning advisor for an online tutoring
+    service. Pick the single best next action for the family: discover before pitching, answer
+    questions from the knowledge base, handle objections empathetically, and invite a low-pressure
+    next step only once trust and qualification support it. Never pressure a hesitant prospect;
+    deterministic gates may override your proposal.
+  nlg: >-
+    Speak as Alex — warm, consultative, educational, low-pressure. Use short, natural spoken sentences
+    (they may be read aloud). Ground every factual claim in the provided knowledge-base facts; never
+    invent prices, guarantees, or outcomes. Reply with exactly one concise turn.
 
 playbooks:
   # SPIN-grounded discovery sequence (R35); budget intentionally late (trust-gated).
   discovery_sequence: [grade_level, subject, goal, timeline, prior_tutoring, budget]
-  # objection -> rebuttal pointers (KB-grounded content lands in U5)
+  # Concise objection reframes (KB-grounded — the supporting facts live in the kb_chunk corpus under
+  # `objections#*`; retriever.grounded() validates any specific claim the agent makes against them).
   rebuttals:
-    price: PLACEHOLDER
-    efficacy_doubt: PLACEHOLDER
-    diy_free: PLACEHOLDER
-    timing: PLACEHOLDER
-    decision_maker: PLACEHOLDER
+    price: >-
+      Look at value per month, not a lump sum: bundled hours lower the effective rate, tiers let a
+      family start light and scale up, and a satisfaction guarantee plus a 14-day refund remove the risk.
+    efficacy_doubt: >-
+      Tutors are vetted and matched by subject, level, and learning style; progress is tracked weekly so
+      improvement is visible; and a free re-match guarantee means a family is never stuck with a bad fit.
+    diy_free: >-
+      Free resources are useful but passive — live 1:1 tutoring adds structure, accountability, and
+      real-time personalization on top. It works with free tools, not instead of them.
+    timing: >-
+      The right time is tied to the deadline: a test-date plan needs ~8–12 weeks to avoid a cram, and
+      closing a gap early beats catching up. No long-term contract, and the plan can pause over breaks.
+    decision_maker: >-
+      It's a family decision — gather the specifics (subject, goal, tier, monthly cost, schedule) so the
+      talk at home is easy; a no-pressure consultation or trial gives them something concrete, backed by
+      a 14-day refund if the fit isn't right.
 
 thresholds:
   # Cold-start priors (logged as guesses pending sim calibration — see belief-state-schema.md).

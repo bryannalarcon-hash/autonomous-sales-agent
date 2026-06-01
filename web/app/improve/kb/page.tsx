@@ -3,17 +3,19 @@
 // on, loaded from GET /api/kb (the kb_chunk corpus grouped by section). Clicking a section in the left
 // tree renders THAT section's real chunks in the right panel — header = section label, body = each
 // chunk's derived title + full grounding text. Counts in the tree equal what's shown (no placeholder
-// text, no single hardcoded example for every section). A SAVE still forks a DRAFT CHALLENGER via POST
-// /api/playbook (the loop's pure config mutators — NEVER mutates the live champion, R20); a post-save
-// banner links the operator to the Experiment Lab to watch the draft. Degrades to an empty-state when
-// the corpus is empty (or the API has not yet served the grouped shape).
+// text, no single hardcoded example for every section). This view is READ-ONLY: there is no in-page
+// corpus editor, so it does NOT silently fork a draft (N7 fix — the old "Test edit as experiment"
+// button POSTed /api/playbook on click, creating an empty draft of an edit never made). Instead the
+// primary action routes to the Experiment Lab, where forking a DRAFT CHALLENGER is an explicit,
+// intentional step (R20: experiments mutate config, NEVER the live champion). Degrades to an
+// empty-state when the corpus is empty (or the API has not yet served the grouped shape).
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon, type IconName } from '@/components/cadence/Icon';
-import { fetchKb, savePlaybookDraft } from '@/lib/improve-api';
-import type { Experiment, KbResponse, KbSection } from '@/lib/improve-types';
+import { fetchKb } from '@/lib/improve-api';
+import type { KbResponse, KbSection } from '@/lib/improve-types';
 
 // Per-section glyph for the left tree, keyed by the raw section slug (internal — never rendered as
 // text). An unknown section falls back to the generic note glyph so a NEW corpus section still renders.
@@ -69,8 +71,6 @@ export default function KbPage() {
   const router = useRouter();
   const [kb, setKb] = useState<KbResponse | null>(null);
   const [active, setActive] = useState<string | null>(null);
-  const [draft, setDraft] = useState<Experiment | null>(null);
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -95,21 +95,6 @@ export default function KbPage() {
     () => sections.find((s) => s.id === active) ?? null,
     [sections, active],
   );
-
-  async function saveDraft(goToLab: boolean) {
-    setBusy(true);
-    setError(null);
-    try {
-      const label = activeSection?.label ?? 'knowledge base';
-      const res = await savePlaybookDraft({ name: `KB edit · ${label}` });
-      setDraft(res.draft);
-      if (goToLab) router.push('/improve/lab');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Save failed.');
-    } finally {
-      setBusy(false);
-    }
-  }
 
   return (
     <div className="page">
@@ -149,7 +134,8 @@ export default function KbPage() {
             <div className="muted" style={{ fontSize: 11.5, lineHeight: 1.5 }}>
               These are the real facts the agent grounds answers on
               {kb ? <> — <b className="mono">{kb.total_chunks}</b> across {sections.length} sections</> : null}.
-              Editing forks the corpus into a draft that won&rsquo;t affect live calls until promoted via an experiment.
+              This is a read-only view. To trial a change, open the Experiment Lab and fork a draft
+              challenger there — it won&rsquo;t affect live calls until promoted.
             </div>
           </div>
         </div>
@@ -168,40 +154,19 @@ export default function KbPage() {
               </div>
             </div>
             <div className="grow" />
+            {/* Read-only browser: this does NOT fork a draft (that was an empty-edit fork, N7).
+                It routes to the Experiment Lab, where forking a challenger is an explicit step. */}
             <button
               className="btn btn-primary btn-sm"
-              disabled={busy || !activeSection}
-              onClick={() => saveDraft(true)}
+              onClick={() => router.push('/improve/lab')}
+              title="Open the Experiment Lab to fork a draft challenger from the current playbook"
             >
               <Icon name="flask" size={14} />
-              Test edit as experiment
+              Open in Experiment Lab
             </button>
           </div>
 
           <div className="scroll" style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 18 }}>
-            {/* Draft banner: makes it explicit a SAVE is a draft, not a live change (R20). */}
-            {draft ? (
-              <div
-                className="card card-pad"
-                style={{ borderColor: 'var(--accent-border)', background: 'var(--accent-soft)', marginBottom: 16 }}
-              >
-                <div className="row" style={{ gap: 9, alignItems: 'center' }}>
-                  <Icon name="branch" size={17} style={{ color: 'var(--accent-strong)' }} />
-                  <div className="grow">
-                    <div className="b" style={{ fontSize: 13, color: 'var(--accent-strong)' }}>
-                      Draft challenger created — the live champion is unchanged
-                    </div>
-                    <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 2 }}>
-                      <b className="mono">{draft.challenger_version}</b> ({draft.dimension_label}) is now a draft experiment. Promote it via the lab to make it live.
-                    </div>
-                  </div>
-                  <button className="btn btn-ghost btn-sm" onClick={() => router.push('/improve/lab')}>
-                    Open in lab
-                    <Icon name="arrowR" size={14} />
-                  </button>
-                </div>
-              </div>
-            ) : null}
             {error ? (
               <div className="card card-pad" style={{ borderColor: 'var(--danger-border)', background: 'var(--danger-soft)', marginBottom: 16 }}>
                 <span style={{ fontSize: 12.5, color: 'var(--danger)' }}>{error}</span>

@@ -4,13 +4,21 @@
 // it's extreme (the guardrail reason) + the enroll/ladder lift, with Reject (danger) / Approve with
 // override (ok) actions wired to POST /api/approvals/{id}/{approve,reject}: approve PROMOTES the
 // challenger to champion, reject leaves the champion unchanged. A decided card leaves the queue and
-// appends a logged-decision line. A drawer surfaces the full "why it needs sign-off" detail.
+// appends a logged-decision line. A drawer surfaces the full "why it needs sign-off" detail. All
+// version/dimension text is humanized (lib/labels) — no raw `__…__` slug or exp-/DRAFT- id renders.
 'use client';
 
 import { useEffect, useState } from 'react';
 import { Icon } from '@/components/cadence/Icon';
 import { approveExperiment, fetchApprovals, rejectExperiment } from '@/lib/improve-api';
 import type { Experiment } from '@/lib/improve-types';
+import { dimensionLabel, versionLabel } from '@/lib/labels';
+
+// Operator-facing "what changed" label: prefer the backend's pre-translated dimension_label, else
+// derive a human label from the raw `dimension` slug. Never the raw `__…__` id or slug.
+function changeLabel(a: Experiment): string {
+  return a.dimension_label || dimensionLabel(a.dimension);
+}
 
 function Box({ l, v, good, warn, last }: { l: string; v: string; good?: boolean; warn?: boolean; last?: boolean }) {
   const color = good ? 'var(--ok)' : warn ? 'var(--warn-strong)' : 'var(--text)';
@@ -52,8 +60,10 @@ function AprDrawer({
         <div className="card-head">
           <div className="grow">
             <div className="row" style={{ gap: 8, marginBottom: 4 }}>
-              <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-3)' }}>{a.experiment_id}</span>
-              <span className="tag warn dot">{a.dimension_label}</span>
+              <span className="faint" style={{ fontSize: 11.5, fontWeight: 600 }}>
+                {versionLabel(a.champion_version)} → {versionLabel(a.challenger_version)}
+              </span>
+              <span className="tag warn dot">{changeLabel(a)}</span>
             </div>
             <div className="b" style={{ fontSize: 15.5, fontFamily: 'var(--font-display)' }}>{a.name}</div>
           </div>
@@ -67,7 +77,7 @@ function AprDrawer({
               Why it needs sign-off
             </div>
             <div style={{ fontSize: 13.5, lineHeight: 1.55 }}>
-              {a.diff_description}. This change is extreme ({a.dimension_label.toLowerCase()}), so promotion is paused for a human.
+              {a.diff_description}. This change is extreme ({changeLabel(a).toLowerCase()}), so promotion is paused for a human.
             </div>
           </div>
           <div className="card card-pad" style={{ borderColor: 'var(--warn-border)', background: 'var(--warn-soft)' }}>
@@ -78,7 +88,7 @@ function AprDrawer({
                   Guardrail: {a.guardrail_reason ?? 'breached'}
                 </div>
                 <div style={{ fontSize: 12, color: 'var(--warn-strong)', opacity: 0.85, marginTop: 2 }}>
-                  Approving records an override on your account and ships {a.challenger_version} as champion.
+                  Approving records an override on your account and ships {versionLabel(a.challenger_version)} as champion.
                 </div>
               </div>
             </div>
@@ -116,7 +126,9 @@ function AprDrawer({
 export default function ApprovalsPage() {
   const [rows, setRows] = useState<Experiment[]>([]);
   const [sel, setSel] = useState<Experiment | null>(null);
-  const [decided, setDecided] = useState<Record<string, 'approved' | 'rejected'>>({});
+  // Decided this session: keyed by experiment_id (internal), but we store the HUMAN label so the
+  // logged-decision footer never renders the raw exp-/DRAFT- id.
+  const [decided, setDecided] = useState<Record<string, { label: string; verdict: 'approved' | 'rejected' }>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -142,8 +154,13 @@ export default function ApprovalsPage() {
     try {
       if (v === 'approved') await approveExperiment(id);
       else await rejectExperiment(id);
+      // Capture the human label BEFORE the row leaves the queue (so the footer has no raw id).
+      const row = rows.find((r) => r.experiment_id === id);
+      const label = row
+        ? `${versionLabel(row.challenger_version)} · ${changeLabel(row)}`
+        : 'Experiment';
       setRows((prev) => prev.filter((r) => r.experiment_id !== id));
-      setDecided((d) => ({ ...d, [id]: v }));
+      setDecided((d) => ({ ...d, [id]: { label, verdict: v } }));
       setSel(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Decision failed.');
@@ -191,13 +208,12 @@ export default function ApprovalsPage() {
                 <div key={a.experiment_id} className="card">
                   <div className="card-pad">
                     <div className="row" style={{ gap: 9, marginBottom: 9 }}>
-                      <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-3)' }}>{a.experiment_id}</span>
-                      <span className="tag warn dot">{a.dimension_label}</span>
-                      <span className="tag">{a.champion_version ?? '—'} · {a.challenger_version}</span>
+                      <span className="tag warn dot">{changeLabel(a)}</span>
+                      <span className="tag">{versionLabel(a.champion_version)} → {versionLabel(a.challenger_version)}</span>
                     </div>
                     <div className="b" style={{ fontSize: 16, fontFamily: 'var(--font-display)', letterSpacing: '-0.02em' }}>{a.name}</div>
                     <div className="muted" style={{ fontSize: 13, marginTop: 5, lineHeight: 1.5, maxWidth: 760 }}>
-                      {a.diff_description}. This is an extreme change ({a.dimension_label.toLowerCase()}) — it needs your sign-off before it can ship.
+                      {a.diff_description}. This is an extreme change ({changeLabel(a).toLowerCase()}) — it needs your sign-off before it can ship.
                     </div>
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1.4fr', borderTop: '1px solid var(--border)' }}>
@@ -228,8 +244,8 @@ export default function ApprovalsPage() {
           {Object.keys(decided).length > 0 ? (
             <div className="row" style={{ gap: 8, marginTop: 16, color: 'var(--text-3)', fontSize: 12.5 }}>
               <Icon name="check" size={14} />
-              {Object.entries(decided)
-                .map(([k, v]) => `${k} ${v}`)
+              {Object.values(decided)
+                .map((d) => `${d.label} ${d.verdict}`)
                 .join(' · ')}
               {' — logged to version history'}
             </div>
