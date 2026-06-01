@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cadence — Theme Explorations</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;550;600;650;680;700;730&family=Poppins:wght@500;600;700;800&display=swap" rel="stylesheet" />
+<style>
+  html, body { margin: 0; height: 100%; background: #f0eee9; }
+  * { font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+</style>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script src="cadence-themes.jsx"></script>
+<script type="text/babel" src="cadence-monitor.jsx"></script>
+
+<script type="text/babel">
+  const { useState } = React;
+  const themes = window.CADENCE_THEMES;
+  const nerdy = themes.filter(t => t.id === 'nerdy');
+  const light = themes.filter(t => t.sub.startsWith('Light'));
+  const dark = themes.filter(t => t.sub.startsWith('Dark') && t.id !== 'nerdy');
+
+  const board = (t) => (
+    <DCArtboard key={t.id} id={t.id} label={t.label + ' · ' + t.sub} width={1440} height={920}>
+      <div style={{ position: 'relative', width: '100%', height: '100%', ...t.vars }}>
+        <window.CadenceCallMonitor />
+      </div>
+    </DCArtboard>
+  );
+
+  function App() {
+    return (
+      <DesignCanvas>
+        <DCSection id="nerdy" title="Nerdy-inspired" subtitle="Built from your reference — aurora indigo, cyan gradient CTA, pink→cyan display type (Poppins)">
+          {nerdy.map(board)}
+        </DCSection>
+        <DCSection id="light" title="Light themes" subtitle="Live Call Monitor (P1) · soft SaaS shell from the seed, restyled for Cadence">
+          {light.map(board)}
+        </DCSection>
+        <DCSection id="dark" title="Dark themes" subtitle="Same screen, dark surfaces — the monitoring-room read">
+          {dark.map(board)}
+        </DCSection>
+      </DesignCanvas>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

@@ -36,3 +36,6 @@ data/
 
 # Handoff docs (context-management; per-machine, not for the repo)
 handoff/
+
+# Design handoff raw archive (extracted into docs/design/cadence-handoff/)
+auto-sales-agent.zip
