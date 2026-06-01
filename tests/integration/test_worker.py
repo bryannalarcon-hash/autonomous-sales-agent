@@ -422,3 +422,129 @@ def test_room_raw_phone_from_metadata_and_sip_attributes():
     assert w._room_raw_phone(_StubCtx(sip_room)) == "+15559998888"
     # No phone anywhere -> None (anonymous caller).
     assert w._room_raw_phone(_StubCtx(_StubRoom(metadata="{}"))) is None
+
+
+# =============================== CONSENT SEEDING FROM ROOM METADATA ==============================
+# The deadlock fix: the browser captured consent via /api/consent/respond BEFORE requesting a
+# LiveKit token, and the token stamped that consent onto the room metadata. The worker SEEDS its
+# fresh ConsentGate from that metadata (via PUBLIC gate methods) so can_converse is True from the
+# start and the brain answers — instead of blocking forever on a `pending` gate. With NO consent
+# metadata (a future direct SIP call), the gate stays fail-closed (the safety property never
+# regresses).
+
+
+def _consent_meta(state="ready", recording_granted=True, conversable=True,
+                  jurisdiction="ca", phone_hash="abc123"):
+    """Build the room-metadata JSON the token stamps + the worker reads (matches the demo helper)."""
+    return json.dumps({
+        "consent_state": state,
+        "recording_granted": recording_granted,
+        "jurisdiction": jurisdiction,
+        "phone_hash": phone_hash,
+        "conversable": conversable,
+    })
+
+
+def test_seed_gate_from_metadata_recording_granted_opens_ready():
+    """Recording granted in the captured consent -> the worker seeds the gate to READY: can_converse
+    AND can_record are True from the start (no spoken-consent deadlock; recording stays honest)."""
+    from src.voice import worker as w
+
+    gate = ConsentGate(jurisdiction="ca", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
+    seeded = w._seed_gate_from_metadata(gate, _StubCtx(_StubRoom(metadata=_consent_meta())))
+    assert seeded is True
+    assert gate.can_converse is True
+    assert gate.can_record is True
+    assert gate.recorded is True
+
+
+def test_seed_gate_from_metadata_recording_refused_opens_unrecorded():
+    """Recording refused but the call proceeds (conversable) -> the worker seeds UNRECORDED:
+    can_converse is True but can_record is False (recorded stays honest = not recording)."""
+    from src.voice import worker as w
+
+    gate = ConsentGate(jurisdiction="ca", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
+    meta = _consent_meta(state="unrecorded", recording_granted=False, conversable=True)
+    seeded = w._seed_gate_from_metadata(gate, _StubCtx(_StubRoom(metadata=meta)))
+    assert seeded is True
+    assert gate.can_converse is True
+    assert gate.can_record is False
+    assert gate.recorded is False
+
+
+def test_seed_gate_from_metadata_minor_unresolved_stays_blocked():
+    """A captured minor gate that is NOT conversable (need_parental, unresolved) -> the worker does
+    NOT open the gate: can_converse stays False (a suspected minor may not proceed unsupervised)."""
+    from src.voice import worker as w
+
+    gate = ConsentGate(jurisdiction="ca", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
+    meta = _consent_meta(state="need_parental", recording_granted=True, conversable=False)
+    w._seed_gate_from_metadata(gate, _StubCtx(_StubRoom(metadata=meta)))
+    assert gate.can_converse is False
+
+
+def test_seed_gate_from_metadata_absent_keeps_fail_closed():
+    """NO consent metadata (a future direct SIP call) -> the worker leaves the gate UNTOUCHED and
+    fail-closed: can_converse stays False so the safety property never regresses."""
+    from src.voice import worker as w
+
+    gate = ConsentGate(jurisdiction="ca", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
+    # Metadata present but carrying ONLY jurisdiction/phone (no consent_state/conversable keys).
+    meta = json.dumps({"jurisdiction": "ca", "phone": "+15551234567"})
+    seeded = w._seed_gate_from_metadata(gate, _StubCtx(_StubRoom(metadata=meta)))
+    assert seeded is False
+    assert gate.can_converse is False
+    # Truly empty/garbage metadata also leaves it gated.
+    g2 = ConsentGate(jurisdiction="ca")
+    assert w._seed_gate_from_metadata(g2, _StubCtx(_StubRoom(metadata=None))) is False
+    assert g2.can_converse is False
+
+
+async def test_seeded_gate_lets_worker_turn_proceed_and_records():
+    """END-TO-END (worker side): a gate SEEDED from `recording granted` metadata lets a worker turn
+    PROCEED — on_user_turn_completed buffers a pending turn (no ConsentError) and recorded is True.
+    This is the deadlock fix surfaced through the real WorkerVoiceAgent turn path."""
+    from src.voice import worker as w
+
+    gate = ConsentGate(jurisdiction="ca", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
+    w._seed_gate_from_metadata(gate, _StubCtx(_StubRoom(metadata=_consent_meta())))
+    agent = _make_worker_agent(consent_gate=gate)
+
+    await agent.on_user_turn_completed(None, _StubMessage("How much does it cost per month?"))
+    sid = agent._pending_speech_id
+    assert sid is not None
+    assert sid in agent.voice_session.state.pending
+    assert agent.voice_session.recorded is True
+
+
+async def test_seeded_unrecorded_gate_proceeds_but_not_recorded():
+    """A gate SEEDED from `recording refused` (conversable) metadata lets a worker turn PROCEED but
+    keeps recording honest: a pending turn buffers, yet recorded is False (nothing is recorded)."""
+    from src.voice import worker as w
+
+    gate = ConsentGate(jurisdiction="ca", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
+    meta = _consent_meta(state="unrecorded", recording_granted=False, conversable=True)
+    w._seed_gate_from_metadata(gate, _StubCtx(_StubRoom(metadata=meta)))
+    agent = _make_worker_agent(consent_gate=gate)
+
+    await agent.on_user_turn_completed(None, _StubMessage("Tell me more about tutoring."))
+    sid = agent._pending_speech_id
+    assert sid is not None and sid in agent.voice_session.state.pending
+    assert agent.voice_session.recorded is False
+
+
+async def test_unseeded_gate_keeps_worker_fail_closed():
+    """FAIL-CLOSED preserved: with NO consent metadata the gate stays `pending`, so the worker turn
+    raises ConsentError and the brain never runs / nothing is buffered (no regression of the safety
+    property for a future direct SIP call)."""
+    from src.voice import worker as w
+
+    gate = ConsentGate(jurisdiction="ca", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
+    # No consent metadata -> seeding is a no-op, gate stays pending.
+    assert w._seed_gate_from_metadata(gate, _StubCtx(_StubRoom(metadata=None))) is False
+    agent = _make_worker_agent(consent_gate=gate)
+
+    with pytest.raises(ConsentError):
+        await agent.voice_session.handle_user_turn("How much does it cost?", "pre-consent")
+    assert agent.voice_session.state.pending == {}
+    assert agent.voice_session.recorded is False

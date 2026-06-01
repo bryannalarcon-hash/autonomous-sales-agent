@@ -336,7 +336,8 @@ def test_livekit_token_minted_with_creds(monkeypatch):
 
     seen: dict[str, str] = {}
 
-    def fake_builder(api_key: str, api_secret: str, identity: str, room: str) -> str:
+    def fake_builder(api_key: str, api_secret: str, identity: str, room: str,
+                     room_metadata: Optional[str] = None) -> str:
         seen.update(api_key=api_key, api_secret=api_secret, identity=identity, room=room)
         return "fake.jwt.token"  # never embeds the secret
 
@@ -360,6 +361,102 @@ def test_livekit_token_minted_with_creds(monkeypatch):
     assert seen["api_secret"] == "devsecret_value_should_never_appear"
     # ... but the raw secret never appears in the response body.
     assert "devsecret_value_should_never_appear" not in json.dumps(payload)
+
+
+def test_consent_room_metadata_helper_shape():
+    """The pure helper builds the small consent JSON the LiveKit room carries (no secrets): the
+    gate's consent_state, recording_granted, jurisdiction, phone_hash, and conversable — exactly the
+    shape the worker seeds its gate from. A None phone_hash stays null (anonymous caller)."""
+    from src.api.demo_routes import _consent_room_metadata
+    from src.voice.consent import ConsentGate, RefusalPolicy
+
+    gate = ConsentGate(jurisdiction="CA", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
+    gate.grant_recording()  # -> ready, recording granted
+    raw = _consent_room_metadata(gate, phone_hash_value="abc123")
+    meta = json.loads(raw)
+    assert meta == {
+        "consent_state": "ready",
+        "recording_granted": True,
+        "jurisdiction": "CA",
+        "phone_hash": "abc123",
+        "conversable": True,
+    }
+
+    # Refused recording but proceeding -> conversable True, recording_granted False (honest).
+    g2 = ConsentGate(jurisdiction="TX", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
+    g2.refuse_recording()  # -> unrecorded
+    m2 = json.loads(_consent_room_metadata(g2, phone_hash_value=None))
+    assert m2["consent_state"] == "unrecorded"
+    assert m2["recording_granted"] is False
+    assert m2["conversable"] is True
+    assert m2["phone_hash"] is None
+
+
+def test_livekit_token_carries_consent_metadata_into_room(monkeypatch):
+    """The token endpoint hands the INJECTED builder the already-captured consent as room metadata
+    (the JSON the worker reads from ctx.room.metadata to seed its gate). The metadata reflects the
+    granted-recording consent and binds the caller's phone-hash; no secret leaks into it."""
+    monkeypatch.setenv("LIVEKIT_API_KEY", "devkey")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "devsecret_value_should_never_appear")
+    monkeypatch.setenv("LIVEKIT_URL", "wss://example.livekit.cloud")
+
+    seen: dict[str, Any] = {}
+
+    def fake_builder(api_key, api_secret, identity, room, room_metadata=None):
+        seen.update(room=room, room_metadata=room_metadata)
+        return "fake.jwt.token"
+
+    app = create_app(
+        llm_client_factory=lambda: _agent_mock(), token_builder=fake_builder, live_rag=False
+    )
+    client = TestClient(app)
+    body = _start(client, jurisdiction="CA")
+    sid = body["session_id"]
+    h = phone_hash("+15551234567")
+    client.post("/api/consent/respond", json={
+        "session_id": sid, "ai_acknowledged": True, "recording_consent": True, "phone_hash": h,
+    })
+    r = client.post("/api/livekit/token", json={"session_id": sid, "identity": "caller"})
+    assert r.status_code == 200, r.text
+
+    # The builder received the consent metadata the worker will read off the room.
+    meta = json.loads(seen["room_metadata"])
+    assert meta["consent_state"] == "ready"
+    assert meta["recording_granted"] is True
+    assert meta["conversable"] is True
+    assert meta["jurisdiction"] == "CA"
+    assert meta["phone_hash"] == h
+    # No secret ever rides along in the metadata.
+    assert "devsecret_value_should_never_appear" not in seen["room_metadata"]
+
+
+def test_livekit_token_metadata_reflects_recording_refusal(monkeypatch):
+    """When recording was REFUSED but the call proceeds, the carried metadata says conversable=True
+    with recording_granted=False — so the worker seeds UNRECORDED (proceeds but does not record)."""
+    monkeypatch.setenv("LIVEKIT_API_KEY", "devkey")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "secret_xxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    monkeypatch.setenv("LIVEKIT_URL", "wss://example.livekit.cloud")
+
+    seen: dict[str, Any] = {}
+
+    def fake_builder(api_key, api_secret, identity, room, room_metadata=None):
+        seen["room_metadata"] = room_metadata
+        return "fake.jwt.token"
+
+    app = create_app(
+        llm_client_factory=lambda: _agent_mock(), token_builder=fake_builder, live_rag=False
+    )
+    client = TestClient(app)
+    sid = _start(client, jurisdiction="CA")["session_id"]
+    client.post("/api/consent/respond", json={
+        "session_id": sid, "ai_acknowledged": True, "recording_consent": False,
+    })
+    r = client.post("/api/livekit/token", json={"session_id": sid, "identity": "caller"})
+    assert r.status_code == 200, r.text
+    meta = json.loads(seen["room_metadata"])
+    assert meta["consent_state"] == "unrecorded"
+    assert meta["recording_granted"] is False
+    assert meta["conversable"] is True
 
 
 def test_text_channel_one_party_jurisdiction_consent_flow():

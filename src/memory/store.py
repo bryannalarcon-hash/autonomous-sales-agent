@@ -456,21 +456,23 @@ async def get_escalation(escalation_id: str) -> Optional[EscalationLog]:
 async def list_escalations(
     *, lifecycle: Optional[str] = None, limit: int = 100
 ) -> list[EscalationLog]:
-    """Read the escalation review queue (oldest first), optionally filtered by lifecycle.
+    """Read the escalation review queue (NEWEST first), optionally filtered by lifecycle.
 
     The dashboard escalation queue (P5) reads this: pass lifecycle="unreviewed" for the pending items
-    an operator still has to triage. Ordered created_at ASC so the queue is FIFO; `limit` caps the page.
+    an operator still has to triage. Ordered created_at DESC + `limit` so the MOST RECENT escalations
+    always surface — with ASC, a backlog larger than `limit` would hide every new escalation behind the
+    oldest ones (a new item could never appear until the queue drained). Page back for older items.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         if lifecycle is None:
             rows = await conn.fetch(
-                "SELECT * FROM escalation_log ORDER BY created_at ASC LIMIT $1", limit
+                "SELECT * FROM escalation_log ORDER BY created_at DESC LIMIT $1", limit
             )
         else:
             rows = await conn.fetch(
                 "SELECT * FROM escalation_log WHERE lifecycle = $1 "
-                "ORDER BY created_at ASC LIMIT $2",
+                "ORDER BY created_at DESC LIMIT $2",
                 lifecycle,
                 limit,
             )

@@ -6,13 +6,17 @@
 # is_minor flag, R40); /api/chat (GATED 409 by consent) runs one brain turn via VoiceSession — it
 # detect_minors the user text first (a self-reported minor flips need_parental -> 409), buffers/persists
 # an escalation with a PII-scrubbed moment, and reports `done` for terminal acts; /api/livekit/token
-# (503 without creds) mints a token via the injected builder; /api/session/{id}/end persists the
+# (503 without creds) mints a token via the injected builder AND stamps the already-captured consent
+# onto the room metadata (consent_state/recording_granted/jurisdiction/phone_hash/conversable — no
+# secrets) so the live voice worker SEEDS its ConsentGate from it instead of deadlocking on a pending
+# gate waiting for spoken consent; /api/session/{id}/end persists the
 # Episode (+escalations+lead) FK-safely and EVICTS the session from the bounded LRU store (503 over
 # cap); GET /api/session/{id} + /api/health are introspection. Everything network/DB-bound is injected
 # from create_app (LLM factory, embedder, retrieve/hydrate/escalation/call-end hooks, token builder) so
 # tests run offline. PII is scrubbed in the VoiceSession before storage; the lead key is the phone-hash.
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from collections import OrderedDict
@@ -33,8 +37,11 @@ from src.voice.session import ConsentError, RetrieveHook, VoiceSession
 LLMClientFactory = Callable[[], LLMClient]
 # Optional lookup: phone_hash -> a stored sticky voice (U6 hydrate). Returns None for a new caller.
 LeadVoiceLookup = Callable[[str], Optional[str]]
-# Builds a LiveKit access token: (api_key, api_secret, identity, room) -> jwt str.
-TokenBuilder = Callable[[str, str, str, str], str]
+# Builds a LiveKit access token: (api_key, api_secret, identity, room, room_metadata?) -> jwt str.
+# room_metadata is an optional small JSON string stamped onto the room (carries the already-captured
+# consent for the worker to seed its gate; NEVER secrets). The builder accepts it as a keyword so an
+# existing 4-arg builder still type-checks; the default impl ignores None.
+TokenBuilder = Callable[..., str]
 # Optional cross-call hydration: (raw_phone | phone_hash, config) -> a seeded BeliefState (U6).
 HydrateHook = Callable[..., Awaitable[Any]]
 # Optional escalation persist: (EscalationLog) -> awaitable (the U14 review-queue write).
@@ -141,6 +148,25 @@ _OK_STATE_MESSAGES = {
     "pending": "Awaiting consent.",
     "ai_disclosed": "AI disclosure acknowledged; awaiting recording consent.",
 }
+
+
+def _consent_room_metadata(gate: ConsentGate, *, phone_hash_value: Optional[str]) -> str:
+    """Serialize the already-captured consent into the small JSON the LiveKit room carries (no
+    secrets), so the live voice worker can SEED its fresh ConsentGate from it instead of deadlocking
+    on a pending gate waiting for spoken consent (the U13 deadlock fix).
+
+    Shape (read by src.voice.worker._seed_gate_from_metadata): consent_state (the gate's state),
+    recording_granted (bool — only True when recording was actually granted, so recording stays
+    honest), jurisdiction (tunes the worker's disclosure emphasis), phone_hash (the lead key, a HASH
+    not the raw phone — R42), and conversable (whether the brain may proceed). NEVER includes the
+    LiveKit creds or any secret — only consent facts the worker needs to open its gate."""
+    return json.dumps({
+        "consent_state": gate.state,
+        "recording_granted": gate.can_record,
+        "jurisdiction": gate.jurisdiction,
+        "phone_hash": phone_hash_value,
+        "conversable": gate.can_converse,
+    })
 
 
 def create_demo_router(
@@ -399,7 +425,13 @@ def create_demo_router(
                 detail="LiveKit not configured (set LIVEKIT_API_KEY / LIVEKIT_API_SECRET / LIVEKIT_URL).",
             )
         room = f"demo-{req.session_id}"
-        token = build_token(api_key, api_secret, req.identity, room)
+        # Stamp the ALREADY-captured consent onto the room metadata so the voice worker seeds its
+        # ConsentGate from it (no spoken-consent deadlock). The browser captured consent via
+        # /api/consent/respond before this call, so sess.gate already reflects it. No secrets ride
+        # along — only consent facts (R33/R41/R42). The builder applies it via the LiveKit token's
+        # room-config metadata, which LiveKit stamps on the room the worker reads.
+        room_metadata = _consent_room_metadata(sess.gate, phone_hash_value=sess.phone_hash)
+        token = build_token(api_key, api_secret, req.identity, room, room_metadata=room_metadata)
         return TokenResponse(token=token, url=url, room=room)
 
     # --- POST /api/session/{session_id}/end (persist the finished call + evict) -----------------

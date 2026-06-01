@@ -216,10 +216,17 @@ def create_app(
     return app
 
 
-def _build_livekit_token(api_key: str, api_secret: str, identity: str, room: str) -> str:
+def _build_livekit_token(api_key: str, api_secret: str, identity: str, room: str,
+                         room_metadata: Optional[str] = None) -> str:
     """Build a LiveKit access token from creds (never logged / printed). Imports livekit.api lazily so
     the API module imports cleanly even when livekit is not installed (the token path is the only place
-    that needs it, and it is already guarded by the 503 in the demo router when creds are absent)."""
+    that needs it, and it is already guarded by the 503 in the demo router when creds are absent).
+
+    When `room_metadata` is given (the already-captured consent JSON the voice worker seeds its gate
+    from — never secrets), it is attached via the token's room-config metadata (RoomConfiguration):
+    LiveKit stamps that metadata onto the room when the room is created from this token, so the worker
+    reads it off ctx.room.metadata and opens its ConsentGate (the U13 deadlock fix). A None metadata
+    keeps the prior plain-token behavior."""
     from livekit import api as lk_api
 
     grants = lk_api.VideoGrants(room_join=True, room=room)
@@ -229,6 +236,9 @@ def _build_livekit_token(api_key: str, api_secret: str, identity: str, room: str
         .with_name(identity)
         .with_grants(grants)
     )
+    if room_metadata:
+        # Carry consent on the room config so it lands on ctx.room.metadata for the worker to seed.
+        token = token.with_room_config(lk_api.RoomConfiguration(metadata=room_metadata))
     return token.to_jwt()
 
 

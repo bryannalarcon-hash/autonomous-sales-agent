@@ -8,8 +8,12 @@
 # COMPLIANCE (U13/R33/R40/R41): the entrypoint builds a ConsentGate (jurisdiction from room metadata,
 # RefusalPolicy from env), threads it into the VoiceSession via build_voice_agent (so every turn is
 # gated by VoiceSession._require_consent EXACTLY like /api/chat), and SPEAKS the AI+recording
-# disclosure BEFORE the brain answers — a not-yet-can_converse turn raises ConsentError and is never
-# recorded. PERSISTENCE (U2/U15): at room close the finished VoiceSession is saved via
+# disclosure. It SEEDS that gate from the consent the BROWSER already captured + carried on the room
+# metadata (_seed_gate_from_metadata): recording granted -> ready, refused-but-proceeding ->
+# unrecorded, unresolved minor -> stays blocked — so can_converse is True from the first turn and the
+# brain answers (the U13 deadlock fix). With NO consent metadata (a future direct SIP call) the gate
+# stays `pending`, so a turn raises ConsentError and is never recorded — fail-closed is preserved.
+# PERSISTENCE (U2/U15): at room close the finished VoiceSession is saved via
 # src.api.persistence.persist_call_end (channel="voice") with the bound phone-hash, any escalations
 # captured DURING the call, and the last close tier — so voice calls flow into /operate exactly like
 # text calls.
@@ -39,7 +43,7 @@ from src.kb.embeddings import SentenceTransformerEmbedder
 from src.kb.live import build_live_retrieve_hook
 from src.memory.schema import phone_hash as compute_phone_hash
 from src.voice.agent import AGENT_MODEL, STT_MODEL_ID, build_voice_agent
-from src.voice.consent import ConsentGate, RefusalPolicy
+from src.voice.consent import NEED_PARENTAL, ConsentGate, RefusalPolicy
 from src.voice.session import VoiceSession
 
 # --- Import guard for the livekit-agents CORE -----------------------------------------------------
@@ -247,6 +251,52 @@ def _room_raw_phone(ctx: Any) -> Optional[str]:
     return None
 
 
+def _seed_gate_from_metadata(gate: ConsentGate, ctx: Any) -> bool:
+    """Seed a FRESH worker ConsentGate from the consent the BROWSER already captured (the U13 deadlock
+    fix). Returns True if consent metadata was present + applied, False if none was found.
+
+    The /api/livekit/token route stamps the already-captured consent onto the room metadata (shape:
+    consent_state/recording_granted/jurisdiction/phone_hash/conversable — see
+    src.api.demo_routes._consent_room_metadata). Here we drive the worker's gate to the SAME outcome
+    using ONLY public ConsentGate transitions (never private fields): acknowledge the AI disclosure,
+    then GRANT recording (-> ready, can_record) when it was granted, else REFUSE (-> unrecorded:
+    conversable but NOT recorded — recording stays honest). A captured-but-not-conversable consent
+    (e.g. an unresolved suspected minor -> need_parental) is mirrored with flag_minor() so the gate
+    stays BLOCKED. When NO consent metadata is present (a future direct SIP call), we DO NOTHING and
+    return False — the gate stays `pending` and the worker keeps its fail-closed behavior, so the
+    safety property never regresses.
+
+    We treat metadata as "consent metadata" only when it carries the consent keys (consent_state /
+    conversable / recording_granted); a metadata blob that only carries jurisdiction/phone (the SIP
+    shape) is NOT treated as captured consent."""
+    meta = _room_metadata(ctx)
+    has_consent_keys = any(k in meta for k in ("consent_state", "conversable", "recording_granted"))
+    if not has_consent_keys:
+        return False
+
+    conversable = bool(meta.get("conversable"))
+    recording_granted = bool(meta.get("recording_granted"))
+    consent_state = str(meta.get("consent_state") or "")
+
+    # Always acknowledge the AI disclosure the browser already surfaced (idempotent, harmless).
+    gate.acknowledge_ai()
+
+    if conversable:
+        # The browser captured consent AND the call may proceed: open the gate to the matching
+        # state. Recording granted -> ready (can_record); refused-but-proceeding -> unrecorded.
+        if recording_granted:
+            gate.grant_recording()
+        else:
+            gate.refuse_recording()
+    elif consent_state == NEED_PARENTAL:
+        # A suspected minor was flagged and parental consent is UNRESOLVED: keep the gate BLOCKED
+        # (need_parental) — a minor may not proceed unsupervised. flag_minor() drives it there.
+        gate.flag_minor()
+    # else: consent metadata present but not conversable and not a minor gate (e.g. ended) -> leave
+    # the gate as-is (pending/blocked); the worker stays fail-closed for that turn.
+    return True
+
+
 def _wire_commit_on_speech(session: Any, agent: WorkerVoiceAgent, config: AgentConfig) -> None:
     """Gate commit-vs-discard on the agent's TTS playout (the only path that writes session state).
 
@@ -400,8 +450,15 @@ async def entrypoint(ctx: Any) -> None:  # pragma: no cover - requires live live
         except ValueError:
             phone_hash_value = None
     gate = ConsentGate(jurisdiction=jurisdiction, refusal_policy=_REFUSAL_POLICY)
-    logger.info("consent gate: jurisdiction=%r mode=%s phone_bound=%s",
-                jurisdiction, gate.mode, phone_hash_value is not None)
+    # SEED the gate from the consent the BROWSER already captured + carried on the room metadata (the
+    # U13 deadlock fix): if present, the gate opens to ready/unrecorded (or stays blocked for an
+    # unresolved minor) so can_converse is True from the first turn and the brain answers — no
+    # waiting forever for spoken consent. If NO consent metadata is present (a future direct SIP
+    # call), the gate stays `pending` and the worker keeps its fail-closed behavior.
+    seeded = _seed_gate_from_metadata(gate, ctx)
+    logger.info("consent gate: jurisdiction=%r mode=%s phone_bound=%s seeded=%s state=%s can_converse=%s",
+                jurisdiction, gate.mode, phone_hash_value is not None, seeded, gate.state,
+                gate.can_converse)
 
     agent = _build_brain(config, consent_gate=gate, lead_phone_hash=phone_hash_value)
 
@@ -435,10 +492,13 @@ async def entrypoint(ctx: Any) -> None:  # pragma: no cover - requires live live
 
     try:
         await session.start(agent=agent, room=ctx.room)
-        # DISCLOSURE BEFORE the brain answers (R33): the opening turn states the AI + recording
-        # disclosure. The gate is still `pending` (not can_converse), so any user turn raises
-        # ConsentError until recording consent is captured (recording granted -> ready, refused ->
-        # unrecorded per policy). Spoken consent capture is part of the MANUAL audio check.
+        # DISCLOSURE BEFORE the brain answers (R33): the opening turn re-states the AI + recording
+        # disclosure (good practice — the caller hears it on the call too). When the gate was SEEDED
+        # from the browser-captured consent it is ALREADY can_converse, so the first user turn flows
+        # straight to the brain (no deadlock). When NO consent metadata was carried (a future direct
+        # SIP call) the gate stays `pending`, so a user turn raises ConsentError until recording
+        # consent is captured (recording granted -> ready, refused -> unrecorded per policy) —
+        # fail-closed is preserved. Spoken consent capture for that SIP path is a MANUAL audio check.
         await session.say(gate.disclosure_text, allow_interruptions=True)
         logger.info("voice session started + disclosure spoken for room %r (version=%s kb_version=%s)",
                     ctx.room.name, stamp.get("version"), stamp.get("kb_version"))
