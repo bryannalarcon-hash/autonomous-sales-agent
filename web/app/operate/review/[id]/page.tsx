@@ -3,10 +3,12 @@
 // clicking a turn selects it. Right: the BELIEF-TRAJECTORY replay — a scrubber over the turns with
 // tick marks at key decision turns, and a belief snapshot (Trust + Walk-away risk gauges, stage +
 // the selected turn's decision, slot mini-table) that reflects the NEAREST belief snapshot at/below
-// the selected turn. Drives entirely off the recorded per-turn belief log (/api/episodes/{id}); all
-// labels are pre-translated by the backend (no driver slug / internal index renders). A 0-turn /
-// still-connecting episode renders a graceful empty state (with a link to the live monitor) rather
-// than a blank transcript + dash belief.
+// the selected turn. Drives entirely off the recorded per-turn belief log (/api/episodes/{id}).
+// Belief/stage/decision labels are pre-translated by the backend; the raw persona archetype + version
+// slugs are humanized client-side via @/lib/labels (archetypeLabel/versionLabel) and the raw episode
+// id is muted/secondary (never the headline) — no internal index renders as an operator-facing label.
+// A 0-turn / still-connecting episode renders a graceful empty state (with a link to the live monitor)
+// rather than a blank transcript + dash belief.
 'use client';
 
 import { useMemo, useState } from 'react';
@@ -14,6 +16,7 @@ import { useEffect } from 'react';
 import { Icon } from '@/components/cadence/Icon';
 import { Ring } from '@/components/cadence/Spark';
 import { fetchEpisode, fmtDuration } from '@/lib/operate-api';
+import { archetypeLabel, versionLabel } from '@/lib/labels';
 import type { BeliefSnapshot, EpisodeDetail } from '@/lib/operate-types';
 
 function driverValue(b: BeliefSnapshot | null, key: string): number | null {
@@ -125,9 +128,12 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
         <div className="rv-strip">
           <div className="rv-av">{ep.episode_id.replace(/[^0-9]/g, '').slice(-2) || 'CA'}</div>
           <div>
-            <div className="rv-name">{ep.episode_id}</div>
-            <div className="rv-co">
-              {(ep.persona ?? 'Unknown archetype')} · {ep.cohort ?? '—'}
+            {/* Lead with the humanized archetype as the title; the raw episode id is an internal
+                index, demoted to a muted mono secondary line. The cohort id (`coh-…`) has no human
+                form so it's dropped — only the outcome accompanies the archetype here. */}
+            <div className="rv-name">{ep.persona ? archetypeLabel(ep.persona) : 'Unknown archetype'} · {ep.outcome}</div>
+            <div className="rv-co mono" style={{ opacity: 0.7 }}>
+              #{ep.episode_id}
             </div>
           </div>
           <div className="rv-stat">
@@ -147,7 +153,7 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
           <div className="rv-stat">
             <div className="l">Version</div>
             <div className="v">
-              {ep.version} · {ep.kb_version}
+              {versionLabel(ep.version)} · {ep.kb_version}
             </div>
           </div>
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 9 }}>

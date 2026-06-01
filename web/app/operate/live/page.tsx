@@ -5,8 +5,10 @@
 // drivers are the secondary "Full belief state" expander below. No realtime infra — it polls
 // /api/live every few seconds and shows the most-recent call, with a clear "no active call" empty
 // state AND a "Connecting…" state for an active call that has no turns yet (so a just-started call
-// never renders as a wall of dashes). All operator-facing text uses the backend's pre-translated
-// labels (no driver slug / P-id). N3 FIX: every "LIVE" affordance (transcript-card pill, footer
+// never renders as a wall of dashes). Belief/stage/act labels are pre-translated by the backend; the
+// raw persona archetype + version slugs are humanized client-side via @/lib/labels (archetypeLabel/
+// versionLabel) and the raw cohort id (`coh-…`) is dropped — no internal index reaches the operator.
+// N3 FIX: every "LIVE" affordance (transcript-card pill, footer
 // recording dot, and the shell top-title pill the layout renders statically) is now gated on the
 // REAL snap.active flag — when a COMPLETED call is shown (active:false) the surface reads "Most
 // recent call" with no live/recording treatment, instead of contradicting the not-live footer.
@@ -16,6 +18,7 @@ import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchLive, fmtDuration, initials } from '@/lib/operate-api';
+import { archetypeLabel, versionLabel } from '@/lib/labels';
 import type { BeliefSnapshot, LiveSnapshot, Turn } from '@/lib/operate-types';
 
 const POLL_MS = 5000;
@@ -275,15 +278,16 @@ export default function LivePage() {
               <div className="lv-pname">{ep.episode_id}</div>
               <div className="lv-pco">{ep.channel === 'voice' ? 'Web-voice' : 'Text'}</div>
               <div className="row gap6" style={{ marginTop: 8 }}>
-                {ep.persona ? <span className="tag accent">{ep.persona}</span> : null}
-                {ep.cohort ? <span className="tag">{ep.cohort}</span> : null}
+                {/* Humanize the persona archetype; the raw cohort id (`coh-…`) is an internal grouping
+                    index with no human label, so it's dropped from the operator-facing chips. */}
+                {ep.persona ? <span className="tag accent">{archetypeLabel(ep.persona)}</span> : null}
                 <span className="tag">{ep.channel === 'voice' ? 'Web-voice' : 'Text'}</span>
               </div>
             </div>
             <div className="lv-pright">
               <div className="lv-dur">{fmtDuration((ep.metrics?.duration_ms as number) ?? null)}</div>
               <div className="lv-vtag">
-                {ep.version} · {ep.kb_version}
+                {versionLabel(ep.version)} · {ep.kb_version}
               </div>
             </div>
           </div>

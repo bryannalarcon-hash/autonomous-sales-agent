@@ -5,14 +5,17 @@
 // the API call — the key is never shown), plus an "Escalated only" toggle and a free-text search
 // over the call id. The table shows call id, outcome (dot-tag), ladder tier (labeled), duration,
 // version and when; a row click opens a right-side drawer with the call's facts + "Belief at close"
-// and a primary "Open full call review" link to /operate/review/{id}. All semantic labels come
-// pre-translated from the backend.
+// and a primary "Open full call review" link to /operate/review/{id}. Outcome/ladder labels are
+// pre-translated by the backend; the raw persona archetype + version slugs are humanized client-side
+// via @/lib/labels (archetypeLabel/versionLabel), and the raw call id is muted/secondary — never a
+// headline (internal indices must not render as operator-facing labels).
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchEpisodes, fmtDuration, fmtTimeAgo } from '@/lib/operate-api';
+import { archetypeLabel, versionLabel } from '@/lib/labels';
 import type { EpisodeSummary } from '@/lib/operate-types';
 
 // Outcome filter options: the displayed label + the internal key it maps to ('' = no filter).
@@ -58,9 +61,13 @@ function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
         <div className="card-head" style={{ background: 'transparent' }}>
           <div className="avatar">{c.episode_id.replace(/[^0-9]/g, '').slice(-2) || 'CA'}</div>
           <div className="grow">
-            <div className="b" style={{ fontSize: 15, fontFamily: 'var(--font-display)' }}>{c.episode_id}</div>
-            <div className="muted" style={{ fontSize: 12 }}>
-              {(c.persona ?? 'Unknown archetype')} · {c.cohort ?? '—'}
+            {/* Lead with the humanized archetype (+ outcome) as the primary label; the raw call id is
+                an internal index, so it's demoted to a muted mono secondary line (never the headline). */}
+            <div className="b" style={{ fontSize: 15, fontFamily: 'var(--font-display)' }}>
+              {c.persona ? archetypeLabel(c.persona) : 'Unknown archetype'} · {c.outcome}
+            </div>
+            <div className="muted mono" style={{ fontSize: 11.5 }}>
+              #{c.episode_id}
             </div>
           </div>
           <button className="gctl" onClick={onClose} style={{ width: 36, padding: 0, justifyContent: 'center' }}>
@@ -77,7 +84,7 @@ function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
             </span>
             <span className="tag">{c.ladder_label}</span>
             <span className="tag accent">
-              {c.version} · {c.kb_version}
+              {versionLabel(c.version)} · {c.kb_version}
             </span>
             <span className="tag">{c.channel === 'voice' ? 'Web-voice' : c.channel}</span>
             {c.escalated ? (
@@ -226,12 +233,18 @@ export default function CallsPage() {
                   {visible.map((c) => (
                     <tr key={c.episode_id} onClick={() => setSel(c)}>
                       <td>
-                        <span className="mono" style={{ fontSize: 12, color: 'var(--text-2)' }}>
+                        {/* The Call cell leads with the humanized archetype as the primary label; the raw
+                            call id is an internal index, demoted to a muted mono secondary line (not the
+                            headline). The Archetype column repeats the human label as a filterable tag. */}
+                        <div className="b" style={{ fontSize: 13 }}>
+                          {c.persona ? archetypeLabel(c.persona) : 'Unknown archetype'}
+                        </div>
+                        <span className="mono muted" style={{ fontSize: 11 }}>
                           #{c.episode_id}
                         </span>
                       </td>
                       <td>
-                        <span className="tag">{c.persona ?? 'Unknown'}</span>
+                        <span className="tag">{c.persona ? archetypeLabel(c.persona) : 'Unknown'}</span>
                       </td>
                       <td>
                         <span className={`tag dot ${outcomeClass(c.outcome_key)}`}>{c.outcome}</span>
@@ -241,7 +254,7 @@ export default function CallsPage() {
                       </td>
                       <td className="num mono" style={{ fontSize: 12.5 }}>{fmtDuration(c.duration_ms)}</td>
                       <td>
-                        <span className="tag accent">{c.version}</span>
+                        <span className="tag accent">{versionLabel(c.version)}</span>
                       </td>
                       <td className="num muted" style={{ fontSize: 12 }}>{fmtTimeAgo(c.created_at)}</td>
                     </tr>

@@ -5,10 +5,12 @@
 // badge per destination and maps 1:1 to App Router paths. Active nav state derives from the pathname
 // (the Call Review detail keeps "Calls" highlighted). Operator-facing titles are human-readable —
 // NO internal P-id ever renders.
-// The top bar carries the champion-version chip (REAL champion + kb_version from /api/versions, hash
-// suffix stripped — never a fabricated id), the persona chip (the REAL agent persona from config —
-// "Alex", warm-consultative), and the Sandbox/Live environment toggle (local UI state). Pure chrome:
-// pages render as {children} inside .main.
+// The top bar carries the champion-version chip (REAL champion version humanized + kb_version from
+// /api/versions, BOTH with their internal `__…`/`-hash` suffix stripped via versionLabel/kbVersionTag
+// — never a raw index or fabricated id), the persona chip (the REAL agent persona from config —
+// "Alex", warm-consultative), and the Sandbox/Live environment toggle (local UI state). The KB nav
+// entry's title reads "KB / Playbook" (no "Editor") since that page is read-only. Pure chrome: pages
+// render as {children} inside .main.
 'use client';
 
 import Link from 'next/link';
@@ -36,6 +38,13 @@ function versionLabel(raw: string): string {
   return base;
 }
 
+// The kb-version tag (e.g. "kb_v0") is an acceptable small version chip, but must render CLEANLY —
+// strip any internal `__…`/`-hash` suffix so no raw index leaks (it's not humanized like a champion
+// version, just trimmed). "kb_v0__playbooks__7" / "kb_v0-9c1f" -> "kb_v0".
+function kbVersionTag(raw: string): string {
+  return raw.split('__')[0].split('-')[0];
+}
+
 interface NavDest {
   href: string; // the App Router path the rail item navigates to (1:1 with a page)
   label: string; // operator-facing rail label
@@ -60,7 +69,8 @@ const NAV: NavDest[] = [
   // badges) keys off these entries unchanged.
   { href: '/improve/lab', label: 'Experiment Lab', title: 'Experiment Lab', icon: 'flask', group: 'improve' },
   { href: '/improve/approvals', label: 'Approvals', title: 'Approval Queue', icon: 'badge', group: 'improve', amber: true },
-  { href: '/improve/kb', label: 'KB / Playbook', title: 'KB / Playbook Editor', icon: 'book', group: 'improve' },
+  // m4 FIX: the KB page is read-only, so the top-bar title drops "Editor" (label was already "KB / Playbook").
+  { href: '/improve/kb', label: 'KB / Playbook', title: 'KB / Playbook', icon: 'book', group: 'improve' },
   { href: '/improve/versions', label: 'Versions', title: 'Version History', icon: 'branch', group: 'improve' },
 ];
 
@@ -135,7 +145,7 @@ function GlobalControls() {
         <span>
           Champion {champion ? <b>{versionLabel(champion.version)}</b> : <b>—</b>}
         </span>
-        {champion ? <span className="muted">{champion.kbVersion}</span> : null}
+        {champion ? <span className="muted">{kbVersionTag(champion.kbVersion)}</span> : null}
         <Icon name="chevDown" className="gctl-chev" />
       </Link>
       <div className="gctl" title="Active agent persona / voice">
