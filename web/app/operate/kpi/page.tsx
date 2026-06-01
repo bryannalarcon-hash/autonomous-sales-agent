@@ -13,19 +13,20 @@
 // is at 0% (enrollment is genuinely rare for the seeded champion), leads with the meaningful NON-zero
 // signal — the commitment-reached rate (ladder tier >= 2) — so it's informative, not a wall of 0%.
 //
-// The version selector is populated from REAL data: /api/versions (lineage) plus the cohort the
-// episodes are actually tagged with, and it DEFAULTS to a version that has episodes so numbers show
-// on first load (no more hardcoded v10/v11/v12 placeholders that matched nothing). Hash suffixes on
-// raw version ids are an internal index and are NOT rendered — the selector shows a clean label. The
-// COMPARE baseline is derived empirically (probe candidate versions' episode counts, pick the most-
-// populated non-selected one) so the baseline arm has real n instead of a misleading "0 / N".
+// The version selector is populated ONLY with versions that ACTUALLY have episodes: a page of
+// episodes is fetched and their `version` tags are grouped by operator label (deriveVersionOptions),
+// so every option resolves to real calls — NOT the /api/versions lineage ids ("v1-0dbf7bff"), which
+// tag zero episodes and would render "No calls for this selection". It DEFAULTS to champion_v0 (the
+// only always-populated cohort). Hash suffixes on raw ids are an internal index and are NOT rendered.
+// The COMPARE baseline reuses that same small, episode-volume-ordered option set and probes AT MOST 2
+// of the most-populated non-selected candidates (not every vA-*/vB-* — which was a ~134-request
+// storm), so entering Compare costs a handful of requests and still yields a baseline with real n.
 'use client';
 
 import { useEffect, useState } from 'react';
 import { Icon } from '@/components/cadence/Icon';
 import { Spark } from '@/components/cadence/Spark';
 import { fetchKpis, fetchEpisodes } from '@/lib/operate-api';
-import { fetchVersions } from '@/lib/improve-api';
 import type { KpiResponse } from '@/lib/operate-types';
 import { archetypeLabel, versionLabel } from '@/lib/labels';
 
@@ -65,8 +66,39 @@ function isProspectArchetype(label: string): boolean {
 // One selectable version: the raw id sent to the API + the operator-facing label. The hash suffix on
 // a raw id (e.g. "v1-f3798d7a") is an internal index, so the label strips it; the champion is marked.
 interface VersionOption {
-  value: string; // raw version id passed to /api/kpis
+  value: string; // raw version id passed to /api/kpis (a representative that HAS episodes)
   label: string; // human-readable label shown in the dropdown (no internal hash)
+  count: number; // # episodes under this label (used to order + pick a compare baseline)
+}
+
+// Derive the selectable version set from versions episodes are ACTUALLY tagged with — NOT the
+// /api/versions lineage (its ids like "v1-0dbf7bff" tag zero episodes, so they'd be dead-end options).
+// Episodes are tagged "champion_v0" / "vA-<hash>" / "vB-<hash>" etc.; many raw ids collapse to one
+// operator label via versionLabel ("vA-…"→"vA"). We group by that label, pick the MOST-populated raw
+// id per label as the value (so /api/kpis?version=<value> always returns n>0), and carry the total
+// episode count under the label for ordering + cheap baseline selection. Result: a handful of options,
+// every one of which yields calls (no "No calls for this selection"), ordered by real volume.
+function deriveVersionOptions(versions: string[]): VersionOption[] {
+  const byLabel = new Map<string, { value: string; valueCount: number; total: number }>();
+  const rawCounts = new Map<string, number>();
+  for (const v of versions) if (v) rawCounts.set(v, (rawCounts.get(v) ?? 0) + 1);
+  for (const [raw, c] of rawCounts) {
+    const label = versionLabel(raw);
+    const cur = byLabel.get(label);
+    if (!cur) {
+      byLabel.set(label, { value: raw, valueCount: c, total: c });
+    } else {
+      cur.total += c;
+      // Keep the most-populated raw id as the representative (its own /api/kpis n is guaranteed > 0).
+      if (c > cur.valueCount) {
+        cur.value = raw;
+        cur.valueCount = c;
+      }
+    }
+  }
+  return [...byLabel.entries()]
+    .map(([label, e]) => ({ value: e.value, label, count: e.total }))
+    .sort((a, b) => b.count - a.count);
 }
 
 // versionLabel (strip the `__…__` experiment suffix + short `-hash`, humanize "champion_v0" ->
@@ -109,84 +141,76 @@ export default function KpiPage() {
   const [version, setVersion] = useState(SEEDED_VERSION);
   const [cohort, setCohort] = useState('All');
   const [versionOptions, setVersionOptions] = useState<VersionOption[]>([
-    { value: SEEDED_VERSION, label: versionLabel(SEEDED_VERSION) },
+    { value: SEEDED_VERSION, label: versionLabel(SEEDED_VERSION), count: 0 },
   ]);
   const [data, setData] = useState<KpiResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Populate the version selector from REAL lineage data. The seeded cohort (which actually has
-  // episodes) is always kept in the list and stays the default; lineage versions are appended.
+  // Populate the version selector ONLY with versions that ACTUALLY have episodes. We fetch one page
+  // of episodes and group their `version` tags by operator label (deriveVersionOptions), so every
+  // option resolves to real calls — no dead-end "v1-0dbf7bff" lineage ids that tag zero episodes and
+  // render "No calls for this selection". The seeded cohort (champion_v0) is guaranteed present and
+  // stays the default; if the probe somehow returns nothing, the seeded default is kept as a fallback.
   useEffect(() => {
     let cancelled = false;
-    fetchVersions()
+    fetchEpisodes({ limit: '2000' })
       .then((res) => {
         if (cancelled) return;
-        // De-dupe by the OPERATOR-FACING label, not the raw id: experiment-suffixed ids
-        // ("champion_v0__…") collapse to the same "Champion v0" label, so keep the first (the seeded,
-        // populated cohort) and drop the n=0 duplicates that would only render "No calls".
-        const seenLabels = new Set<string>();
-        const opts: VersionOption[] = [];
-        const add = (raw: string) => {
-          if (!raw) return;
-          const label = versionLabel(raw);
-          if (seenLabels.has(label)) return;
-          seenLabels.add(label);
-          opts.push({ value: raw, label });
-        };
-        add(SEEDED_VERSION); // guaranteed-populated default first
-        for (const v of res.versions) add(v.version);
-        setVersionOptions(opts);
+        const opts = deriveVersionOptions(res.episodes.map((e) => e.version));
+        // Guarantee the seeded, always-populated default is present (and first) even if it didn't
+        // surface in this page — it is the only selection guaranteed to have episodes on a fresh load.
+        const hasSeeded = opts.some((o) => o.value === SEEDED_VERSION);
+        const final = hasSeeded
+          ? opts
+          : [{ value: SEEDED_VERSION, label: versionLabel(SEEDED_VERSION), count: 0 }, ...opts];
+        if (final.length > 0) setVersionOptions(final);
       })
       .catch(() => {
-        // Lineage fetch failing is non-fatal — keep the seeded default so the page still shows data.
+        // Episode probe failing is non-fatal — keep the seeded default so the page still shows data.
       });
     return () => {
       cancelled = true;
     };
   }, []);
 
-  // Compare baseline: a version that ACTUALLY has episodes (not just any different option). The
-  // lineage versions from /api/versions are records with 0 tagged episodes, so naively picking "the
-  // first different option" produced a baseline arm of n=0 ("0 / 2464") — an uninformative compare.
-  // We instead derive the baseline empirically: gather candidate versions (the selector options PLUS
-  // the version ids the episodes are actually tagged with), probe each via /api/kpis, and pick the
-  // non-selected one with the MOST episodes. Until that probe resolves we hold null (compare mode
-  // simply shows a "finding a baseline…" state rather than a misleading n=0 arm).
+  // Compare baseline: a version that ACTUALLY has episodes (not just any different option). It must be
+  // CHEAP to pick — an earlier build probed EVERY vA-*/vB-* candidate with its own /api/kpis call
+  // (~134 requests on entering Compare). Instead we reuse the SAME small, episode-derived option set
+  // as the selector (already ordered by real episode volume), take the most-populated NON-selected
+  // candidates, and probe AT MOST 2 of them to confirm n>0 under the current cohort filter. So
+  // entering Compare costs a handful of requests, not dozens, and still resolves to a baseline with
+  // real n. Until the probe resolves we hold null (compare mode shows a "finding a baseline…" state
+  // rather than a misleading n=0 arm).
+  const MAX_BASELINE_PROBES = 2;
   const [compareVersion, setCompareVersion] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    // Candidate raw version ids to consider as a baseline, deduped, excluding the current selection.
-    const candidates = new Set<string>();
-    for (const o of versionOptions) candidates.add(o.value);
 
     async function pickBaseline() {
-      // Pull the real episode-tagged version ids (the seeded data tags vA-…/vB-…/champion_v0, which
-      // the lineage endpoint does NOT surface) so a populated baseline is actually reachable.
-      try {
-        const eps = await fetchEpisodes({ limit: '500' });
-        for (const e of eps.episodes) if (e.version) candidates.add(e.version);
-      } catch {
-        // Episode probe failing is non-fatal — fall back to the selector options alone.
+      // Candidates = the option set MINUS the current selection (dedup by raw value), already sorted
+      // most-populated-first by deriveVersionOptions. Probe only the top few — these are the only
+      // versions known to have episodes, so a populated baseline is found in 1–2 requests.
+      const candidates = versionOptions.map((o) => o.value).filter((v) => v !== version);
+      const cohortParam = cohort === 'All' ? undefined : cohort;
+      let picked: string | null = null;
+      for (const cand of candidates.slice(0, MAX_BASELINE_PROBES)) {
+        try {
+          const k = await fetchKpis({ version: cand, cohort: cohortParam });
+          if (cancelled) return;
+          if (k.n > 0) {
+            picked = cand;
+            break;
+          }
+        } catch {
+          if (cancelled) return;
+          // A failed probe just moves on to the next candidate.
+        }
       }
       if (cancelled) return;
-
-      const pool = [...candidates].filter((v) => v !== version);
-      // Probe each candidate's episode count; keep the most-populated one.
-      const counts = await Promise.all(
-        pool.map(async (v) => {
-          try {
-            const k = await fetchKpis({ version: v, cohort: cohort === 'All' ? undefined : cohort });
-            return { v, n: k.n };
-          } catch {
-            return { v, n: 0 };
-          }
-        }),
-      );
-      if (cancelled) return;
-      const best = counts.filter((c) => c.n > 0).sort((a, b) => b.n - a.n)[0];
-      // If nothing populated turns up, fall back to the seeded cohort (still a real selection).
-      setCompareVersion(best?.v ?? (version === SEEDED_VERSION ? null : SEEDED_VERSION));
+      // Fall back to the most-populated non-selected candidate even if its cohort-filtered probe was
+      // empty (still a real selection), else the seeded cohort, else null (no other version exists).
+      setCompareVersion(picked ?? candidates[0] ?? (version === SEEDED_VERSION ? null : SEEDED_VERSION));
     }
 
     void pickBaseline();

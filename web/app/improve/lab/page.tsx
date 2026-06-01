@@ -8,9 +8,11 @@
 // threshold + new value), see an explicit "this runs N real model calls" cost note, submit to
 // /api/experiments/run, then watch the new card transition running -> result (we poll /api/experiments).
 // Data from /api/experiments; the discovery-sequencing before/after is the headline demo artifact. All
-// semantic labels (state, dimension, version) are humanized before render — no raw slug, `__…__`
-// experiment suffix, or DRAFT-/exp- id renders. Cards/drawer show the human version + change label
-// (lib/labels: versionLabel/dimensionLabel; backend dimension_label preferred via changeLabel()).
+// semantic labels (state, dimension, version, population/cohort) are humanized before render — no raw
+// slug, `__…__` experiment suffix, or DRAFT-/exp- id renders. Cards/drawer show the human version +
+// change label (lib/labels: versionLabel/dimensionLabel; backend dimension_label preferred via
+// changeLabel()); the population/cohort value (e.g. legacy `held_out`) is humanized via
+// lib/labels.populationLabel so no raw snake_case slug leaks next to "Champion v1 · …".
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -18,7 +20,7 @@ import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchExperiments, fetchPlaybook, runExperiment } from '@/lib/improve-api';
 import type { Experiment, PlaybookResponse, RunExperimentRequest } from '@/lib/improve-types';
-import { dimensionLabel, versionLabel } from '@/lib/labels';
+import { dimensionLabel, populationLabel, versionLabel } from '@/lib/labels';
 
 // Operator-facing "what changed" label for an experiment: prefer the backend's pre-translated
 // dimension_label, else derive a human label from the raw `dimension` slug. Never the raw `__…__` id.
@@ -124,7 +126,7 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
               <div className="b" style={{ fontSize: 17, fontFamily: 'var(--font-display)', margin: '4px 0', color: 'var(--accent-strong)' }}>
                 {versionLabel(e.challenger_version)} · {changeLabel(e)}
               </div>
-              <div className="muted" style={{ fontSize: 12 }}>Ladder {e.challenger_kpi.toFixed(2)} · {e.population}</div>
+              <div className="muted" style={{ fontSize: 12 }}>Ladder {e.challenger_kpi.toFixed(2)} · {populationLabel(e.population)}</div>
             </div>
           </div>
 
@@ -573,7 +575,7 @@ export default function LabPage() {
                         <Icon name="arrowR" size={11} />
                         {versionLabel(e.challenger_version)} · {changeLabel(e)}
                       </span>
-                      <span className="muted" style={{ fontSize: 12 }}>{e.population}</span>
+                      <span className="muted" style={{ fontSize: 12 }}>{populationLabel(e.population)}</span>
                     </div>
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', borderTop: '1px solid var(--border)' }}>

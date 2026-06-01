@@ -364,7 +364,14 @@ export default function LivePage() {
             <Icon name="eye" size={16} />
             Open review
           </button>
-          <button className="btn btn-primary btn-lg" disabled={!snap.active} title={snap.active ? 'Take over the live call' : 'No active call to take over'}>
+          {/* Operator live-takeover (barging into the live LiveKit room as a human) isn't wired in
+              this build, so the control is honestly disabled rather than a click-that-does-nothing —
+              the monitor is observe-only; interact via /demo or the phone. */}
+          <button
+            className="btn btn-primary btn-lg"
+            disabled
+            title="Live takeover isn't available in this build — the monitor is view-only. Interact via the demo console or the phone line."
+          >
             <Icon name="hand" size={17} />
             Take over
           </button>

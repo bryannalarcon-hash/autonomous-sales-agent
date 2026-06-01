@@ -1,8 +1,9 @@
 // Shared humanizers for operator-facing text. Internal indices/slugs (the experiment `__<dim>__<n>`
-// suffix, short `-hash` suffixes, `DRAFT-`/`exp-` id prefixes, snake_case dimension + archetype slugs)
-// must NEVER render in observable output — these turn them into human-readable labels. Mirrors the
-// inlined versionLabel logic in DashboardShell.tsx / kpi / versions (kept in sync; do not import from
-// those — they keep their own copy). Used by improve/lab, improve/approvals, operate/kpi pages.
+// suffix, short `-hash` suffixes, `DRAFT-`/`exp-` id prefixes, snake_case dimension/archetype/
+// population slugs) must NEVER render in observable output — these turn them into human-readable
+// labels (versionLabel / dimensionLabel / archetypeLabel / populationLabel). Mirrors the inlined
+// versionLabel logic in DashboardShell.tsx / kpi / versions (kept in sync; do not import from those —
+// they keep their own copy). Used by improve/lab, improve/approvals, operate/kpi pages.
 
 // Strip the internal suffixes from a raw version id for display: the experiment dimension/seq suffix
 // ("champion_v0__playbooks_discovery_sequence__7" -> "champion_v0") and any short hash
@@ -43,6 +44,28 @@ export function dimensionLabel(slug: string | null | undefined): string {
 export function archetypeLabel(slug: string | null | undefined): string {
   if (!slug) return '';
   return titleCase(slug);
+}
+
+// Humanize an experiment population/cohort value for display. Real runs already arrive humanized
+// ("Held-out · 12 personas") and pass through untouched; seeded/legacy records carry a raw slug
+// ("held_out", "mined_failures") that must NOT render as-is. Canonical slugs map to a curated label;
+// anything else (already-human strings, other slugs) falls through to Title Case so no bare
+// snake_case / `__` token ever reaches the operator.
+const POPULATION_LABELS: Record<string, string> = {
+  held_out: 'Held-out',
+  mined_failures: 'Mined failures',
+  training: 'Training',
+  live: 'Live',
+};
+export function populationLabel(value: string | null | undefined): string {
+  if (!value) return '';
+  const trimmed = value.trim();
+  // Already-humanized backend strings carry a space, a "·" separator, or an uppercase lead — leave
+  // those intact (only the raw snake_case slugs need translating).
+  if (/[\s·]/.test(trimmed) || /^[A-Z]/.test(trimmed)) {
+    return POPULATION_LABELS[trimmed] ?? trimmed;
+  }
+  return POPULATION_LABELS[trimmed] ?? titleCase(trimmed);
 }
 
 // snake_case / kebab-case -> "Title case words" (first word capitalized, rest lower). Used by the
