@@ -5,8 +5,13 @@
 # policy.decide(...) [LLM proposes; deterministic gates already applied inside] -> nlg.realize(...).
 # Returns (Decision, reply_text, new_belief): the Decision for logging/decision-trace, the realized
 # reply, and the NEW BeliefState (the input is never mutated). NO LiveKit types cross this boundary.
+# TIMING: each of the three stages is wrapped in time.perf_counter() and the breakdown (dst/policy/nlg
+# + total) is attached to decision.meta["timings"] and logged once per turn on the "brain.timing"
+# logger — so per-turn AND per-model-call latency is measurable on both the text and voice paths.
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any, Optional, Sequence
 
 from src.config.settings import AgentConfig
@@ -15,6 +20,11 @@ from src.core.belief_state import BeliefState
 from src.core.llm import LLMClient
 from src.core.nlg import realize
 from src.core.policy import Decision, decide
+
+# One structured line per agent turn with the three model-call stage timings + total. Each stage is
+# dominated by exactly ONE LLM round-trip (the slot/gate/trend work between calls is sub-millisecond),
+# so a stage's time IS that model call's latency. Filter/route via logging.getLogger("brain.timing").
+_timing_log = logging.getLogger("brain.timing")
 
 
 def _last_agent_act(history: Optional[Sequence[Any]]) -> Optional[str]:
@@ -54,6 +64,7 @@ async def respond(
     new belief so the gates (e.g. price_gate's 'asked unprompted', escalation's human-request) see
     it. NO LiveKit types appear in or cross this signature.
     """
+    t0 = time.perf_counter()
     new_belief = await dst.update(
         belief,
         _last_agent_act(history),
@@ -61,8 +72,10 @@ async def respond(
         llm_client,
         last_user_act=last_user_act,
     )
+    t1 = time.perf_counter()
 
     decision = await decide(new_belief, history=history, config=config, llm_client=llm_client)
+    t2 = time.perf_counter()
 
     # Record the decision's confidence onto the belief for the decision-trace / low-confidence
     # escalation streak (escalation_imminent is set inside the gates when an EXTREME trigger fires).
@@ -71,6 +84,33 @@ async def respond(
 
     reply_text = await realize(
         decision, new_belief, config, llm_client, retrieved_facts=retrieved_facts
+    )
+    t3 = time.perf_counter()
+
+    # Stage timings == per-model-call latency (one LLM round-trip dominates each stage). Attach to the
+    # decision so callers persist the total onto Turn.latency_ms, and log one line per turn. `model` is
+    # best-effort (real OpenRouterClient exposes .model; the test MockLLMClient does not -> None).
+    dst_ms = round((t1 - t0) * 1000.0, 1)
+    policy_ms = round((t2 - t1) * 1000.0, 1)
+    nlg_ms = round((t3 - t2) * 1000.0, 1)
+    total_ms = round((t3 - t0) * 1000.0, 1)
+    model = getattr(llm_client, "model", None)
+    decision.meta["timings"] = {
+        "dst_ms": dst_ms,
+        "policy_ms": policy_ms,
+        "nlg_ms": nlg_ms,
+        "total_ms": total_ms,
+        "model": model,
+    }
+    _timing_log.info(
+        "turn=%s total=%.1fms dst=%.1fms policy=%.1fms nlg=%.1fms model=%s act=%s",
+        new_belief.turn_count,
+        total_ms,
+        dst_ms,
+        policy_ms,
+        nlg_ms,
+        model,
+        decision.act,
     )
 
     return decision, reply_text, new_belief

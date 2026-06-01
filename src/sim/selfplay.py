@@ -262,6 +262,7 @@ async def run_episode(
             last_user_act=last_user_act,
         )
 
+        _timings = decision.meta.get("timings") or {}
         turns.append(
             Turn(
                 turn_id=turn_id,
@@ -270,6 +271,8 @@ async def run_episode(
                 decision=decision.act,
                 rationale=decision.rationale,
                 belief=_belief_snapshot(belief),
+                # Real measured turn latency (respond() stage timing) — was previously unset.
+                latency_ms=int(round(_timings["total_ms"])) if "total_ms" in _timings else None,
             )
         )
         history.append(

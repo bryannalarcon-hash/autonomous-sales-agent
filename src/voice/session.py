@@ -269,6 +269,7 @@ class VoiceSession:
         #    stamped with the running kb_version; append the agent history dict (selfplay shape).
         agent_turn_id = self._next_turn_id
         self._next_turn_id += 1
+        _timings = pending.decision.meta.get("timings") or {}
         agent_turn = Turn(
             turn_id=agent_turn_id,
             speaker="agent",
@@ -277,6 +278,9 @@ class VoiceSession:
             rationale=pending.decision.rationale,
             belief=pending.new_belief.to_snapshot(),
             kb_version=self.state.kb_version,
+            # Real measured turn latency from respond()'s stage timing (perf_counter) — feeds the live
+            # monitor's per-turn latency, which was previously unpopulated for real calls.
+            latency_ms=int(round(_timings["total_ms"])) if "total_ms" in _timings else None,
         )
         self.state.turns.append(agent_turn)
         self.state.history.append(
