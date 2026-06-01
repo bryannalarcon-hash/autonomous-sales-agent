@@ -99,6 +99,35 @@ LIFECYCLE_LABEL: dict[str, str] = {
     "dismissed": "Dismissed",
 }
 
+# Experiment lifecycle state -> display label (P6 lab chips / P7 queue). `blocked` is the human-gate
+# state (the loop's "pending_approval"); the operator sees the meaning, never the raw slug.
+EXPERIMENT_STATE_LABEL: dict[str, str] = {
+    "draft": "Draft",
+    "running": "Running",
+    "passed": "Result ready",
+    "blocked": "Guardrail blocked",
+    "promoted": "Promoted",
+    "rejected": "Rejected",
+    "paused": "Paused",
+}
+
+# Mutation-surface dimension slug (declared_diff label) -> operator-facing name. The raw namespaced
+# slug ("playbooks.discovery_sequence", "thresholds.pushiness_cap", "persona") is an INTERNAL index
+# and must never render in the lab/approvals text — translate it here.
+DIMENSION_LABEL: dict[str, str] = {
+    "persona": "Persona & tone",
+    "playbooks.discovery_sequence": "Discovery sequencing",
+    "playbooks.rebuttals": "Objection rebuttals",
+    "thresholds.pushiness_cap": "Pushiness cap",
+    "thresholds.pushiness_pressure_count_cap": "Pushiness pressure count",
+    "thresholds.discovery_slots_required": "Discovery depth",
+    "thresholds.low_confidence_level": "Low-confidence threshold",
+    "thresholds.trust_gate_open_price": "Trust gate for pricing",
+    "thresholds.max_concession_band": "Pricing concession band",
+    "thresholds.escalate_low_confidence_turns": "Escalation patience",
+    "kb": "Knowledge base",
+}
+
 
 def _titleize(slug: str) -> str:
     """Fallback: turn an unknown slug ("foo_bar") into a readable label ("Foo bar")."""
@@ -143,3 +172,21 @@ def lifecycle_label(slug: Optional[str]) -> str:
     if not slug:
         return "Unreviewed"
     return LIFECYCLE_LABEL.get(slug, _titleize(slug))
+
+
+def experiment_state_label(slug: Optional[str]) -> str:
+    if not slug:
+        return "Running"
+    return EXPERIMENT_STATE_LABEL.get(slug, _titleize(slug))
+
+
+def dimension_label(slug: Optional[str]) -> str:
+    """Translate a mutation-surface dimension slug to its operator-facing name. A namespaced
+    threshold/playbook slug falls back to a readable title of its trailing key (never the raw slug)."""
+    if not slug:
+        return "—"
+    if slug in DIMENSION_LABEL:
+        return DIMENSION_LABEL[slug]
+    # Namespaced fallback: show the trailing key titleized, dropping the internal "prompts."/etc.
+    tail = slug.split(".", 1)[1] if "." in slug else slug
+    return _titleize(tail)
