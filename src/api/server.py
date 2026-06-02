@@ -1,4 +1,4 @@
-# The thin FastAPI app-assembler (plan U13/U15/U16). It wires three routers onto ONE app over the
+# The thin FastAPI app-assembler (plan U13/U15/U16). It wires four routers onto ONE app over the
 # EXACT, frozen JSON contract the Next.js front-end depends on:
 #   - the /demo call router (src.api.demo_routes.create_demo_router): consent, chat, livekit-token,
 #     session end/view — the transport-agnostic brain (src.core.respond via VoiceSession) + the
@@ -6,16 +6,19 @@
 #   - the Operate read router (src.api.operate): /api/episodes, /api/kpis, /api/escalations, /api/live.
 #   - the Improve router (src.api.improve): experiments/approvals/kb/playbook/versions — GATED behind
 #     require_operator (a write surface) at the include site, never inside the router.
+#   - the Replay router (src.api.replay_routes): POST /api/replay/build + GET /api/replay/results —
+#     builds fidelity experiments from all completed real calls; background task, bounded concurrency.
 # Everything network/DB-bound is INJECTABLE (llm_client_factory, embedder, retrieve/hydrate/escalation/
-# call-end/live-upsert hooks, read_store/improve_store, token_builder) so tests run offline. LIVE
-# GROUNDING (U5): by default create_app builds a real embedder + a kb.live retrieve hook so /api/chat
-# grounds in the ingested KB; tests pass live_rag=False (or a FakeEmbedder + stub hook) to stay
-# DB-free. LIVE PERSISTENCE (U2/U14/U15/Layer2): a finished call persists its Episode + escalations +
-# per-lead memory at /end; live_upsert_hook upserts an in_progress Episode after each turn so the Live
-# monitor can query calls mid-call. SECURITY/OPS: require_operator guards write endpoints (env
-# OPERATOR_TOKEN; unset -> ALLOW with a warning for local demo); CORS reads ALLOWED_ORIGINS (never
-# wildcard + credentials together); a lifespan warms the embedder when live_rag and closes the DB pool
-# on shutdown. PII is scrubbed before any transcript is stored; the lead key is the phone-hash.
+# call-end/live-upsert hooks, read_store/improve_store, token_builder, replay_agent_llm_factory,
+# replay_twin_llm_factory) so tests run offline. LIVE GROUNDING (U5): by default create_app builds a
+# real embedder + a kb.live retrieve hook so /api/chat grounds in the ingested KB; tests pass
+# live_rag=False (or a FakeEmbedder + stub hook) to stay DB-free. LIVE PERSISTENCE (U2/U14/U15/Layer2):
+# a finished call persists its Episode + escalations + per-lead memory at /end; live_upsert_hook upserts
+# an in_progress Episode after each turn so the Live monitor can query calls mid-call. SECURITY/OPS:
+# require_operator guards write endpoints (env OPERATOR_TOKEN; unset -> ALLOW with a warning for local
+# demo); CORS reads ALLOWED_ORIGINS (never wildcard + credentials together); a lifespan warms the
+# embedder when live_rag and closes the DB pool on shutdown. PII is scrubbed before any transcript is
+# stored; the lead key is the phone-hash.
 from __future__ import annotations
 
 import logging
@@ -37,7 +40,8 @@ from src.api.demo_routes import (
     create_demo_router,
 )
 from src.api.improve import ImproveStore, create_improve_router
-from src.api.operate import ReadStore, create_operate_router
+from src.api.operate import ReadStore, _StoreBackedReadStore, create_operate_router
+from src.api.replay_routes import LLMFactory as ReplayLLMFactory, create_replay_router
 from src.config.settings import AgentConfig, load_config
 from src.core.llm import LLMClient
 from src.kb.embeddings import EmbeddingModel, FakeEmbedder
@@ -104,6 +108,8 @@ def create_app(
     escalation_persist_hook: Optional[EscalationPersistHook] = None,
     call_end_persist_hook: Optional[CallEndPersistHook] = None,
     live_upsert_hook: Optional[LiveUpsertHook] = None,
+    replay_agent_llm_factory: Optional[ReplayLLMFactory] = None,
+    replay_twin_llm_factory: Optional[ReplayLLMFactory] = None,
 ) -> FastAPI:
     """Assemble the demo + operator API app. Everything network/DB-bound is injectable so tests run
     offline.
@@ -122,6 +128,10 @@ def create_app(
     the dashboard READ layers (default Postgres; tests fake them). experiment_runner is the Improve A/B
     (POST /api/experiments/run) self-play seam — tests inject a deterministic runner; prod leaves it None
     so a run does REAL self-play with the injected LLM client (which SPENDS credit).
+    replay_agent_llm_factory / replay_twin_llm_factory are injectable for tests (network-free replay);
+    prod builds OpenRouterClient from env (agent: AGENT_MODEL, twin: SIM_MODEL). When neither is
+    injected and OPENROUTER_API_KEY is absent, the replay router still mounts but POST /api/replay/build
+    returns 503 at request time (no LLM calls at import or mount).
     """
     cfg = config or load_config("champion_v0")
     # Embedder: a REAL SentenceTransformerEmbedder by default (lazy model load on first embed), unless
@@ -168,6 +178,24 @@ def create_app(
         from src.core.llm import OpenRouterClient
 
         return OpenRouterClient()
+
+    # --- Replay LLM factories (injectable for tests; prod builds OpenRouterClient from env) ---
+    def _make_replay_agent_llm() -> LLMClient:
+        if replay_agent_llm_factory is not None:
+            return replay_agent_llm_factory()
+        from src.core.llm import OpenRouterClient
+        return OpenRouterClient()
+
+    def _make_replay_twin_llm() -> LLMClient:
+        if replay_twin_llm_factory is not None:
+            return replay_twin_llm_factory()
+        from src.core.llm import OpenRouterClient
+        return OpenRouterClient(model=os.environ.get("SIM_MODEL", "openai/gpt-4o"))
+
+    _has_replay_key = bool(
+        replay_agent_llm_factory is not None
+        or os.environ.get("OPENROUTER_API_KEY", "").strip()
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -234,6 +262,19 @@ def create_app(
             experiment_runner=experiment_runner,
         ),
         dependencies=[Depends(_make_require_operator())],
+    )
+
+    # Replay-build endpoints — POST /api/replay/build + GET /api/replay/results. Background job;
+    # DB-free. 503 at request time when no LLM key and no injected factories (not at mount time).
+    _replay_rs: ReadStore = read_store if read_store is not None else _StoreBackedReadStore()
+    app.include_router(
+        create_replay_router(
+            read_store=_replay_rs,
+            agent_llm_factory=_make_replay_agent_llm,
+            twin_llm_factory=_make_replay_twin_llm,
+            config=cfg,
+            has_llm_key=_has_replay_key,
+        )
     )
 
     return app
