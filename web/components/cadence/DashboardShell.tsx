@@ -72,6 +72,7 @@ const NAV: NavDest[] = [
   // m4 FIX: the KB page is read-only, so the top-bar title drops "Editor" (label was already "KB / Playbook").
   { href: '/improve/kb', label: 'KB / Playbook', title: 'KB / Playbook', icon: 'book', group: 'improve' },
   { href: '/improve/versions', label: 'Versions', title: 'Version History', icon: 'branch', group: 'improve' },
+  { href: '/improve/fidelity', label: 'Fidelity', title: 'Replay Fidelity', icon: 'layers', group: 'improve' },
 ];
 
 // The Call Review detail screen (no rail entry of its own) keeps "Calls" highlighted + shows a
