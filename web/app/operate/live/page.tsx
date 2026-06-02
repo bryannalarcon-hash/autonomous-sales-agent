@@ -8,6 +8,9 @@
 // pre-translated by the backend; raw persona slug is humanized via @/lib/labels (archetypeLabel).
 // N3 invariant: LIVE pill + recording dot are ONLY shown when snap.active is true AND snap.sample
 // is NOT true. Internal episode IDs never render as primary labels; persona_label is used.
+// "Run demo call" (empty state): kicks off a scripted self-driving call (lib/demo-call) through the
+// real consent + chat endpoints so the monitor populates turn-by-turn without a phone; the existing
+// queue poll auto-selects it. Best-effort ends the demo session on unmount (no dangling shell).
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -16,6 +19,7 @@ import { Icon } from '@/components/cadence/Icon';
 import { fetchActiveCalls, fetchLive, fetchSampleCall, fmtDuration, initials } from '@/lib/operate-api';
 import { archetypeLabel, versionLabel } from '@/lib/labels';
 import type { ActiveCallSummary, ActiveCallsResponse, BeliefSnapshot, LiveSnapshot, Turn } from '@/lib/operate-types';
+import { runDemoCall, type DemoHandle, type DemoProgress } from '@/lib/demo-call';
 
 const POLL_MS = 5000;
 
@@ -365,6 +369,24 @@ function CallMonitor({
   );
 }
 
+/** Human-readable narration for the demo-call lifecycle (no internal phase slugs shown). */
+function demoStatusText(d: DemoProgress): string {
+  switch (d.phase) {
+    case 'consent':
+      return 'Connecting the demo call…';
+    case 'turn':
+      return `Demo call in progress — turn ${d.turn ?? 1} of ${d.total ?? '…'}…`;
+    case 'ending':
+      return 'Wrapping up the demo call…';
+    case 'done':
+      return 'Demo call complete.';
+    case 'error':
+      return d.error ? `Demo call failed: ${d.error}` : 'Demo call failed.';
+    default:
+      return '';
+  }
+}
+
 export default function LivePage() {
   const router = useRouter();
   // Queue state: full list from /api/live/active
@@ -378,6 +400,36 @@ export default function LivePage() {
   const [showSample, setShowSample] = useState(false);
   const [sampleSnap, setSampleSnap] = useState<LiveSnapshot | null>(null);
   const [sampleLoading, setSampleLoading] = useState(false);
+
+  // "Run demo call" state — a self-driving scripted call so the monitor lights up without a phone.
+  const [demo, setDemo] = useState<DemoProgress | null>(null);
+  const demoHandleRef = useRef<DemoHandle | null>(null);
+  const demoAbortRef = useRef<AbortController | null>(null);
+  const demoRunning = demo != null && demo.phase !== 'done' && demo.phase !== 'error';
+
+  const handleRunDemo = useCallback(() => {
+    if (demoRunning) return;
+    setShowSample(false); // a real (demo) call is about to appear — drop the sample preview
+    const ac = new AbortController();
+    demoAbortRef.current = ac;
+    setDemo({ phase: 'consent' });
+    const handle = runDemoCall((p) => setDemo(p), ac.signal);
+    demoHandleRef.current = handle;
+    void handle.done.then((final) => {
+      demoHandleRef.current = null;
+      demoAbortRef.current = null;
+      // Auto-clear the status a few seconds after a clean finish so the empty state resets.
+      if (final.phase === 'done') setTimeout(() => setDemo((d) => (d === final ? null : d)), 6000);
+    });
+  }, [demoRunning]);
+
+  // Best-effort cleanup: if the operator navigates away mid-demo, abort + end the session so we don't
+  // leave a dangling in-progress shell (runDemoCall ends the session on abort-triggered error path).
+  useEffect(() => {
+    return () => {
+      demoAbortRef.current?.abort();
+    };
+  }, []);
 
   // Keep a ref so the detail-polling interval always sees the current selectedEpisodeId
   const selectedRef = useRef<string | null>(null);
@@ -537,6 +589,35 @@ export default function LivePage() {
           </div>
           <h3>No active call</h3>
           <p>Nothing is on the line right now. The monitor will light up the moment a call starts.</p>
+
+          {/* "Run demo call" — drives a scripted self-playing call through the real consent + chat
+              path so the operator can watch the live monitor populate without dialing in. */}
+          <div className="lv-demo" data-testid="run-demo" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, marginTop: 4 }}>
+            <button
+              className="btn btn-primary"
+              onClick={handleRunDemo}
+              disabled={demoRunning}
+              aria-label="Run a demo call"
+            >
+              <Icon name="broadcast" size={16} />
+              {demoRunning ? 'Demo call running…' : 'Run demo call'}
+            </button>
+            {demo ? (
+              <span style={{ fontSize: 12.5, color: demo.phase === 'error' ? 'var(--danger)' : 'var(--text-3)' }}>
+                {demoStatusText(demo)}
+              </span>
+            ) : (
+              <span style={{ fontSize: 12, color: 'var(--text-faint)' }}>
+                Plays a scripted call into the monitor — no phone needed.
+              </span>
+            )}
+            {demo?.phase === 'done' && demo.episodeId ? (
+              <button className="btn btn-ghost btn-sm" onClick={() => router.push(`/operate/review/${demo.episodeId}`)}>
+                View the call in Review
+              </button>
+            ) : null}
+          </div>
+
           {/* "Show sample call" toggle — lets operators preview the monitor with real data */}
           <div className="lv-sample-toggle" data-testid="sample-toggle">
             <span style={{ fontSize: 13, color: 'var(--text-2)', fontWeight: 550 }}>

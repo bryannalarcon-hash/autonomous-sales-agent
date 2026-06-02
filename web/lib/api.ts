@@ -12,6 +12,8 @@ import type {
   ConsentStartResponse,
   LiveKitTokenRequest,
   LiveKitTokenResponse,
+  SessionEndRequest,
+  SessionEndResponse,
 } from './api-types';
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000').replace(/\/+$/, '');
@@ -77,6 +79,10 @@ export function sendChat(req: ChatRequest): Promise<ChatResponse> {
 
 export function livekitToken(req: LiveKitTokenRequest): Promise<LiveKitTokenResponse> {
   return postJson<LiveKitTokenRequest, LiveKitTokenResponse>('/api/livekit/token', req);
+}
+
+export function sessionEnd(req: SessionEndRequest): Promise<SessionEndResponse> {
+  return postJson<SessionEndRequest, SessionEndResponse>(`/api/session/${encodeURIComponent(req.session_id)}/end`, req);
 }
 
 export { API_BASE };

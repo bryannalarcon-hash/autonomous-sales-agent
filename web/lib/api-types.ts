@@ -55,6 +55,23 @@ export interface ChatResponse {
   reply: string;
   /** Internal policy act label (debug-only). MUST NOT render in the prospect-facing surface. */
   decision_act?: string;
+  /** True when the agent reached a terminal act (enrollment close / disqualify / escalate). */
+  done?: boolean;
+}
+
+// --- POST /api/session/{id}/end -----------------------------------------------------------------
+
+export interface SessionEndRequest {
+  session_id: string;
+  /** Optional raw phone to remember the caller by — HASHED server-side, never stored raw. */
+  raw_phone?: string;
+}
+
+export interface SessionEndResponse {
+  episode_id: string;
+  outcome: string;
+  escalations: number;
+  persisted: boolean;
 }
 
 // --- POST /api/livekit/token --------------------------------------------------------------------
