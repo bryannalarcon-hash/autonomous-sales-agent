@@ -31,12 +31,20 @@ import { Icon } from '@/components/cadence/Icon';
 import { Spark } from '@/components/cadence/Spark';
 import { fetchKpis, fetchEpisodes } from '@/lib/operate-api';
 import type { KpiResponse } from '@/lib/operate-types';
-import { archetypeLabel, versionLabel } from '@/lib/labels';
+import { archetypeLabel, populationLabel, versionLabel } from '@/lib/labels';
 
 // The cohort the seeded episodes are actually tagged with — the only selection guaranteed to have
 // episodes on a fresh backend, so it is the default and is always present in the selector.
 const SEEDED_VERSION = 'champion_v0';
-const COHORTS = ['All', 'held_out', 'training', 'live'];
+// Cohort options are { value, label }: `value` is the raw slug sent to /api/kpis (NEVER rendered),
+// `label` is the operator-facing text (populationLabel: "held_out" -> "Held-out"). The no-internal-
+// index rule — a raw snake_case cohort slug must not surface in the dropdown or the empty-state line.
+const COHORTS: { value: string; label: string }[] = [
+  { value: 'All', label: 'All cohorts' },
+  { value: 'held_out', label: populationLabel('held_out') },
+  { value: 'training', label: populationLabel('training') },
+  { value: 'live', label: populationLabel('live') },
+];
 
 // Below this many calls a cohort's rates are too thin to be a real statistic (a single call makes a
 // flat "100%"/"0%" that reads like a settled result). At/under this we surface a muted "directional
@@ -272,8 +280,8 @@ export default function KpiPage() {
             </select>
             <select className="field" value={cohort} onChange={(e) => setCohort(e.target.value)}>
               {COHORTS.map((c) => (
-                <option key={c} value={c}>
-                  {c === 'All' ? 'All cohorts' : c}
+                <option key={c.value} value={c.value}>
+                  {c.label}
                 </option>
               ))}
             </select>
@@ -302,7 +310,7 @@ export default function KpiPage() {
                   <Icon name="chart" size={28} />
                 </div>
                 <h3>No calls for this selection</h3>
-                <p>No episodes match {versionLabel(version)} {cohort === 'All' ? '' : `· ${cohort}`}. Try another filter.</p>
+                <p>No episodes match {versionLabel(version)} {cohort === 'All' ? '' : `· ${populationLabel(cohort)}`}. Try another filter.</p>
               </div>
             </div>
           ) : mode === 'compare' && data.compare ? (

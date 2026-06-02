@@ -6,6 +6,9 @@
 // challenger to champion, reject leaves the champion unchanged. A decided card leaves the queue and
 // appends a logged-decision line. A drawer surfaces the full "why it needs sign-off" detail. All
 // version/dimension text is humanized (lib/labels) — no raw `__…__` slug or exp-/DRAFT- id renders.
+// CB-04: the backend `diff_description` embeds a raw threshold key ("set max_concession_band -> …"),
+// so it renders through humanizeDiffDescription ("Pricing concession band 0.15 → 0.22") — the raw
+// string stays on the record/logs, only the displayed sentence is scrubbed.
 // The "champion → challenger" arrow uses challengerArrowLabel: when the challenger shares the
 // champion's base version (a same-base fork), it qualifies the right side with the change dimension
 // so the arrow shows a REAL transition (not an identical "Champion v1 → Champion v1").
@@ -15,7 +18,7 @@ import { useEffect, useState } from 'react';
 import { Icon } from '@/components/cadence/Icon';
 import { approveExperiment, fetchApprovals, rejectExperiment } from '@/lib/improve-api';
 import type { Experiment } from '@/lib/improve-types';
-import { dimensionLabel, versionLabel } from '@/lib/labels';
+import { dimensionLabel, humanizeDiffDescription, versionLabel } from '@/lib/labels';
 
 // Operator-facing "what changed" label: prefer the backend's pre-translated dimension_label, else
 // derive a human label from the raw `dimension` slug. Never the raw `__…__` id or slug.
@@ -93,7 +96,7 @@ function AprDrawer({
               Why it needs sign-off
             </div>
             <div style={{ fontSize: 13.5, lineHeight: 1.55 }}>
-              {a.diff_description}. This change is extreme ({changeLabel(a).toLowerCase()}), so promotion is paused for a human.
+              {humanizeDiffDescription(a.diff_description)}. This change is extreme ({changeLabel(a).toLowerCase()}), so promotion is paused for a human.
             </div>
           </div>
           <div className="card card-pad" style={{ borderColor: 'var(--warn-border)', background: 'var(--warn-soft)' }}>
@@ -229,7 +232,7 @@ export default function ApprovalsPage() {
                     </div>
                     <div className="b" style={{ fontSize: 16, fontFamily: 'var(--font-display)', letterSpacing: '-0.02em' }}>{a.name}</div>
                     <div className="muted" style={{ fontSize: 13, marginTop: 5, lineHeight: 1.5, maxWidth: 760 }}>
-                      {a.diff_description}. This is an extreme change ({changeLabel(a).toLowerCase()}) — it needs your sign-off before it can ship.
+                      {humanizeDiffDescription(a.diff_description)}. This is an extreme change ({changeLabel(a).toLowerCase()}) — it needs your sign-off before it can ship.
                     </div>
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1.4fr', borderTop: '1px solid var(--border)' }}>

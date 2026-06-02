@@ -1,6 +1,9 @@
 // Call Review (U15) — post-call forensics for one completed episode. Left: the full transcript with
 // the per-turn DECISION TRACE (agent turns show the labeled decision + rationale + latency);
-// clicking a turn selects it. Right: the BELIEF-TRAJECTORY replay — a scrubber over the turns with
+// clicking a turn selects it. CB-04: the gate rationale (`.rv-rat`) leads with an internal gate-name
+// and embeds raw driver enum slugs (e.g. "pushiness_cap: bail_risk over cap…"), so it renders through
+// lib/labels.humanizeRationale ("Pushiness cap: walk-away risk over cap…") — DISPLAY ONLY; the raw
+// rationale stays on the turn record / in logs. Right: the BELIEF-TRAJECTORY replay — a scrubber over the turns with
 // tick marks at key decision turns, and a belief snapshot (Trust + Walk-away risk gauges, stage +
 // the selected turn's decision, slot mini-table) that reflects the NEAREST belief snapshot at/below
 // the selected turn. CB-05: per-driver velocity deltas (↑/↓/~) rendered inline next to each gauge
@@ -17,7 +20,7 @@ import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { Ring } from '@/components/cadence/Spark';
 import { fetchEpisode, fmtDuration } from '@/lib/operate-api';
-import { archetypeLabel, versionLabel } from '@/lib/labels';
+import { archetypeLabel, humanizeRationale, versionLabel } from '@/lib/labels';
 import type { BeliefSnapshot, EpisodeDetail, ProspectTurnState } from '@/lib/operate-types';
 
 function driverValue(b: BeliefSnapshot | null, key: string): number | null {
@@ -546,7 +549,7 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
                         <Icon name="spark" size={12} />
                         {t.decision_label}
                       </span>
-                      {t.rationale ? <span className="rv-rat">{`"${t.rationale}"`}</span> : null}
+                      {t.rationale ? <span className="rv-rat">{`"${humanizeRationale(t.rationale)}"`}</span> : null}
                       {latency ? <span className="rv-lat">{latency}</span> : null}
                     </div>
                   ) : null}
