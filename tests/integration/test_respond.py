@@ -283,3 +283,38 @@ async def test_respond_escalates_on_concession_beyond_band():
     )
     assert decision.act == "escalate"
     assert new_belief.escalation_imminent is True
+
+
+async def test_respond_offers_free_callback_after_repeated_firm_budget_refusal():
+    """Realistic depth (CB-03): the agent reframes value on the first firm budget refusals, but once
+    the CUMULATIVE refusal count crosses the threshold (default 3) the prospect plainly can't afford a
+    paid tier — so the agent offers the FREE callback rung (help + a future meeting), denying only the
+    paid tiers, instead of looping or releasing. Count tracked cumulatively in belief.meta."""
+    cfg = make_config()  # default threshold 3
+    # First firm refusal: count 0 -> 1; gate must NOT down-tier yet (offer the value reframe).
+    llm1 = MockLLMClient([
+        json.dumps({"price_sensitivity": 0.2}),               # dst deltas
+        _policy_json(act="pitch", rationale="reframe value"),  # policy
+        "Let me show how the value works.",                    # nlg
+    ])
+    d1, _, nb1 = await respond(
+        BeliefState.fresh(), history=[],
+        user_utterance="Honestly I don't have a budget for this.", llm_client=llm1, config=cfg,
+    )
+    assert d1.act not in ("attempt_close", "disqualify")          # reframed, not down-tiered/released
+    assert nb1.meta.get("affordability_refusal_count") == 1
+    # Carry forward to count 3 (different phrasing — cumulative count is robust to that).
+    b2 = nb1
+    b2.meta["affordability_refusal_count"] = 2  # as if a 2nd refusal already landed
+    llm2 = MockLLMClient([
+        json.dumps({"price_sensitivity": 0.1}),
+        _policy_json(act="handle_objection", rationale="keep reframing"),
+        "I completely understand.",
+    ])
+    d2, _, nb2 = await respond(
+        b2, history=[],
+        user_utterance="We really can't swing this right now.", llm_client=llm2, config=cfg,
+    )
+    # 3rd refusal -> offer the FREE callback rung (still help + a future meeting), not release.
+    assert d2.act == "attempt_close" and d2.tier == "callback"
+    assert nb2.meta.get("affordability_refusal_count") == 3

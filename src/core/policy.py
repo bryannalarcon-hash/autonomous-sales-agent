@@ -6,9 +6,15 @@
 # | escalate | disqualify. Encodes SPIN-grounded discovery sequencing (budget asked late, trust-
 # gated) and the commitment ladder (enrollment > trial > consultation > callback) for close tiers.
 # Pure + async, NO LiveKit imports — both text self-play and the voice adapter call this.
+# MIXED-MODEL: the proposal is small fixed-vocabulary strict-JSON, so it can ride a cheaper/faster
+# model than NLG. Set env POLICY_MODEL (e.g. openai/gpt-5-mini) to override JUST this call; for GPT-5
+# (reasoning) models a low reasoning effort is pinned (POLICY_REASONING_EFFORT, default 'minimal') —
+# at default effort they 'think' for many seconds; at minimal the same call is ~1.6s. Unset -> the
+# shared llm_client default (AGENT_MODEL) with no reasoning param. Mirrors src/core/dst.py.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
@@ -82,7 +88,13 @@ _POLICY_RUBRIC = (
     "SPIN-grounded discovery: gather grade/subject/goal/timeline BEFORE budget; budget is asked "
     "LATE and only once trust is established. Commitment ladder (strongest first): enrollment > "
     "trial > consultation > callback — match the rung to readiness (hot -> enrollment; warm -> "
-    "trial/consultation; cool -> callback). Never invent facts; use answer_via_kb for factual "
+    "trial/consultation; cool -> callback). "
+    "BE PROACTIVE, NOT ENDLESSLY REACTIVE: once the key facts (grade/subject/goal) are known and "
+    "trust is established, take the INITIATIVE — pitch the value tied to their goal, then attempt_close "
+    "at the readiness-matched tier. A prospect who keeps engaging across many turns is a BUYING SIGNAL; "
+    "do NOT just answer questions or handle objections indefinitely — after addressing their immediate "
+    "point, advance toward a concrete next step (a trial or consultation). "
+    "Never invent facts; use answer_via_kb for factual "
     "questions. If they are genuinely unqualified, disqualify gracefully — do NOT force a close."
 )
 
@@ -183,6 +195,31 @@ def _as_float(value: Any) -> Optional[float]:
         return None
 
 
+def _policy_model() -> Optional[str]:
+    """The model slug for JUST the policy proposal call, or None for the client default.
+
+    Read PER CALL (not at import) so a .env loaded after import still applies. Set env POLICY_MODEL
+    to ride a cheaper/faster model here (e.g. openai/gpt-5-mini) — the mixed-model lever. The robust
+    fallback already degrades a weaker model's bad JSON to a safe non-pressure act."""
+    return os.environ.get("POLICY_MODEL") or None
+
+
+def _policy_call_opts() -> dict[str, Any]:
+    """Per-call opts for the policy proposal. When POLICY_MODEL is set we also pin a low reasoning
+    effort (GPT-5-family slugs are reasoning models that otherwise 'think' for many seconds on this
+    rubric; minimal effort keeps the call ~1.6s and still returns valid JSON). Tunable via
+    POLICY_REASONING_EFFORT (default 'minimal'; 'none' omits it). No override -> pass nothing, leaving
+    the default path unchanged. Mirrors dst._dst_call_opts."""
+    model = _policy_model()
+    if not model:
+        return {}
+    opts: dict[str, Any] = {"model": model}
+    effort = os.environ.get("POLICY_REASONING_EFFORT", "minimal").strip()
+    if effort and effort.lower() != "none":
+        opts["reasoning"] = {"effort": effort}
+    return opts
+
+
 async def decide(
     belief: BeliefState,
     history: Sequence[Any],
@@ -198,7 +235,7 @@ async def decide(
     """
     messages = _build_policy_messages(belief, history, config)
     try:
-        raw = await llm_client.complete_json(messages)
+        raw = await llm_client.complete_json(messages, **_policy_call_opts())
     except Exception:
         # FINDING 2: degrade on ANY proposal-call failure, not just bad JSON. ValueError is the
         # malformed-JSON path; a real OpenRouter outage raises httpx.HTTPStatusError/RequestError

@@ -312,3 +312,58 @@ async def test_update_sets_intent_signals_on_the_belief():
     assert nb.active_objection == "diy_free"
     assert nb.open_question and "Khan" in nb.open_question
     assert nb.last_user_act == "objection"
+
+
+async def test_update_uses_llm_intent_classification_when_present():
+    """The DST's per-turn LLM call now classifies intent BY MEANING (not regex). When the reply
+    carries the intent fields, update() uses them — so an objection phrased in a way the keyword
+    fallback would MISS is still caught, and a firm affordability refusal increments the release count."""
+    # The reply carries driver deltas AND the intent classification (as the real model returns).
+    llm = MockLLMClient([json.dumps({
+        "trust": -0.05, "bail_risk": 0.1,
+        "user_act": "objection", "objection": "diy_free", "open_question": None,
+        "affordability_refusal": False,
+    })])
+    nb = await update(BeliefState.fresh(), last_agent_act="pitch",
+                      # phrasing the keyword classifier would NOT catch as diy_free:
+                      user_utterance="we've been getting by with the videos my neighbor recommended",
+                      llm_client=llm)
+    assert nb.active_objection == "diy_free"      # from the LLM, not the regex
+    assert nb.last_user_act == "objection"
+    assert nb.meta.get("affordability_refusal_count") == 0
+
+    # A firm affordability refusal judged by the LLM bumps the cumulative release count.
+    llm2 = MockLLMClient([json.dumps({"trust": -0.1, "affordability_refusal": True, "objection": "price"})])
+    nb2 = await update(BeliefState.fresh(), last_agent_act="pitch",
+                       user_utterance="money's just really tight for us this year, you know?",
+                       llm_client=llm2)
+    assert nb2.meta.get("affordability_refusal_count") == 1
+    assert nb2.active_objection == "price"
+
+
+async def test_update_falls_back_to_regex_when_llm_omits_intent():
+    """Degradation: a driver-only reply (old prompt / a failure) carries no intent fields -> update()
+    falls back to the deterministic keyword classifier, so intent is still populated."""
+    nb = await update(BeliefState.fresh(), last_agent_act="greet",
+                      user_utterance="why not just use Khan Academy?",
+                      llm_client=MockLLMClient([json.dumps({"trust": 0.0})]))  # driver-only
+    assert nb.active_objection == "diy_free"       # via the regex fallback
+
+
+def test_derive_stage_advances_from_belief():
+    """The DST advances belief.stage deterministically (it was FROZEN at 'greeting' before, so the
+    policy never entered a closing frame). greeting -> discovery -> pitch -> close; an open objection
+    surfaces as 'objection' (transient, takes precedence)."""
+    from src.core.dst import _derive_stage
+
+    b = BeliefState.fresh()
+    assert _derive_stage(b) == "greeting"  # turn 0, nothing known
+    b.turn_count = 1
+    assert _derive_stage(b) == "discovery"  # underway, still cool (neutral trust)
+    b.drivers["trust"] = 0.58
+    assert _derive_stage(b) == "pitch"  # warming
+    b.drivers["trust"] = 0.62
+    b.drivers["purchase_intent"] = 0.5
+    assert _derive_stage(b) == "close"  # warmed + buying intent -> closeable frame
+    b.active_objection = "price"
+    assert _derive_stage(b) == "objection"  # a live objection takes precedence

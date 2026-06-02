@@ -3,12 +3,19 @@
 # returns the ALLOWED/OVERRIDDEN Decision — gates have FINAL say over the LLM proposal (neuro-
 # symbolic: LLM proposes, gates decide). apply_gates() chains them in priority order.
 #   skip_known          — never ask a slot already filled at/above lock confidence.
+#   offer_low_commitment_on_budget— repeated FIRM budget refusals (cumulative count in belief.meta) ->
+#                         offer the FREE callback rung (help + a future meeting), denying only the paid
+#                         tiers, instead of looping or releasing. Runs LAST (final say).
 #   address_direct_input— a live objection or a direct question (from the DST intent classifier)
 #                         pre-empts a discovery/pitch act (-> handle_objection / answer_via_kb) so the
-#                         agent never ignores what the prospect just asked to keep doing discovery.
+#                         agent never ignores what the prospect just asked — BUT once it has answered
+#                         it lets a `pitch` ADVANCE (escapes the reactive answer-loop; never blocks close).
 #   must_clear_objection— forbid pivot-to-close while active_objection is set (-> handle_objection).
 #   price_gate          — don't open price/budget before a trust event (prospect asked unprompted
 #                         OR a value-ack/trust threshold OR required discovery slots filled).
+#   advance_to_close    — once the belief is closeable (no objection, warmed trust, enough turns),
+#                         convert a reactive act into attempt_close so the agent ASKS for the sale
+#                         instead of answering questions forever (the can't-close fix).
 #   pushiness_cap       — forbid further pressure when a pushiness signal (bail_risk) or repeated-
 #                         pressure count exceeds the configured cap.
 #   escalation_triggers — EXTREME only: pricing concession beyond band, explicit human request,
@@ -39,6 +46,21 @@ _DEFAULTS: dict[str, float] = {
     "low_confidence_level": 0.4,
     "max_concession_band": 0.15,
     "discovery_slots_required": 4,
+    # CUMULATIVE firm affordability refusals after which the agent offers the FREE callback rung
+    # (help + a future meeting) instead of pushing paid tiers — the reframe gets its first 1–2 shots,
+    # then we down-tier. Cumulative (not consecutive) so it's robust to the prospect rephrasing.
+    "budget_refusals_before_callback": 2,
+    # advance_to_close: take the initiative to close once the prospect has warmed (trust ABOVE the 0.5
+    # neutral prior) and enough turns have passed — the agent was staying reactive (answering questions
+    # forever) and never asking for the sale. trust is the reliable warmth signal; the trial rung also
+    # needs purchase_intent. The prospect's honest buy-gate still decides acceptance.
+    "close_ready_trust": 0.6,         # trust that warrants offering the low-commitment consultation
+    "close_ready_trial_trust": 0.7,   # trust for the higher trial rung
+    "close_ready_trial_intent": 0.55, # purchase_intent ALSO required for the trial rung
+    "min_turns_before_close": 4,      # never auto-close in the opening turns
+    # A budget-constrained prospect (price_sensitivity at/above this, OR firm budget refusals) gets the
+    # FREE callback rung from advance_to_close instead of a paid consultation they'd reject.
+    "callback_price_sensitivity": 0.75,
 }
 
 
@@ -72,6 +94,43 @@ def skip_known(decision: Any, belief: BeliefState, config: AgentConfig) -> Any:
     return decision
 
 
+# --- offer_low_commitment_on_budget -----------------------------------------------------------
+
+# The lowest, no-cost rung of the commitment ladder — a future follow-up that needs NO budget, so a
+# prospect who can't afford the paid tiers still gets help + a touchpoint (only the paid tiers are
+# denied them, never help itself).
+_FREE_LADDER_TIER = "callback"
+
+
+def offer_low_commitment_on_budget(decision: Any, belief: BeliefState, config: AgentConfig) -> Any:
+    """When a prospect can't afford the higher tiers, offer the FREE rung instead of looping/releasing.
+
+    A prospect who FIRMLY refuses on budget repeatedly (the cumulative count the DST tracks in
+    belief.meta["affordability_refusal_count"]) won't buy a paid tier — but they should STILL get help
+    and a future meeting (product rule: deny the higher commitment-ladder tiers, never help itself).
+    So once the reframe has had its first 1–2 shots and the refusals persist, steer the agent to a
+    CALLBACK — the no-cost rung (a future follow-up) — rather than acknowledging forever. Runs LAST so
+    must_clear_objection/pushiness don't undo the low-pressure offer; never overrides an escalate or an
+    already low-tier (callback/consultation) close. The buy-gate still decides if they take it."""
+    if decision.act == "escalate":
+        return decision
+    if decision.act == "attempt_close" and decision.tier in ("callback", "consultation"):
+        return decision  # already offering a low/no-cost rung
+    refusals = int(belief.meta.get("affordability_refusal_count", 0))
+    if refusals < int(_threshold(config, "budget_refusals_before_callback")):
+        return decision
+    out = decision.copy()
+    out.act = "attempt_close"
+    out.tier = _FREE_LADDER_TIER
+    out.target_slot = None
+    out.concession = None
+    out.rationale = (
+        f"offer_low_commitment_on_budget: {refusals} firm budget refusals — paid tiers are off the "
+        "table, so offering a free future follow-up (callback) rather than pushing or releasing"
+    )
+    return out
+
+
 # --- address_direct_input ---------------------------------------------------------------------
 
 # Discovery/pitch acts that must yield to an unanswered question or a live objection (R35 discovery
@@ -79,14 +138,37 @@ def skip_known(decision: Any, belief: BeliefState, config: AgentConfig) -> Any:
 _DEFERRABLE_ACTS = frozenset({"ask", "confirm_known", "pitch"})
 
 
-def address_direct_input(decision: Any, belief: BeliefState, config: AgentConfig) -> Any:
+def _prev_agent_act(history: Optional[Sequence[Any]]) -> Optional[str]:
+    """The most recent agent act in history (most-recent-first), or None — used to detect that the
+    agent JUST answered, so it can advance instead of answering again."""
+    if not history:
+        return None
+    for turn in reversed(list(history)):
+        if isinstance(turn, dict) and turn.get("role") in ("assistant", "agent"):
+            act = turn.get("act")
+            return str(act) if act is not None else None
+    return None
+
+
+def address_direct_input(
+    decision: Any,
+    belief: BeliefState,
+    config: AgentConfig,
+    *,
+    history: Optional[Sequence[Any]] = None,
+) -> Any:
     """Ensure a direct question or objection is ADDRESSED this turn — not ignored to keep doing
-    discovery. This is the fix for the agent looping "what grade?" at a prospect who asked "how much?"
-    or objected "why not Khan Academy?": the DST now classifies the utterance (active_objection /
-    open_question / price_inquiry), and this gate routes a discovery/pitch proposal accordingly —
-    handle_objection when an objection is live, answer_via_kb when they asked a question. Acts that
-    already address the prospect (answer_via_kb, handle_objection) or advance/close/escalate/disqualify
-    are left to the close-path + escalation gates."""
+    discovery — WITHOUT trapping the agent in an endless answer-loop.
+
+    The DST classifies the utterance (active_objection / open_question / price_inquiry); this gate
+    routes a discovery/pitch proposal: handle_objection when an objection is live, answer_via_kb when
+    they asked a question. BUT a prospect who asks a question every single turn would otherwise pin
+    the agent to answer_via_kb forever and it would never advance to a close (the reactive-loop bug).
+    So if the agent ALREADY answered last turn, a proposed `pitch` is allowed to ADVANCE this turn
+    instead of answering yet again; `ask`/`confirm_known` still defer (answer before MORE discovery —
+    M2). Acts that already address the prospect (answer_via_kb/handle_objection) or advance/close/
+    escalate/disqualify are left to the close-path + escalation gates (attempt_close is never deferred
+    here, so the policy can always close)."""
     if decision.act not in _DEFERRABLE_ACTS:
         return decision
     if belief.active_objection:
@@ -100,12 +182,110 @@ def address_direct_input(decision: Any, belief: BeliefState, config: AgentConfig
         )
         return out
     if belief.open_question and belief.last_user_act in ("question", "price_inquiry"):
+        # Escape the answer-loop: if we just answered, let a pitch advance the sale rather than
+        # answering the next question too (otherwise an inquisitive prospect blocks every close).
+        if decision.act == "pitch" and _prev_agent_act(history) == "answer_via_kb":
+            return decision
         out = decision.copy()
         out.act = "answer_via_kb"
         out.tier = None
         out.rationale = "address_direct_input: prospect asked a direct question; answering before more discovery"
         return out
     return decision
+
+
+# --- advance_to_close -------------------------------------------------------------------------
+
+# Reactive/stalling acts the agent gets stuck in; advance_to_close converts these to a close when the
+# belief is closeable. attempt_close/escalate/disqualify are never advanceable; handle_objection is
+# advanceable ONLY in the break-through case (a repeatedly-handled objection).
+_ADVANCEABLE_ACTS = frozenset({"answer_via_kb", "confirm_known", "pitch", "ask"})
+# After the agent has handled objections this many times recently, break the deadlock and advance
+# (a relentless objector who re-raises every turn would otherwise block every close).
+_BREAKTHROUGH_OBJECTION_HANDLES = 2
+
+
+def _recent_objection_handles(history: Optional[Sequence[Any]], lookback: int = 6) -> int:
+    """Count handle_objection acts among the last `lookback` agent turns — detects the agent being
+    stuck handling the same objection over and over (so it can advance instead)."""
+    if not history:
+        return 0
+    seen = handled = 0
+    for turn in reversed(list(history)):
+        if not isinstance(turn, dict) or turn.get("role") not in ("assistant", "agent"):
+            continue
+        seen += 1
+        if turn.get("act") == "handle_objection":
+            handled += 1
+        if seen >= lookback:
+            break
+    return handled
+
+
+def advance_to_close(
+    decision: Any,
+    belief: BeliefState,
+    config: AgentConfig,
+    *,
+    history: Optional[Sequence[Any]] = None,
+) -> Any:
+    """Take the INITIATIVE to close once the belief says the prospect is closeable.
+
+    The LLM policy tends to stay reactive — answering an inquisitive prospect's questions forever (or
+    handling a relentless objector turn after turn) and never asking for the sale (the can't-close
+    failure: 0 close attempts even for warm, qualified prospects). This gate converts a reactive/
+    stalling act into an attempt_close at the right tier once at least `min_turns_before_close` turns
+    have passed and EITHER there is no open objection (warmth-gated close) OR the objection has been
+    handled repeatedly (break the deadlock with a low-pressure consultation). Tier selection:
+      • budget-constrained (price_sensitivity high OR firm refusals) -> the FREE 'callback' rung — a
+        no-budget prospect still gets a meeting, never a paid tier they'll reject;
+      • else very warm + buying intent -> 'trial';
+      • else warmed (or breaking through an objection) -> 'consultation'.
+    trust is the reliable warmth signal (purchase_intent in the agent's belief barely moves). The
+    prospect's HONEST buy-gate still decides acceptance; NLG still has the open_question so the close
+    acknowledges what they asked (not a dodge). Runs BEFORE pushiness_cap (which can veto an over-
+    aggressive close) and offer_low_commitment_on_budget."""
+    if int(belief.turn_count) < int(_threshold(config, "min_turns_before_close")):
+        return decision
+    objection_open = bool(belief.active_objection)
+    breakthrough = objection_open and _recent_objection_handles(history) >= _BREAKTHROUGH_OBJECTION_HANDLES
+    can_advance = decision.act in _ADVANCEABLE_ACTS or (breakthrough and decision.act == "handle_objection")
+    if not can_advance:
+        return decision
+    # An open objection that has NOT yet been handled enough times: keep handling, don't close over it.
+    if objection_open and not breakthrough:
+        return decision
+
+    trust = float(belief.drivers.get("trust", 0.0))
+    intent = float(belief.drivers.get("purchase_intent", 0.0))
+    price_sens = float(belief.drivers.get("price_sensitivity", 0.0))
+    refusals = int(belief.meta.get("affordability_refusal_count", 0))
+    budget_constrained = (
+        price_sens >= _threshold(config, "callback_price_sensitivity")
+        or refusals >= int(_threshold(config, "budget_refusals_before_callback"))
+    )
+
+    if budget_constrained:
+        tier = "callback"
+    elif trust >= _threshold(config, "close_ready_trial_trust") and intent >= _threshold(
+        config, "close_ready_trial_intent"
+    ):
+        tier = "trial"
+    elif trust >= _threshold(config, "close_ready_trust") or breakthrough:
+        tier = "consultation"
+    else:
+        return decision
+
+    out = decision.copy()
+    out.act = "attempt_close"
+    out.tier = tier
+    out.target_slot = None
+    out.rationale = (
+        f"advance_to_close: tier='{tier}' (trust={trust:.2f}, purchase_intent={intent:.2f}, "
+        f"breakthrough={breakthrough}, budget_constrained={budget_constrained}), "
+        f"{belief.turn_count} turns in — taking initiative instead of staying reactive"
+    )
+    return out
 
 
 # --- must_clear_objection ---------------------------------------------------------------------
@@ -337,7 +517,7 @@ def apply_gates(
     Order matters: escalation is checked FIRST and LAST — first so an EXTREME moment short-circuits
     everything, and again last so an override another gate produced still can't slip past an extreme
     trigger. Between them: skip_known -> address_direct_input -> must_clear_objection -> price_gate
-    -> pushiness_cap.
+    -> pushiness_cap -> offer_low_commitment_on_budget (last, so the free-callback offer has final say).
     """
     # Extreme moments dominate: nothing else matters if we must defer.
     escalated = escalation_triggers(decision, belief, config, history=history)
@@ -345,10 +525,16 @@ def apply_gates(
         return escalated
 
     d = skip_known(decision, belief, config)
-    d = address_direct_input(d, belief, config)  # answer/handle what they just said before discovery
+    d = address_direct_input(d, belief, config, history=history)  # answer/handle input, but let pitch advance
     d = must_clear_objection(d, belief, config)
     d = price_gate(d, belief, config)
+    # Take initiative to close when the belief is closeable (escape the reactive answer-loop); placed
+    # before pushiness_cap so an over-aggressive close can still be backed off on a high bail signal.
+    d = advance_to_close(d, belief, config, history=history)
     d = pushiness_cap(d, belief, config, history=history)
+    # LAST override: a budget-constrained prospect gets the free callback rung (help + future meeting),
+    # not a loop or a release — placed here so must_clear_objection/pushiness don't undo the offer.
+    d = offer_low_commitment_on_budget(d, belief, config)
 
     # Re-check escalation on the (possibly rewritten) decision so a gate-introduced concession or
     # state change can't escape the extreme-deferral guarantee.

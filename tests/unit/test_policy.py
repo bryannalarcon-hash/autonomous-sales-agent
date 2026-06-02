@@ -571,3 +571,91 @@ def test_address_direct_input_routes_open_question_to_answer_via_kb():
     assert out.act == "answer_via_kb"
     # With no question and no objection, a discovery ask is untouched.
     assert gates.address_direct_input(Decision(act="ask", target_slot="goal"), BeliefState.fresh(), cfg).act == "ask"
+
+
+def test_address_direct_input_lets_pitch_advance_after_an_answer():
+    """Reactive-loop fix: a prospect who asks a question EVERY turn must not pin the agent to
+    answer_via_kb forever (the can't-close bug). If the agent ALREADY answered last turn, a proposed
+    `pitch` is allowed to ADVANCE (not re-deferred); `ask`/`confirm_known` still defer to answer the
+    question first (M2 intact); with no prior answer, `pitch` still defers (answer first)."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.open_question = "And what about scheduling?"
+    b.last_user_act = "question"
+    just_answered = [
+        {"role": "agent", "act": "answer_via_kb", "text": "Here's the pricing…"},
+        {"role": "user", "text": "And what about scheduling?"},
+    ]
+    # We just answered -> a pitch may advance the sale this turn.
+    assert gates.address_direct_input(Decision(act="pitch"), b, cfg, history=just_answered).act == "pitch"
+    # ask/confirm still defer (answer the question before more discovery).
+    assert (
+        gates.address_direct_input(Decision(act="ask", target_slot="grade_level"), b, cfg, history=just_answered).act
+        == "answer_via_kb"
+    )
+    # No prior answer in history -> pitch still defers to answer the question first.
+    assert gates.address_direct_input(Decision(act="pitch"), b, cfg, history=[]).act == "answer_via_kb"
+
+
+# --- advance_to_close (the can't-close fix: take initiative when the belief is closeable) ----------
+
+def test_advance_to_close_initiates_close_when_warmed():
+    """The reactive-agent fix: when trust has warmed above neutral, enough turns have passed, and no
+    objection is open, a reactive/stalling act is converted to an attempt_close at the best low-
+    commitment tier — so the agent stops answering questions forever and actually asks for the sale.
+    The prospect's honest buy-gate still decides; NLG still acknowledges any pending question."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.turn_count = 6
+    b.drivers["trust"] = 0.65  # warmed above the 0.5 neutral prior
+    out = gates.advance_to_close(Decision(act="answer_via_kb"), b, cfg)
+    assert out.act == "attempt_close" and out.tier == "consultation"
+    # Very warm + buying intent -> the higher trial rung.
+    b.drivers["trust"] = 0.75
+    b.drivers["purchase_intent"] = 0.6
+    assert gates.advance_to_close(Decision(act="pitch"), b, cfg).tier == "trial"
+
+
+def test_advance_to_close_holds_off_when_not_ready():
+    """No premature/aggressive closing: a neutral or early belief, an open objection, or a non-
+    advanceable act (already closing/escalating) is left untouched."""
+    cfg = make_config()
+    # Neutral fresh belief (trust 0.5) -> never fires.
+    assert gates.advance_to_close(Decision(act="answer_via_kb"), BeliefState.fresh(), cfg).act == "answer_via_kb"
+    # Warmed but an objection is open -> handle it first, don't close.
+    b = BeliefState.fresh(); b.turn_count = 6; b.drivers["trust"] = 0.7; b.active_objection = "price"
+    assert gates.advance_to_close(Decision(act="answer_via_kb"), b, cfg).act == "answer_via_kb"
+    # Warmed but too early (few turns) -> don't close yet.
+    b2 = BeliefState.fresh(); b2.turn_count = 2; b2.drivers["trust"] = 0.7
+    assert gates.advance_to_close(Decision(act="answer_via_kb"), b2, cfg).act == "answer_via_kb"
+    # Already closing / escalating is left alone.
+    b3 = BeliefState.fresh(); b3.turn_count = 6; b3.drivers["trust"] = 0.7
+    assert gates.advance_to_close(Decision(act="escalate"), b3, cfg).act == "escalate"
+    assert gates.advance_to_close(Decision(act="attempt_close", tier="trial"), b3, cfg).act == "attempt_close"
+
+
+def test_advance_to_close_breaks_through_repeatedly_handled_objection():
+    """A relentless objector (re-raising the same objection every turn) would otherwise pin the agent
+    to handle_objection forever. After the objection has been handled repeatedly, break the deadlock
+    with a low-pressure consultation offer instead of handling it yet again."""
+    cfg = make_config()
+    b = BeliefState.fresh(); b.turn_count = 8; b.drivers["trust"] = 0.55; b.active_objection = "efficacy_doubt"
+    handled_twice = [
+        {"role": "agent", "act": "handle_objection"}, {"role": "user", "text": "..."},
+        {"role": "agent", "act": "handle_objection"}, {"role": "user", "text": "..."},
+    ]
+    out = gates.advance_to_close(Decision(act="handle_objection"), b, cfg, history=handled_twice)
+    assert out.act == "attempt_close" and out.tier == "consultation"
+    # With only ONE prior handle, keep handling (no premature break-through).
+    handled_once = [{"role": "agent", "act": "handle_objection"}, {"role": "user", "text": "..."}]
+    assert gates.advance_to_close(Decision(act="handle_objection"), b, cfg, history=handled_once).act == "handle_objection"
+
+
+def test_advance_to_close_offers_free_callback_when_budget_constrained():
+    """A budget-constrained prospect (high price-sensitivity OR firm refusals) gets the FREE callback
+    rung — never a paid consultation they'll reject (your 'unqualified still get a meeting' rule)."""
+    cfg = make_config()
+    b = BeliefState.fresh(); b.turn_count = 6; b.drivers["trust"] = 0.7; b.drivers["price_sensitivity"] = 0.8
+    assert gates.advance_to_close(Decision(act="answer_via_kb"), b, cfg).tier == "callback"
+    b2 = BeliefState.fresh(); b2.turn_count = 6; b2.drivers["trust"] = 0.7; b2.meta["affordability_refusal_count"] = 2
+    assert gates.advance_to_close(Decision(act="answer_via_kb"), b2, cfg).tier == "callback"

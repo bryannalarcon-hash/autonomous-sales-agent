@@ -169,6 +169,7 @@ async def run_episode(
     retrieve_facts: Optional[Callable[[BeliefState, str], Sequence[Any]]] = None,
     persist: bool = True,
     last_user_act: Optional[str] = None,
+    on_turn: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> Episode:
     """Run ONE self-play episode: the agent brain (respond()) alternates with the ProspectSimulator
     to a terminal state, logging every turn (decision + rationale + belief snapshot) to a unified
@@ -241,6 +242,21 @@ async def run_episode(
         history.append({"role": "user", "text": corrupted_text})
         turn_id += 1
         turn_count += 1
+
+        # Optional calibration observation hook (default None -> no-op, no behavior change): exposes
+        # the prospect's TRUE hidden drivers + the tier the agent just offered + the buy-gate verdict,
+        # so calibration can see WHY a close was accepted/rejected (the episode logs only the agent's
+        # belief, not the prospect's true state).
+        if on_turn is not None:
+            on_turn(
+                {
+                    "turn": turn_count,
+                    "offered_tier": last_agent_tier,
+                    "true": prospect.state.snapshot(),
+                    "committed_tier": pt.committed_tier,
+                    "walked": pt.walked,
+                }
+            )
 
         # 3. Terminal: the prospect walked or committed (the deterministic buy-gate decided).
         terminal = _terminal_from_prospect(pt)

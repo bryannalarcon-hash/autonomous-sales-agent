@@ -94,22 +94,27 @@ async def respond(
     policy_ms = round((t2 - t1) * 1000.0, 1)
     nlg_ms = round((t3 - t2) * 1000.0, 1)
     total_ms = round((t3 - t0) * 1000.0, 1)
-    model = getattr(llm_client, "model", None)
+    # `model` is the policy+NLG (agent default) model; the DST call may ride a cheaper one via DST_MODEL
+    # (mixed-model setup), so report it separately — otherwise the log misattributes the DST latency.
+    agent_model = getattr(llm_client, "model", None)
+    dst_call_model = dst.dst_model() or agent_model
     decision.meta["timings"] = {
         "dst_ms": dst_ms,
         "policy_ms": policy_ms,
         "nlg_ms": nlg_ms,
         "total_ms": total_ms,
-        "model": model,
+        "model": agent_model,
+        "dst_model": dst_call_model,
     }
     _timing_log.info(
-        "turn=%s total=%.1fms dst=%.1fms policy=%.1fms nlg=%.1fms model=%s act=%s",
+        "turn=%s total=%.1fms dst=%.1fms[%s] policy=%.1fms nlg=%.1fms model=%s act=%s",
         new_belief.turn_count,
         total_ms,
         dst_ms,
+        dst_call_model,
         policy_ms,
         nlg_ms,
-        model,
+        agent_model,
         decision.act,
     )
 

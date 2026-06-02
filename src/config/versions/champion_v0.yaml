@@ -63,4 +63,7 @@ thresholds:
   escalate_low_confidence_turns: 2  # consecutive low-confidence turns -> escalate
   low_confidence_level: 0.4         # decision_confidence below this counts as a low-confidence turn
   max_concession_band: 0.15         # discount fraction beyond which a concession is EXTREME -> escalate
-  discovery_slots_required: 4       # non-budget discovery slots filled that also opens the price gate
+  discovery_slots_required: 5       # non-budget discovery slots filled that also opens the price gate
+                                    # (CB-03: raised 4->5 so the price gate opens LATER — the agent
+                                    # does fuller SPIN discovery before it may pitch/close, lengthening
+                                    # the call and forcing more handled-objection turns before a tier opens)
