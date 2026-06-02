@@ -78,14 +78,14 @@
 - **Acceptance:** a promoted version on `/improve/versions` shows its change dimension label (not "—"); a genesis version still shows "—"; no raw `__dimension__` slug leaks.
 - **Refs:** `src/loop/promotion.py` (where the dimension is known at promote time); `version_lineage` schema; `web/lib/labels.ts::dimensionLabel`.
 
-### CB-04 — Humanize two remaining raw-slug leaks (KPI cohort + Approvals diff)
-- **Type / Surface / Size:** bug · `/operate/kpi` · `/improve/approvals` · S
+### CB-04 — Humanize three remaining raw-slug leaks (KPI cohort + Approvals diff + Review rationale)
+- **Type / Surface / Size:** bug · `/operate/kpi` · `/improve/approvals` · `/operate/review` · S
 - **Prereqs:** —
-- **Important files (candidates):** `web/app/operate/kpi/page.tsx` (the `COHORTS` selector ~line 39 + the empty-state line), `web/app/improve/approvals/page.tsx` (`diff_description` render ~line 96/232); possibly the backend `diff_description` text in `src/api/improve.py` / `src/loop`.
-- **Current:** the KPI **cohort** dropdown renders the raw slug `held_out` (the *version* selector is already humanized; the cohort one isn't); the Approvals "diff_description" sentence embeds the raw threshold key, e.g. *"Raise max_concession_band 0.15 → 0.22"*.
-- **Desired:** humanize both via `web/lib/labels.ts` (`held_out` → "Held-out"; `max_concession_band` → "Pricing concession band") — no raw snake_case slug in operator-facing text (the no-internal-index rule).
-- **Acceptance:** a Playwright text scan of `/operate/kpi` (cohort dropdown open) and `/improve/approvals` finds no `held_out` / `max_concession_band` / other snake_case slug rendered.
-- **Refs:** QA round 7 findings; `web/lib/labels.ts` (`populationLabel`/`dimensionLabel` already exist).
+- **Important files (candidates):** `web/app/operate/kpi/page.tsx` (the `COHORTS` selector ~line 39 + the empty-state line), `web/app/improve/approvals/page.tsx` (`diff_description` render ~line 96/232); `web/app/operate/review/[id]/page.tsx` (the `rv-rat` rationale span ~line 536); possibly the backend `diff_description` text in `src/api/improve.py` / `src/loop`, and the gate rationale strings in `src/core/gates.py` (e.g. `pushiness_cap: bail_risk over cap…`).
+- **Current:** (a) the KPI **cohort** dropdown renders the raw slug `held_out`; (b) the Approvals "diff_description" sentence embeds the raw threshold key, e.g. *"Raise max_concession_band 0.15 → 0.22"*; (c) the Review page renders each turn's gate rationale verbatim in `.rv-rat`, and gate rationales embed raw enum slugs + gate names, e.g. *"pushiness_cap: bail_risk over cap; backing off pressure…"* — confirmed leaking on a live sim episode during the CB-06 screenshot audit (2026-06-02).
+- **Desired:** humanize all three via `web/lib/labels.ts` (`held_out` → "Held-out"; `max_concession_band` → "Pricing concession band"; `bail_risk` → "walk-away risk", `pushiness_cap` → a human gate label) — no raw snake_case slug or gate-name in operator-facing text (the no-internal-index rule). For the Review rationale, prefer scrubbing/labeling at the render boundary so internal logs keep the raw slug.
+- **Acceptance:** a Playwright text scan of `/operate/kpi` (cohort dropdown open), `/improve/approvals`, and `/operate/review/<sim-id>` finds no `held_out` / `max_concession_band` / `bail_risk` / `pushiness_cap` / other snake_case slug rendered.
+- **Refs:** QA round 7 findings; CB-06 screenshot audit (`tests/e2e/verify_cb05_cb06_screens.py` flagged `bail_risk` in `rv-rat`); `web/lib/labels.ts` (`populationLabel`/`dimensionLabel` already exist).
 
 ---
 
@@ -123,33 +123,6 @@
 - **Notes / blockers:** HARD INVARIANT — the honest buy-gate must stay PURE/DETERMINISTIC: budget + qualified + per-tier ceiling immutable to talk; a commitment fires ONLY on the agent's `attempt_close` at the offered tier. Do NOT let "more turns" come from breaking that (e.g., never auto-commit / never move budget). Regenerating transcripts is paid LLM self-play — bounded batch first.
 - **Notes:** DONE + committed (1d9cdec): conviction coupling fixed the binding constraint; N=10 verify = 6/7 qualified close, 0/3 unqualified, avg ~19 turns, buy-gate intact. (Board kept here for history.)
 
-### CB-05 — Per-turn belief DELTA in Call Review
-- **Type / Surface / Size:** feature · `/operate/review` · S
-- **Owner:** coder-belief-ui (frontend)
-- **Started:** 2026-06-02
-- **Prereqs met?:** yes (the data already ships)
-- **Why:** the DST computes `<driver>_velocity = driver(t) − driver(t−1)` and `_belief_to_dict` already ships it as `trends`, and `operate-types.ts` types it — but the Review belief panel renders only VALUES, not how the read MOVED each turn. Operators want to see momentum ("Trust ↑ +0.12 since last turn").
-- **Plan (checklist):**
-  - [ ] Render each driver's `trends` velocity next to its value on the Review belief panel (↑/↓ signed, colored; ~0 shown as flat).
-  - [ ] tsc clean; Cadence tokens only, no new visual language.
-  - [ ] Screenshot-verify the Review page (open a real episode) — layout intact, no overflow/overlap.
-- **Files being touched:** `web/app/operate/review/[id]/page.tsx`, `web/lib/operate-types.ts` (trends already typed), `web/app/cadence.css` if needed.
-- **Notes / blockers:** data is already in the payload — pure frontend.
-
-### CB-06 — Agent-estimate vs prospect-TRUTH belief panel (self-play / twin only)
-- **Type / Surface / Size:** feature · `core` (`src/sim`) · `api` · `/operate/review` · M
-- **Owner:** coder-prospect-truth (backend) + coder-belief-ui (frontend)
-- **Started:** 2026-06-02
-- **Prereqs met?:** yes
-- **Why:** the UI shows only the agent's BELIEF (its estimate of the prospect); for self-play / digital-twin episodes we also have the prospect's TRUE hidden drivers (the `on_turn` hook captures them) but never persist/surface them. Showing agent-estimate vs prospect-truth per turn + the gap is the "is the agent reading the room correctly?" / sim-to-real belief-accuracy view. Real calls have NO prospect truth → panel hidden there.
-- **Plan (checklist):**
-  - [ ] Backend: persist the prospect's true-driver trajectory per turn on sim/twin episodes (e.g. `episode.metrics["prospect_trajectory"] = [{turn, drivers}]`); expose it in the episode-detail API.
-  - [ ] Frontend: a Review panel (only when prospect_trajectory present) showing, per turn, agent-estimate vs prospect-truth for the OVERLAPPING drivers (trust / urgency / purchase_intent) + the signed gap; prospect-only drivers (need / budget / patience) shown as context.
-  - [ ] Tests: backend persistence test; tsc clean.
-  - [ ] Screenshot-verify the Review page with a sim episode — panel renders, no UI break; and with a real (voice) episode — panel correctly ABSENT.
-- **Files being touched:** `src/sim/selfplay.py` (capture prospect.state per turn), `src/api/operate.py` (expose), `web/app/operate/review/[id]/page.tsx`, `web/lib/operate-types.ts`.
-- **Notes / blockers:** driver-key MISMATCH — prospect true drivers are trust/need/urgency/purchase_intent/budget/patience; agent belief drivers are trust/need_intensity/price_sensitivity/urgency/purchase_intent/bail_risk. Compare only the overlapping keys; never render a raw slug. CB-05 + CB-06 BOTH touch the Review page — same frontend owner builds both to avoid a collision.
-
 ---
 
 ## Done
@@ -166,4 +139,20 @@
 > - **Follow-ups / known gaps:** <or none>
 > ```
 
-_(empty — fill as items finish)_
+### CB-05 — Per-turn belief DELTA in Call Review
+- **Type / Surface / Size:** feature · `/operate/review` · S
+- **Completed:** 2026-06-02
+- **Files changed (actual):** `web/app/operate/review/[id]/page.tsx` (added `driverVelocity()` + `VelocityBadge`), `web/lib/operate-types.ts` (no new type needed — `trends` already typed).
+- **What changed:** each gauge header (Trust, Walk-away risk) now renders an inline `VelocityBadge` reading `trends["<key>_velocity"]` — `↑ +0.12` green (rising), `↓ −0.08` amber (falling), `~` faint (|v|<0.01). Raw velocity slugs never render (badge shows arrow + signed magnitude only).
+- **Verification:** tsc exit 0; `.venv` suite 412 passed / 5 skipped; screenshot-verified on a live sim episode (`sp-a0494cd6…`) — Trust `~`, Walk-away risk `↓ −0.10` render correctly, no overflow, 0 JS errors (`tests/e2e/verify_cb05_cb06_screens.py`).
+- **Constraints checked:** no raw `*_velocity` slug leaks into visible text (verified); Cadence tokens only, no new visual language.
+- **Follow-ups / known gaps:** none for CB-05. (Separate pre-existing leak found during the audit: the gate **rationale** string in `.rv-rat` leaks `bail_risk`/`pushiness_cap` — folded into CB-04, not introduced here.)
+
+### CB-06 — Agent-estimate vs prospect-TRUTH belief panel (self-play / twin only)
+- **Type / Surface / Size:** feature · `core` (`src/sim`) · `api` · `/operate/review` · M
+- **Completed:** 2026-06-02
+- **Files changed (actual):** `src/sim/selfplay.py` + `src/api/operate.py` + `tests/integration/test_selfplay.py` + `tests/e2e/test_operate.py` (backend, committed `e86df9e`); `web/app/operate/review/[id]/page.tsx` (`ProspectTruthPanel`, `findProspectState`, `OVERLAP_KEYS`, `PROSPECT_ONLY_KEYS`, `gapColor`) + `web/lib/operate-types.ts` (`ProspectTurnState` + `prospect_trajectory` field) (frontend).
+- **What changed:** `run_episode` accumulates `prospect.state.snapshot()` (filtered to the 6 frozen driver keys, rounded 3dp) into `episode.metrics["prospect_trajectory"] = [{turn, drivers}]`; `episode_detail` exposes top-level `prospect_trajectory` (`[]` for real calls). Frontend renders a panel — only when `prospect_trajectory.length > 0` — comparing agent-estimate vs prospect-truth for the 3 overlapping drivers (trust/urgency/purchase_intent) with a signed, color-coded gap, plus prospect-only context (need/budget/patience).
+- **Verification:** backend — 412 passed / 5 skipped incl. 5 new CB-06 tests (persisted-on-sim, empty-for-voice, empty-when-metrics-None); frontend — tsc exit 0. Screenshot-verified (`tests/e2e/verify_cb05_cb06_screens.py`): sim episode `sp-a0494cd6…` shows the panel (Trust 0.95/0.74/+0.21 amber, Urgency 0.00/0.42/−0.42 red, Purchase intent 0.00/0.40/−0.40 red; context Need 0.59 / Budget 0.71 / Patience 0.20), voice episode `ep-94aabde4…` correctly OMITS the panel with no layout hole, 0 JS errors on both.
+- **Constraints checked:** pure-additive backend (buy-gate / outcomes / existing metrics untouched); driver-key mismatch respected (only overlapping keys compared); no prospect-side slug rendered raw; R37 parity unaffected (sim-only path).
+- **Follow-ups / known gaps:** the agent's belief shows urgency=0.00 / purchase_intent=0.00 at the close turn while the prospect's true urgency/intent are ~0.4 — a real DST-calibration signal (agent under-tracks urgency/intent), now VISIBLE thanks to this panel; candidate for a future calibration item, not a UI defect.

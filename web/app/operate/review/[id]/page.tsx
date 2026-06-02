@@ -3,15 +3,12 @@
 // clicking a turn selects it. Right: the BELIEF-TRAJECTORY replay — a scrubber over the turns with
 // tick marks at key decision turns, and a belief snapshot (Trust + Walk-away risk gauges, stage +
 // the selected turn's decision, slot mini-table) that reflects the NEAREST belief snapshot at/below
-// the selected turn. Drives entirely off the recorded per-turn belief log (/api/episodes/{id}).
-// Belief/stage/decision labels are pre-translated by the backend; the raw persona archetype + version
-// slugs are humanized client-side via @/lib/labels (archetypeLabel/versionLabel) and the raw episode
-// id is muted/secondary (never the headline) — no internal index renders as an operator-facing label.
-// A 0-turn / still-connecting episode renders a graceful empty state (with a link to the live monitor)
-// rather than a blank transcript + dash belief.
-// The strip's three actions are all HONEST (no dead clicks): "Flag" is a local-only toggle that
-// shows a "Flagged" pill (no backend), "Export" downloads the fetched episode as JSON client-side,
-// and "Use in experiment" routes to /improve/lab (same destination as the KB page's lab button).
+// the selected turn. CB-05: per-driver velocity deltas (↑/↓/~) rendered inline next to each gauge
+// value using trends["<key>_velocity"] from the BeliefSnapshot. CB-06: agent-estimate vs
+// prospect-TRUTH panel (self-play / twin only — panel is ABSENT for real voice/text calls); shows
+// the agent's read vs the prospect's true hidden state for the overlapping keys (trust, urgency,
+// purchase_intent) plus prospect-only context drivers (need, budget, patience). Drives entirely off
+// the recorded per-turn belief log (/api/episodes/{id}).
 'use client';
 
 import { useMemo, useState } from 'react';
@@ -21,10 +18,273 @@ import { Icon } from '@/components/cadence/Icon';
 import { Ring } from '@/components/cadence/Spark';
 import { fetchEpisode, fmtDuration } from '@/lib/operate-api';
 import { archetypeLabel, versionLabel } from '@/lib/labels';
-import type { BeliefSnapshot, EpisodeDetail } from '@/lib/operate-types';
+import type { BeliefSnapshot, EpisodeDetail, ProspectTurnState } from '@/lib/operate-types';
 
 function driverValue(b: BeliefSnapshot | null, key: string): number | null {
   return b?.primary_drivers.find((d) => d.key === key)?.value ?? null;
+}
+
+// CB-05: resolve a driver's velocity from the trends map.
+// Looks up "<key>_velocity" (e.g. "trust_velocity", "bail_risk_velocity").
+function driverVelocity(b: BeliefSnapshot | null, key: string): number | null {
+  if (!b?.trends) return null;
+  const v = b.trends[`${key}_velocity`];
+  return typeof v === 'number' ? v : null;
+}
+
+// CB-05: render a subtle signed-velocity indicator:
+// ↑ +0.12 in --ok green, ↓ −0.08 in --warn amber, ~ flat in --text-faint muted.
+function VelocityBadge({ velocity }: { velocity: number | null }) {
+  if (velocity === null) return null;
+  const abs = Math.abs(velocity);
+  // treat |velocity| < 0.01 as flat
+  if (abs < 0.01) {
+    return (
+      <span
+        style={{
+          fontSize: 10,
+          fontWeight: 600,
+          color: 'var(--text-faint)',
+          marginLeft: 6,
+          fontVariantNumeric: 'tabular-nums',
+          letterSpacing: '-0.01em',
+        }}
+        title="No change this turn"
+      >
+        ~
+      </span>
+    );
+  }
+  const up = velocity > 0;
+  const color = up ? 'var(--ok)' : 'var(--warn)';
+  const arrow = up ? '↑' : '↓';
+  const sign = up ? '+' : '−';
+  return (
+    <span
+      style={{
+        fontSize: 10,
+        fontWeight: 700,
+        color,
+        marginLeft: 6,
+        fontVariantNumeric: 'tabular-nums',
+        letterSpacing: '-0.01em',
+        whiteSpace: 'nowrap',
+      }}
+      title={`Changed ${sign}${abs.toFixed(2)} this turn`}
+    >
+      {arrow} {sign}{abs.toFixed(2)}
+    </span>
+  );
+}
+
+// CB-06: find the prospect trajectory entry at/just-before `turn` index.
+function findProspectState(
+  trajectory: ProspectTurnState[],
+  turnIdx: number,
+): ProspectTurnState | null {
+  if (!trajectory.length) return null;
+  let best: ProspectTurnState | null = null;
+  for (const entry of trajectory) {
+    if (entry.turn <= turnIdx) {
+      if (best === null || entry.turn > best.turn) best = entry;
+    }
+  }
+  return best;
+}
+
+// CB-06: human labels for the shared + prospect-only driver keys. These are the only keys surfaced
+// in the panel. Agent keys (trust/urgency/purchase_intent) share names with prospect keys — only
+// those three overlap. Raw keys never render; this map is the source of truth for human labels here.
+const OVERLAP_KEYS: { agentKey: string; prospectKey: string; label: string }[] = [
+  { agentKey: 'trust', prospectKey: 'trust', label: 'Trust' },
+  { agentKey: 'urgency', prospectKey: 'urgency', label: 'Urgency' },
+  { agentKey: 'purchase_intent', prospectKey: 'purchase_intent', label: 'Purchase intent' },
+];
+
+const PROSPECT_ONLY_KEYS: { key: string; label: string }[] = [
+  { key: 'need', label: 'Need' },
+  { key: 'budget', label: 'Budget' },
+  { key: 'patience', label: 'Patience' },
+];
+
+// CB-06: gap color — small gap (≤0.1) is good (--ok), medium (≤0.25) is neutral (--warn), larger is --danger.
+function gapColor(gap: number): string {
+  const abs = Math.abs(gap);
+  if (abs <= 0.1) return 'var(--ok)';
+  if (abs <= 0.25) return 'var(--warn)';
+  return 'var(--danger)';
+}
+
+// CB-06: Agent-estimate vs prospect-truth comparison panel.
+// Only rendered when prospect_trajectory has entries (self-play / twin episodes).
+function ProspectTruthPanel({
+  snap,
+  prospectState,
+}: {
+  snap: BeliefSnapshot | null;
+  prospectState: ProspectTurnState | null;
+}) {
+  if (!prospectState) return null;
+
+  // Resolve agent values for overlap keys from primary + secondary drivers combined.
+  function agentVal(agentKey: string): number | null {
+    if (!snap) return null;
+    const all = [...(snap.primary_drivers ?? []), ...(snap.secondary_drivers ?? [])];
+    const found = all.find((d) => d.key === agentKey);
+    return found ? found.value : null;
+  }
+
+  return (
+    <div
+      className="card card-pad"
+      style={{ display: 'flex', flexDirection: 'column', gap: 12 }}
+    >
+      <div>
+        <div className="row" style={{ justifyContent: 'space-between', marginBottom: 4 }}>
+          <h3 style={{ fontSize: 13, fontWeight: 650 }}>Agent read vs prospect reality</h3>
+          <span className="tag info" style={{ fontSize: 10 }}>Self-play only</span>
+        </div>
+        <p
+          className="faint"
+          style={{ fontSize: 11, lineHeight: 1.4 }}
+        >
+          {"Agent's read vs the prospect's true state (self-play only) — the gap is how accurately the agent is reading the room."}
+        </p>
+      </div>
+
+      {/* Overlapping drivers: agent-estimate vs prospect-truth + gap */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: '1fr 56px 56px 50px',
+            gap: 6,
+            fontSize: 10,
+            fontWeight: 700,
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+            color: 'var(--text-faint)',
+            paddingBottom: 4,
+            borderBottom: '1px solid var(--border-soft)',
+          }}
+        >
+          <span>Driver</span>
+          <span style={{ textAlign: 'right' }}>Agent</span>
+          <span style={{ textAlign: 'right' }}>Prospect</span>
+          <span style={{ textAlign: 'right' }}>Gap</span>
+        </div>
+        {OVERLAP_KEYS.map(({ agentKey, prospectKey, label }) => {
+          const av = agentVal(agentKey);
+          const pv = prospectState.drivers[prospectKey] ?? null;
+          const gap = av !== null && pv !== null ? av - pv : null;
+          const gapSign = gap !== null ? (gap >= 0 ? '+' : '−') : null;
+          const gapAbs = gap !== null ? Math.abs(gap) : null;
+          return (
+            <div
+              key={agentKey}
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '1fr 56px 56px 50px',
+                gap: 6,
+                alignItems: 'center',
+                fontSize: 12,
+              }}
+            >
+              <span style={{ color: 'var(--text-2)', fontWeight: 600 }}>{label}</span>
+              <span
+                style={{
+                  textAlign: 'right',
+                  fontVariantNumeric: 'tabular-nums',
+                  fontWeight: 650,
+                  color: av !== null ? 'var(--text)' : 'var(--text-faint)',
+                }}
+              >
+                {av !== null ? av.toFixed(2) : '—'}
+              </span>
+              <span
+                style={{
+                  textAlign: 'right',
+                  fontVariantNumeric: 'tabular-nums',
+                  fontWeight: 650,
+                  color: pv !== null ? 'var(--text)' : 'var(--text-faint)',
+                }}
+              >
+                {pv !== null ? pv.toFixed(2) : '—'}
+              </span>
+              <span
+                style={{
+                  textAlign: 'right',
+                  fontVariantNumeric: 'tabular-nums',
+                  fontWeight: 700,
+                  fontSize: 11,
+                  color: gap !== null ? gapColor(gap) : 'var(--text-faint)',
+                }}
+                title={gap !== null ? `Agent overestimates by ${gapSign}${gapAbs?.toFixed(2)}` : undefined}
+              >
+                {gap !== null && gapSign !== null && gapAbs !== null
+                  ? `${gapSign}${gapAbs.toFixed(2)}`
+                  : '—'}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Prospect-only context drivers (truth only — agent has no estimate for these) */}
+      {PROSPECT_ONLY_KEYS.some(({ key }) => prospectState.drivers[key] !== undefined) && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div
+            style={{
+              fontSize: 10,
+              fontWeight: 700,
+              textTransform: 'uppercase',
+              letterSpacing: '0.06em',
+              color: 'var(--text-faint)',
+              paddingTop: 4,
+              borderTop: '1px solid var(--border-soft)',
+            }}
+          >
+            Prospect context (not tracked by agent)
+          </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {PROSPECT_ONLY_KEYS.map(({ key, label }) => {
+              const val = prospectState.drivers[key];
+              if (val === undefined) return null;
+              return (
+                <div
+                  key={key}
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 2,
+                    background: 'var(--surface-2)',
+                    border: '1px solid var(--border)',
+                    borderRadius: 9,
+                    padding: '6px 10px',
+                    minWidth: 60,
+                  }}
+                >
+                  <span style={{ fontSize: 10, color: 'var(--text-faint)', fontWeight: 600 }}>
+                    {label}
+                  </span>
+                  <span
+                    style={{
+                      fontSize: 14,
+                      fontWeight: 700,
+                      fontVariantNumeric: 'tabular-nums',
+                      color: 'var(--text-2)',
+                    }}
+                  >
+                    {val.toFixed(2)}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // Next.js 14 App Router: route `params` is a PLAIN object (the Promise+`use()` shape is Next 15+).
@@ -84,6 +344,12 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
     return null;
   }, [ep, cur]);
 
+  // CB-06: prospect truth state at/just-before the current turn (self-play / twin only).
+  const prospectState = useMemo<ProspectTurnState | null>(() => {
+    if (!ep || !ep.prospect_trajectory?.length) return null;
+    return findProspectState(ep.prospect_trajectory, cur);
+  }, [ep, cur]);
+
   // Drive the timed replay: hold the CURRENT turn for its real latency, then advance one turn. A
   // prospect turn (no measured latency) uses a short default; floored so 0-latency turns aren't
   // instant. Stops at the last turn; cleared on pause/unmount.
@@ -94,8 +360,8 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
       return;
     }
     const ms = ep.turns[cur]?.latency_ms ?? 1000;
-    const id = setTimeout(() => setCur((c) => Math.min(c + 1, ep.turns.length - 1)), Math.max(350, ms));
-    return () => clearTimeout(id);
+    const timerId = setTimeout(() => setCur((c) => Math.min(c + 1, ep.turns.length - 1)), Math.max(350, ms));
+    return () => clearTimeout(timerId);
   }, [playing, cur, ep]);
 
   if (error) {
@@ -162,12 +428,17 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
   };
   const trust = driverValue(snap, 'trust');
   const bail = driverValue(snap, 'bail_risk');
+  // CB-05: per-gauge velocities
+  const trustVelocity = driverVelocity(snap, 'trust');
+  const bailVelocity = driverVelocity(snap, 'bail_risk');
   // key decision turns -> tick marks on the scrubber.
   const marks = ep.turns
     .map((t, i) => ({ t, i }))
     .filter(({ t }) => t.speaker === 'agent' && /pivot|close|de-?risk|reframe/i.test(t.decision_label ?? ''));
 
   const qualifiedRight = (ep.ladder_tier >= 2) === ep.qualified;
+  // CB-06: panel visible only when prospect_trajectory is non-empty (self-play / twin episodes).
+  const hasTruth = (ep.prospect_trajectory?.length ?? 0) > 0;
 
   return (
     <div className="page">
@@ -262,7 +533,7 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
                         <Icon name="spark" size={12} />
                         {t.decision_label}
                       </span>
-                      {t.rationale ? <span className="rv-rat">{`“${t.rationale}”`}</span> : null}
+                      {t.rationale ? <span className="rv-rat">{`"${t.rationale}"`}</span> : null}
                       {latency ? <span className="rv-lat">{latency}</span> : null}
                     </div>
                   ) : null}
@@ -314,11 +585,14 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
             </div>
           </div>
 
+          {/* CB-05 + CB-06: belief gauges with velocity deltas */}
           <div className="card card-pad">
             <div className="rv-gg">
               <div className="rv-g">
                 <div className="rv-gt">
                   <span>Trust</span>
+                  {/* CB-05: trust velocity delta */}
+                  <VelocityBadge velocity={trustVelocity} />
                 </div>
                 <div className="rv-gv">{trust == null ? '—' : trust.toFixed(2)}</div>
                 <div className="bar" style={{ marginTop: 8 }}>
@@ -328,6 +602,8 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
               <div className="rv-g">
                 <div className="rv-gt">
                   <span>Walk-away risk</span>
+                  {/* CB-05: bail_risk velocity delta */}
+                  <VelocityBadge velocity={bailVelocity} />
                 </div>
                 <div className="rv-gv">{bail == null ? '—' : bail.toFixed(2)}</div>
                 <div className="bar" style={{ marginTop: 8 }}>
@@ -354,6 +630,11 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
               </div>
             ))}
           </div>
+
+          {/* CB-06: agent-estimate vs prospect-truth panel (self-play / twin only) */}
+          {hasTruth && (
+            <ProspectTruthPanel snap={snap} prospectState={prospectState} />
+          )}
 
           <div className="rv-outcome">
             <Ring value={ep.qualified ? 0.93 : 0.4} size={46} color={qualifiedRight ? 'var(--ok)' : 'var(--warn)'} label={qualifiedRight ? '✓' : '!'} />

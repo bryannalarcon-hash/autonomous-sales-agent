@@ -6,6 +6,8 @@
 // fields are internal-only and MUST NOT render in operator-facing text — the UI shows the labels.
 // Additions (U16 live-monitor): LiveSnapshot gains optional `sample` flag; ActiveCallSummary +
 // ActiveCallsResponse support the queue-rail of concurrent in-progress calls (/api/live/active).
+// Additions (CB-06): EpisodeDetail gains optional prospect_trajectory for self-play / digital-twin
+// episodes — the prospect's true hidden driver state captured per turn by the on_turn hook.
 // lib/operate-api.ts types against these.
 
 /** One belief-state driver signal at a turn, already labeled (e.g. "Walk-away risk"). */
@@ -67,12 +69,23 @@ export interface EpisodeSummary {
   created_at: string | null;
 }
 
-/** The full Call Review payload (P2): summary + per-turn trace + belief trajectory. */
+/** One entry in the prospect's true-driver trajectory (self-play / digital-twin episodes only).
+ *  Captured by the on_turn hook in selfplay.py and persisted in episode.metrics.
+ *  drivers keys: trust, need, urgency, purchase_intent, budget, patience (prospect-side naming). */
+export interface ProspectTurnState {
+  turn: number;
+  drivers: Record<string, number>;
+}
+
+/** The full Call Review payload (P2): summary + per-turn trace + belief trajectory.
+ *  prospect_trajectory is [] for real voice/text calls — the panel must be ABSENT in that case. */
 export interface EpisodeDetail extends EpisodeSummary {
   turns: Turn[];
   belief_trajectory: (BeliefSnapshot | null)[];
   disqualifier_reason: string | null;
   metrics: Record<string, unknown>;
+  /** Per-turn prospect true-driver states (self-play / twin only). Empty array for real calls. */
+  prospect_trajectory: ProspectTurnState[];
 }
 
 export interface EpisodeListResponse {
