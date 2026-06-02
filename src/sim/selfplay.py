@@ -7,6 +7,11 @@
 # so the agent's robust DST is exercised on garbled (voice-shaped) input. An optional `prospect=`
 # kwarg on run_episode lets callers inject a pre-built prospect (e.g. a GenerativeTwin for replay
 # experiments — U15) instead of creating a fresh ProspectSimulator; default None = current behavior.
+# CB-06: after each prospect.respond() call, the prospect's TRUE hidden drivers are captured from
+# prospect.state.snapshot() and accumulated into a per-episode list; _build_episode stores it as
+# episode.metrics["prospect_trajectory"] = [{turn, drivers}] (one entry per prospect turn, 1-based,
+# drivers rounded to 3 dp). This works for both ProspectSimulator and injected GenerativeTwin — both
+# expose .state.snapshot(). Real voice/text episodes never go through this path so they get no entry.
 # Collaborators: src.core.respond, src.core.belief_state, src.sim.prospect/personas,
 # src.config.settings, src.core.llm, src.memory.{schema,store}. This file MAY import the store
 # (it is the harness, not core/) but MUST NOT import LiveKit (R37: text substrate) and MUST NOT
@@ -55,6 +60,13 @@ _DEFAULT_OPENER = "Hi, this is {name} from Nerdy. How can I help you today?"
 # inject_noise tuning: bounded so the text is degraded (ASR-shaped) but not destroyed. All
 # randomness flows through the passed seeded random.Random so a seed reproduces the corruption.
 _SWAP_NEIGHBORS = "abcdefghijklmnopqrstuvwxyz"
+
+# CB-06: the frozen driver keys extracted from prospect.state.snapshot() for trajectory entries.
+# snapshot() returns all ProspectState fields (including booleans and non-float bookkeeping); we
+# persist only these 6 true-driver floats (rounded to 3 dp) per the CB-06 frozen contract.
+_PROSPECT_DRIVER_KEYS: tuple[str, ...] = (
+    "trust", "need", "urgency", "purchase_intent", "budget", "patience"
+)
 
 
 def _opener(config: AgentConfig) -> str:
@@ -134,9 +146,12 @@ def _build_episode(
     walked: bool,
     escalated: bool,
     turn_count: int,
+    prospect_trajectory: list[dict[str, Any]],
 ) -> Episode:
     """Assemble the channel='sim' Episode from a finished run. version/kb_version come from
-    config.stamp(); qualified/disqualifier_reason/persona are GROUND TRUTH from the persona."""
+    config.stamp(); qualified/disqualifier_reason/persona are GROUND TRUTH from the persona.
+    CB-06: prospect_trajectory = [{turn, drivers}] captures the prospect's TRUE hidden-driver
+    state after each prospect turn; stored in metrics so episode_detail can expose it."""
     stamp = config.stamp()
     return Episode(
         episode_id=f"sp-{uuid.uuid4().hex}",
@@ -155,6 +170,7 @@ def _build_episode(
             "turn_count": turn_count,
             "committed_tier": committed_tier,
             "prospect_walked": walked,
+            "prospect_trajectory": prospect_trajectory,
         },
     )
 
@@ -235,6 +251,11 @@ async def run_episode(
     walked = False
     escalated = False
     turn_count = 0
+    # CB-06: accumulate the prospect's TRUE hidden-driver state after each prospect turn. One entry
+    # per prospect turn (1-based index), drivers extracted from prospect.state.snapshot() and
+    # filtered to the 6 frozen keys (trust/need/urgency/purchase_intent/budget/patience), rounded to
+    # 3 dp. Works for both ProspectSimulator and injected GenerativeTwin (both expose .state.snapshot()).
+    prospect_trajectory: list[dict[str, Any]] = []
 
     while True:
         # 1. Prospect responds to the agent's last utterance + act + offered tier (commit/walk
@@ -252,6 +273,19 @@ async def run_episode(
         history.append({"role": "user", "text": corrupted_text})
         turn_id += 1
         turn_count += 1
+
+        # CB-06: capture the prospect's TRUE hidden-driver state after this turn. Extract only the
+        # 6 frozen driver keys from the full snapshot (which also includes bookkeeping booleans/ints)
+        # and round each to 3 dp per the contract. Works for ProspectSimulator and GenerativeTwin.
+        _raw_snap = prospect.state.snapshot()
+        prospect_trajectory.append({
+            "turn": turn_count,  # 1-based: turn_count was just incremented above
+            "drivers": {
+                k: round(float(_raw_snap[k]), 3)
+                for k in _PROSPECT_DRIVER_KEYS
+                if k in _raw_snap
+            },
+        })
 
         # Optional calibration observation hook (default None -> no-op, no behavior change): exposes
         # the prospect's TRUE hidden drivers + the tier the agent just offered + the buy-gate verdict,
@@ -336,6 +370,7 @@ async def run_episode(
         walked=walked,
         escalated=escalated,
         turn_count=turn_count,
+        prospect_trajectory=prospect_trajectory,
     )
     if persist:
         await store.save_episode(episode)

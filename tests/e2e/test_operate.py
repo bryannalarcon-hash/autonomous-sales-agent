@@ -8,6 +8,8 @@
 # trajectory; /api/live hoists the prioritized belief IA; /api/live/active lists all non-stale
 # active calls; /api/live/sample returns the newest completed call. Also guards empty data +
 # verifies NO raw internal index (ladder int alone, driver slug) leaks into operator-facing labels.
+# CB-06: episode_detail exposes prospect_trajectory for sim/twin episodes; real (voice) episodes
+# get [] so the frontend panel is correctly absent there.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -646,3 +648,109 @@ def test_live_active_uses_same_predicate_as_live_snapshot():
                         persona="Skeptical Analyzer", qualified=False,
                         minutes_ago=int(_LIVE_STALE_SECONDS / 60) + 10, turn_count=0)
     assert _is_active(ep_stale, now=now) is False
+
+
+# =============================== CB-06 — PROSPECT TRAJECTORY IN EPISODE DETAIL ====================
+
+# The 6 frozen driver keys the contract mandates in each trajectory entry.
+_TRAJ_DRIVER_KEYS = frozenset({"trust", "need", "urgency", "purchase_intent", "budget", "patience"})
+
+# Canonical prospect trajectory used to seed the sim-channel episode below.
+_SAMPLE_TRAJ = [
+    {"turn": 1, "drivers": {"trust": 0.32, "need": 0.55, "urgency": 0.4, "purchase_intent": 0.1, "budget": 0.9, "patience": 0.47}},
+    {"turn": 2, "drivers": {"trust": 0.46, "need": 0.69, "urgency": 0.54, "purchase_intent": 0.24, "budget": 0.9, "patience": 0.44}},
+    {"turn": 3, "drivers": {"trust": 0.6, "need": 0.83, "urgency": 0.68, "purchase_intent": 0.38, "budget": 0.9, "patience": 0.41}},
+]
+
+
+def _sim_episode(eid: str, *, traj=None) -> Episode:
+    """A channel='sim' episode with an optional prospect_trajectory in its metrics. Simulates what
+    run_episode produces for a sim/twin episode (CB-06). Real voice episodes use _episode() above and
+    do NOT have prospect_trajectory in their metrics."""
+    created = datetime.now(timezone.utc) - timedelta(minutes=10)
+    turns = [
+        Turn(turn_id=0, speaker="agent", text="Hi, how can I help?",
+             decision="greeting", rationale="opener", belief=_belief(0.3, 0.2, "discovery"), latency_ms=500),
+        Turn(turn_id=1, speaker="prospect", text="We have a kid in grade 9 struggling with algebra."),
+        Turn(turn_id=2, speaker="agent", text="Got it — what subject is most urgent?",
+             decision="ask", rationale="discovery", belief=_belief(0.4, 0.25, "discovery"), latency_ms=600),
+        Turn(turn_id=3, speaker="prospect", text="Math, for sure."),
+        Turn(turn_id=4, speaker="agent", text="Want me to set up a consultation?",
+             decision="attempt_close", rationale="buying signal", belief=_belief(0.6, 0.3, "closing"), latency_ms=700),
+        Turn(turn_id=5, speaker="prospect", text="Sure, let's set up a consultation."),
+    ]
+    metrics: dict = {
+        "turn_count": 3,
+        "committed_tier": "consultation",
+        "prospect_walked": False,
+    }
+    if traj is not None:
+        metrics["prospect_trajectory"] = traj
+    return Episode(
+        episode_id=eid, turns=turns, outcome="consult_booked", ladder_tier=2, qualified=True,
+        version="champion_v0", kb_version="kb-37", channel="sim", persona="anxious_parent",
+        cohort="training", escalated=False, metrics=metrics, created_at=created,
+    )
+
+
+def test_episode_detail_includes_prospect_trajectory_for_sim_episode():
+    """CB-06: episode_detail surfaces prospect_trajectory for a sim-channel episode that has it in
+    metrics. The list must be present at the top level as 'prospect_trajectory', be non-empty, and
+    each entry must have 'turn' + 'drivers' with the 6 frozen keys."""
+    sim_ep = _sim_episode("SIM-0001", traj=_SAMPLE_TRAJ)
+    app = create_app(read_store=FakeReadStore([sim_ep], []))
+    client = TestClient(app)
+
+    r = client.get("/api/episodes/SIM-0001")
+    assert r.status_code == 200, r.text
+    detail = r.json()
+
+    assert "prospect_trajectory" in detail, "prospect_trajectory missing from episode_detail"
+    traj = detail["prospect_trajectory"]
+    assert isinstance(traj, list), f"expected list, got {type(traj)}"
+    assert len(traj) == len(_SAMPLE_TRAJ), f"expected {len(_SAMPLE_TRAJ)} entries, got {len(traj)}"
+
+    for i, entry in enumerate(traj):
+        assert "turn" in entry, f"entry {i} missing 'turn' key"
+        assert "drivers" in entry, f"entry {i} missing 'drivers' key"
+        assert entry["turn"] == i + 1, f"entry {i} has turn={entry['turn']}, expected {i + 1}"
+        assert set(entry["drivers"].keys()) == _TRAJ_DRIVER_KEYS, (
+            f"entry {i} driver keys: {set(entry['drivers'].keys())}"
+        )
+
+
+def test_episode_detail_prospect_trajectory_empty_for_real_voice_episode():
+    """CB-06: episode_detail returns prospect_trajectory=[] for a real (voice/text) episode that
+    has no prospect_trajectory in its metrics. The field must be present (not absent) to let the
+    frontend reliably detect 'no truth data, hide the panel'."""
+    # Use the standard voice episode fixture — it has no prospect_trajectory in metrics.
+    voice_ep = _episode("VOICE-0001", outcome="enrolled", tier=4, version="v12",
+                        cohort="held_out", persona="Warm Champion", qualified=True, minutes_ago=5)
+    app = create_app(read_store=FakeReadStore([voice_ep], []))
+    client = TestClient(app)
+
+    r = client.get("/api/episodes/VOICE-0001")
+    assert r.status_code == 200, r.text
+    detail = r.json()
+
+    assert "prospect_trajectory" in detail, (
+        "prospect_trajectory must always be present in episode_detail ([] for non-sim episodes)"
+    )
+    assert detail["prospect_trajectory"] == [], (
+        f"expected [] for a voice episode, got {detail['prospect_trajectory']!r}"
+    )
+
+
+def test_episode_detail_prospect_trajectory_empty_when_metrics_is_none():
+    """CB-06: episode_detail returns prospect_trajectory=[] even when metrics is None/absent —
+    the field must never raise or be missing regardless of how sparse the stored episode is."""
+    from src.api.operate import episode_detail
+
+    sparse_ep = Episode(
+        episode_id="SPARSE-001", turns=[], outcome="walked", ladder_tier=0, qualified=False,
+        version="v1", kb_version="kb-0", channel="voice", persona="unknown", cohort="live",
+        escalated=False, metrics=None,
+    )
+    detail = episode_detail(sparse_ep)
+    assert "prospect_trajectory" in detail
+    assert detail["prospect_trajectory"] == []

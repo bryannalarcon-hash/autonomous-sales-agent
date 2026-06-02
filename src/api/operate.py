@@ -11,6 +11,9 @@
 # endpoints: GET /api/live (newest active call or null), GET /api/live?episode_id=<id> (specific ep),
 # GET /api/live/active (all non-stale active calls with summary fields), GET /api/live/sample
 # (newest completed call with sample:true, for the page's "Show sample call" toggle).
+# CB-06: episode_detail adds "prospect_trajectory" — the prospect's TRUE hidden-driver arc per turn,
+# persisted by run_episode on sim/twin episodes; real (voice/text) episodes get [] so the frontend
+# panel can detect absence with a simple falsy check. Collaborators: src.sim.selfplay (writer).
 from __future__ import annotations
 
 import os
@@ -204,12 +207,17 @@ def episode_summary(ep: Episode) -> dict[str, Any]:
 
 
 def episode_detail(ep: Episode) -> dict[str, Any]:
-    """Full Call Review payload (P2): summary + per-turn trace + belief trajectory."""
+    """Full Call Review payload (P2): summary + per-turn trace + belief trajectory.
+    CB-06: adds prospect_trajectory — the prospect's TRUE hidden-driver arc for sim/twin episodes
+    (one entry per prospect turn: {turn: int, drivers: {trust,need,urgency,purchase_intent,budget,
+    patience}}). Real voice/text episodes carry no prospect truth -> []. Always present so the
+    frontend can check truthiness without guarding for a missing key."""
     detail = episode_summary(ep)
     detail["turns"] = [_turn_to_dict(t) for t in ep.turns]
     detail["belief_trajectory"] = [_belief_to_dict(t.belief) for t in ep.turns]
     detail["disqualifier_reason"] = ep.disqualifier_reason
     detail["metrics"] = ep.metrics or {}
+    detail["prospect_trajectory"] = (ep.metrics or {}).get("prospect_trajectory") or []
     return detail
 
 

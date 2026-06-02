@@ -6,7 +6,10 @@
 # with version attribution + ground-truth qualified; ASR-noise corrupts prospect text without
 # crashing the robust agent; walked/escalated outcomes map correctly; and a batch persists N
 # episodes whose outcome_distribution sums to N. Mirrors test_store.py's _schema fixture (rebind the
-# store pool per loop + apply migrations/001_init.sql).
+# store pool per loop + apply migrations/001_init.sql). CB-06: also verifies that
+# episode.metrics["prospect_trajectory"] is persisted on sim episodes with one entry per prospect
+# turn carrying the 6 driver keys (trust/need/urgency/purchase_intent/budget/patience), each rounded
+# to 3 dp, and that the GenerativeTwin injected-prospect path also populates the trajectory.
 from __future__ import annotations
 
 import os
@@ -333,3 +336,92 @@ async def test_batch_runs_persist_and_outcome_distribution():
     commits = sum(dist.get(o, 0) for o in _COMMIT_OUTCOMES)
     assert commits >= 1, f"expected >=1 ladder commit, got distribution {dist}"
     assert dist.get("walked", 0) >= 1, f"expected >=1 walked, got distribution {dist}"
+
+
+# CB-06: prospect true-driver trajectory persistence tests -------------------------------------------
+
+# The 6 driver keys the frozen contract mandates in each trajectory entry's "drivers" dict.
+_TRAJECTORY_DRIVER_KEYS = frozenset({"trust", "need", "urgency", "purchase_intent", "budget", "patience"})
+
+
+async def test_prospect_trajectory_persisted_on_sim_episode():
+    """CB-06: episode.metrics["prospect_trajectory"] has one entry per prospect turn with the 6
+    frozen driver keys (trust/need/urgency/purchase_intent/budget/patience), each rounded to 3 dp,
+    and 1-based turn indices. The trajectory length equals the number of prospect turns (not total
+    turns — the agent's turns do not add entries). Verified via both the in-process Episode object
+    and the round-tripped store.get_episode() to confirm the trajectory survives persistence."""
+    config = load_config("champion_v0")
+    persona = _hot_qualified()
+    # Agent closes each turn; prospect pushes drivers hard so the episode ends after a few turns.
+    agent_llm = _agent_mock(act="attempt_close", target_slot=None, tier="consultation")
+    prospect_llm = _prospect_mock(big_push=True)
+
+    ep = await selfplay.run_episode(
+        persona, agent_llm, prospect_llm, config, seed=42, cohort="training", max_turns=24
+    )
+
+    # The trajectory must be present in metrics.
+    traj = ep.metrics.get("prospect_trajectory")
+    assert traj is not None, "expected episode.metrics['prospect_trajectory'] to be set on a sim episode"
+    assert isinstance(traj, list), f"expected list, got {type(traj)}"
+    assert len(traj) > 0, "expected at least one prospect turn"
+
+    # Count prospect turns in the Turn list (excluding agent and the greeting) to check the length.
+    prospect_turn_count = sum(1 for t in ep.turns if t.speaker == "prospect")
+    assert len(traj) == prospect_turn_count, (
+        f"trajectory length {len(traj)} != prospect turn count {prospect_turn_count}"
+    )
+
+    # Each entry must be {"turn": <1-based int>, "drivers": {6 float keys, each rounded to 3 dp}}.
+    for i, entry in enumerate(traj):
+        assert "turn" in entry, f"entry {i} missing 'turn' key"
+        assert "drivers" in entry, f"entry {i} missing 'drivers' key"
+        assert entry["turn"] == i + 1, f"entry {i} has turn={entry['turn']}, expected {i + 1}"
+        drivers = entry["drivers"]
+        assert isinstance(drivers, dict), f"entry {i} drivers is not a dict"
+        # All 6 frozen driver keys must be present.
+        assert _TRAJECTORY_DRIVER_KEYS == set(drivers.keys()), (
+            f"entry {i} driver keys mismatch: got {set(drivers.keys())}"
+        )
+        for key, val in drivers.items():
+            assert isinstance(val, float), f"entry {i} driver '{key}' is not a float (got {type(val)})"
+            # Confirm 3 dp rounding: value must equal itself rounded to 3 places.
+            assert val == round(val, 3), (
+                f"entry {i} driver '{key}' = {val!r} is not rounded to 3 dp"
+            )
+            assert 0.0 <= val <= 1.0, f"entry {i} driver '{key}' = {val!r} out of [0, 1]"
+
+    # Round-trip: trajectory must survive serialization to Postgres and back.
+    got = await store.get_episode(ep.episode_id)
+    assert got is not None
+    rt_traj = (got.metrics or {}).get("prospect_trajectory")
+    assert rt_traj is not None, "trajectory not found after round-trip through store"
+    assert len(rt_traj) == len(traj)
+    for i, (orig, rt) in enumerate(zip(traj, rt_traj)):
+        assert orig["turn"] == rt["turn"], f"turn index mismatch at {i}"
+        assert set(orig["drivers"].keys()) == set(rt["drivers"].keys()), f"driver key mismatch at {i}"
+
+
+async def test_prospect_trajectory_via_injected_prospect():
+    """CB-06: the trajectory is also populated when an external (injected) prospect is passed as the
+    `prospect=` kwarg to run_episode, which is the GenerativeTwin code path (U15). The presence of
+    .state.snapshot() on the injected object is what matters — the same accumulation logic applies."""
+    config = load_config("champion_v0")
+    persona = _hot_qualified()
+    agent_llm = _agent_mock(act="attempt_close", target_slot=None, tier="consultation")
+    prospect_llm = _prospect_mock(big_push=True)
+
+    from src.sim.prospect import ProspectSimulator
+    injected = ProspectSimulator(persona, seed=7)
+
+    ep = await selfplay.run_episode(
+        persona, agent_llm, prospect_llm, config,
+        seed=7, cohort="training", max_turns=24,
+        prospect=injected,
+    )
+
+    traj = ep.metrics.get("prospect_trajectory")
+    assert traj is not None, "trajectory absent on injected-prospect run"
+    assert len(traj) > 0
+    for entry in traj:
+        assert set(entry["drivers"].keys()) == _TRAJECTORY_DRIVER_KEYS
