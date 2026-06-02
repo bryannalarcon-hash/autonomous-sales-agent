@@ -4,6 +4,7 @@
 // "consent required") and 503 (token: "voice unavailable / LiveKit creds absent") — without parsing
 // strings. Base URL comes from NEXT_PUBLIC_API_BASE (browser-safe); never embeds secrets.
 import type {
+  AutoDemoResponse,
   ChatRequest,
   ChatResponse,
   ConsentRespondRequest,
@@ -83,6 +84,14 @@ export function livekitToken(req: LiveKitTokenRequest): Promise<LiveKitTokenResp
 
 export function sessionEnd(req: SessionEndRequest): Promise<SessionEndResponse> {
   return postJson<SessionEndRequest, SessionEndResponse>(`/api/session/${encodeURIComponent(req.session_id)}/end`, req);
+}
+
+/** Kick off a SERVER-SIDE demo call. The backend streams turns into the live monitor (~1-2 min) and
+ *  the existing /api/live/active queue poll surfaces + auto-selects it — no body needed. Throws an
+ *  ApiError(503) (LLM key missing / demo capacity reached) whose `.message` is the human-readable
+ *  reason the caller can show. */
+export function startAutoDemo(): Promise<AutoDemoResponse> {
+  return postJson<Record<string, never>, AutoDemoResponse>('/api/demo/auto/start', {});
 }
 
 export { API_BASE };

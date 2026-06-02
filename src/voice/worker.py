@@ -28,7 +28,11 @@
 # PERSISTENCE (U2/U15/Layer2): at room close the finished VoiceSession is saved via
 # src.api.persistence.persist_call_end (channel="voice") with the bound phone-hash, any escalations
 # captured DURING the call, and the last close tier — so voice calls flow into /operate exactly like
-# text calls. LIVE PERSISTENCE (Layer 2): a stable live_episode_id is generated at call start; after
+# text calls. CB-09: a call that DISCONNECTS without ever reaching a terminal act (close/escalate/
+# disqualify) used to persist outcome=in_progress FOREVER and vanish from the Calls list; the shutdown
+# now maps such a call to a TERMINAL outcome via _terminal_outcome_on_disconnect ("abandoned" for a
+# 0-turn hang-up, "released" for a substantive no-close call) and re-saves the same row, so a hung-up
+# call is visible. LIVE PERSISTENCE (Layer 2): a stable live_episode_id is generated at call start; after
 # each committed agent turn _upsert_live_voice writes an in_progress Episode via persist_call_live
 # using that stable id so the Live monitor can query voice calls mid-call; _register_persistence
 # finalizes with the same id so no orphan row is created.
@@ -188,6 +192,65 @@ def _classify_consent_reply(text: str) -> str:
     if _CONSENT_YES_RE.search(t):
         return "yes"
     return "unclear"
+
+
+# --- Terminal outcome on participant-disconnect (CB-09) --------------------------------------------
+# A real inbound call that disconnects mid-call (LiveKit `participant disconnect`, reason
+# CLIENT_INITIATED) was persisted with outcome=in_progress FOREVER, because no terminal agent act
+# (attempt_close / escalate / disqualify) ever fired. The Calls list (/api/episodes via
+# operate._is_completed) filters OUT in_progress episodes, so a hung-up call was INVISIBLE. This pure,
+# livekit-free mapping assigns a TERMINAL outcome when the call ended WITHOUT a terminal act, using the
+# SAME canonical outcome vocabulary the sim already emits (selfplay._RELEASED) plus "abandoned" (a
+# 0-turn hang-up). A hang-up is NEVER a positive outcome — that is the whole point: it only maps the
+# NON-terminal case; a call that DID reach a terminal act keeps the outcome derive_outcome computed.
+#
+# - "abandoned": the caller dropped with ~no conversation (no committed turns). Renders as "Abandoned"
+#   via src.api.labels.OUTCOME_LABEL (added there so no bare slug leaks to the operator).
+# - "released": a substantive conversation happened (>=1 committed turn) but no close/escalate/dq —
+#   the same terminal the self-play loop uses for "ran out of runway without a commitment".
+
+# A LAST agent decision act that already means a TERMINAL outcome (persistence.derive_outcome maps each
+# to enrolled/booked/escalated/disqualified). When the last act is one of these, the call ALREADY has a
+# terminal outcome, so the disconnect mapping must NOT override it.
+_TERMINAL_ACTS = frozenset({"attempt_close", "escalate", "disqualify"})
+
+
+def _terminal_outcome_on_disconnect(
+    *,
+    turn_count: int,
+    escalated: bool,
+    committed_tier: Optional[str],
+    last_act: Optional[str],
+) -> Optional[str]:
+    """Pick the TERMINAL outcome for a call that ended via participant-disconnect (CB-09).
+
+    Returns None when the call ALREADY reached a terminal outcome (a terminal last act fired, an
+    escalation was captured, or a close tier was committed) — the caller then keeps whatever
+    persistence.derive_outcome produced (enrolled / *_booked / escalated / disqualified). For a
+    NON-terminal disconnect it returns a terminal slug so the episode stops being in_progress:
+      - 0 committed turns  -> "abandoned" (the caller dropped during the opening, ~no conversation).
+      - >=1 committed turn  -> "released" (a real exchange happened but no close — the same canonical
+        terminal selfplay._RELEASED uses).
+    A hang-up is NEVER mapped to a positive outcome (enrolled / consult_booked); those only arise from
+    an actual terminal close act, which short-circuits this fn to None. Pure / stdlib-only so its unit
+    test runs in the livekit-free .venv; both returned slugs have human labels in src.api.labels."""
+    if last_act in _TERMINAL_ACTS or escalated or committed_tier:
+        return None
+    if turn_count <= 0:
+        return "abandoned"
+    return "released"
+
+
+def _last_committed_act(turns: list[Any]) -> Optional[str]:
+    """The act of the most recent committed AGENT turn (its `decision` string), or None.
+
+    Mirrors persistence._last_agent_decision but kept livekit-free + local so the worker can feed
+    _terminal_outcome_on_disconnect without importing a private helper across the persistence seam.
+    A committed agent Turn carries the system act on `.decision` (schema.Turn); user turns have None."""
+    for turn in reversed(turns or []):
+        if getattr(turn, "speaker", None) == "agent" and getattr(turn, "decision", None):
+            return turn.decision
+    return None
 
 
 def _is_sip_call(ctx: Any) -> bool:
@@ -733,6 +796,28 @@ def _register_persistence(ctx: Any, agent: WorkerVoiceAgent, config: AgentConfig
                 last_tier=agent.last_close_tier,
                 episode_id=agent.live_episode_id,
             )
+            # CB-09: a disconnect WITHOUT a terminal act persisted as in_progress forever (invisible in
+            # the Calls list, which filters in_progress out). When the call ended non-terminal, map it
+            # to a TERMINAL outcome (abandoned / released) and RE-SAVE the same row (save_episode
+            # upserts ON CONFLICT). persist_call_end / persistence.py are intentionally untouched; the
+            # override lives here because only the worker knows the call ended on a participant-
+            # disconnect. derive_outcome already produced terminal outcomes for close/escalate/dq, so
+            # the mapping returns None for those and we leave the persisted outcome as-is.
+            terminal = _terminal_outcome_on_disconnect(
+                turn_count=len(agent.voice_session.state.turns),
+                escalated=bool(agent.escalations),
+                committed_tier=agent.last_close_tier,
+                last_act=_last_committed_act(agent.voice_session.state.turns),
+            )
+            if terminal is not None and episode.outcome in (None, "", "in_progress"):
+                episode.outcome = terminal
+                episode.ladder_tier = 0
+                episode.qualified = False
+                from src.memory import store
+
+                await store.save_episode(episode)
+                logger.info("CB-09 disconnect: re-saved episode %s as terminal outcome=%s",
+                            episode.episode_id, terminal)
             logger.info("persisted voice episode %s (outcome=%s)", episode.episode_id, episode.outcome)
         except Exception as exc:  # pragma: no cover - prod-only path (needs a real call + DB)
             logger.warning("voice episode persistence skipped/failed: %s", type(exc).__name__)

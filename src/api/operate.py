@@ -94,10 +94,13 @@ _MAX_FETCH = 10000
 
 
 def _is_completed(ep: Episode) -> bool:
-    """Terminal outcome + at least one turn. Excludes active/0-turn episodes from the P3 list."""
+    """Terminal outcome + at least one turn — EXCEPT a terminal 'abandoned' hang-up, which is a real
+    missed lead that dropped during the agent's opening (so 0 committed turns) and MUST still surface
+    in the Calls list (CB-09). in_progress / unset outcomes are still excluded (those are active or
+    never-finalized shells, caught by the first guard)."""
     if ep.outcome in _UNFINISHED_OUTCOMES:
         return False
-    return len(ep.turns) > 0
+    return len(ep.turns) > 0 or ep.outcome == "abandoned"
 
 
 def _is_active(ep: Episode, *, now: Optional[datetime] = None) -> bool:

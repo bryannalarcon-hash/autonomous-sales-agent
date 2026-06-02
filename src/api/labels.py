@@ -28,6 +28,7 @@ OUTCOME_LABEL: dict[str, str] = {
     "booked": "Booked",
     "interested": "Interested",
     "released": "Released",
+    "abandoned": "Abandoned",  # CB-09: caller hung up mid-call with ~no conversation (0 turns)
     "no_interest": "No interest",
     "walked": "Walked away",
     "disqualified": "Disqualified",

@@ -74,6 +74,16 @@ export interface SessionEndResponse {
   persisted: boolean;
 }
 
+// --- POST /api/demo/auto/start ------------------------------------------------------------------
+
+/** Response from POST /api/demo/auto/start — kicks off a SERVER-SIDE demo call that streams turns
+ *  into the live monitor over ~1-2 min, independent of the browser. 503 if the LLM key is missing
+ *  or demo capacity is reached (the 503 `detail` surfaces via ApiError.message in lib/api.ts). */
+export interface AutoDemoResponse {
+  episode_id: string;
+  started: boolean;
+}
+
 // --- POST /api/livekit/token --------------------------------------------------------------------
 
 export interface LiveKitTokenRequest {

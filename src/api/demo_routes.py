@@ -8,7 +8,10 @@
 # an escalation with a PII-scrubbed moment, and reports `done` for terminal acts; LIVE PERSISTENCE
 # (Layer 2): after each /api/chat turn the live_upsert_hook (default: persist_call_live) upserts an
 # in_progress Episode using a stable episode_id + created_at stamped at session creation, so the Live
-# monitor can query the call WHILE it is happening; /api/livekit/token (503 without creds) mints a
+# monitor can query the call WHILE it is happening; POST /api/demo/auto/start (CB-08) kicks off a
+# SERVER-SIDE scripted demo call (consent pre-captured) that streams the real brain through that same
+# per-turn live-upsert path as a background task — so the Live monitor populates without a phone AND
+# the demo survives the operator navigating away (it is not browser-bound); /api/livekit/token (503 without creds) mints a
 # token via the injected builder AND stamps the already-captured consent onto the room metadata
 # (consent_state/recording_granted/jurisdiction/phone_hash/conversable — no secrets) so the live
 # voice worker SEEDS its ConsentGate from it instead of deadlocking on a pending gate waiting for
@@ -20,7 +23,9 @@
 # is scrubbed in the VoiceSession before storage; the lead key is the phone-hash.
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import uuid
 from collections import OrderedDict
@@ -30,6 +35,8 @@ from typing import Any, Awaitable, Callable, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 from src.config.settings import AgentConfig
 from src.core.belief_state import BeliefState
@@ -63,6 +70,25 @@ LiveUpsertHook = Callable[..., Awaitable[Any]]
 # evicts its session, and a fresh /consent/start over the cap is refused with 503 rather than letting
 # the in-memory dict grow without bound. Overridable via MAX_DEMO_SESSIONS for load tests.
 _DEFAULT_MAX_SESSIONS = 5000
+
+# Server-side auto-demo (POST /api/demo/auto/start): a scripted, realistic QUALIFIED-parent arc the
+# backend plays against the real brain so the Live monitor populates turn-by-turn WITHOUT a phone and,
+# crucially, INDEPENDENT of the browser (it survives the operator navigating away + back). The arc
+# warms toward an explicit move-forward so the close gate can fire (terminal "Consultation booked"
+# rather than lingering in_progress). Agent replies are the real brain; only these lines are scripted.
+_AUTO_DEMO_SCRIPT: tuple[str, ...] = (
+    "Hi — my daughter's a high-school sophomore and she's really struggling with Algebra 2 right before finals.",
+    "She does all the homework but still gets C's and D's on the tests, and her confidence is shot.",
+    "We tried one of those free tutoring apps and she just didn't stick with it. What makes you different?",
+    "That actually sounds like what she needs. How does the pricing work — is it worth it?",
+    "Okay, that's reasonable. How soon could she actually start with someone?",
+    "Great — let's go ahead and get her set up. What's the next step?",
+    "Yes, I'm ready to move forward today — sign us up.",
+    "Perfect. Please go ahead and book the first session for us.",
+)
+# Gap BETWEEN turns (on top of the ~6 s real-brain latency per turn) so the operator can watch each
+# turn land in the monitor and the heartbeat stays fresh. Kept short — the brain is the real pacer.
+_AUTO_DEMO_TURN_GAP_S = 1.5
 
 
 # --- request/response DTOs (the EXACT contract the front-end depends on) -------------------------
@@ -131,6 +157,13 @@ class EndResponse(BaseModel):
     outcome: str
     escalations: int
     persisted: bool
+
+
+class AutoDemoResponse(BaseModel):
+    # Returned by POST /api/demo/auto/start. episode_id is the stable live id the background demo will
+    # stream into (the /api/live/active poll surfaces it); started is always True on a 200.
+    episode_id: str
+    started: bool
 
 
 @dataclass
@@ -313,6 +346,119 @@ def create_demo_router(
             )
         except Exception:
             pass  # swallow — persist_call_live already logs; never crash the call path
+
+    # --- Server-side auto-demo (POST /api/demo/auto/start) -------------------------------------
+    # Holds strong refs to in-flight demo tasks (asyncio only weakly references tasks, so without
+    # this a demo could be garbage-collected mid-run). Each task discards itself on completion.
+    _demo_tasks: "set[asyncio.Task[Any]]" = set()
+
+    async def _finalize_auto_demo(sess: _Session) -> None:
+        """Persist the finished auto-demo terminal + evict it — mirrors /end's persist branch but runs
+        server-side. Passes the stable created_at so duration_ms is recorded. Idempotent on `ended`;
+        swallows failures so a finalize hiccup never leaks the background task."""
+        if sess.ended:
+            return
+        sess.ended = True
+        try:
+            if sess.voice_session is not None:
+                from src.api.persistence import derive_outcome
+
+                persist = call_end_persist_hook
+                if persist is None:
+                    from src.api.persistence import persist_call_end as _pce
+
+                    persist = _pce
+                # If the agent closed at ANY point in the call, force that terminal outcome even when
+                # the LAST turn wasn't the close (the script keeps talking past a mid-call close) — so
+                # the demo lands in the Calls list as e.g. "Consultation booked", not in_progress.
+                override = (
+                    derive_outcome("attempt_close", sess.last_close_tier)[0]
+                    if sess.last_close_tier
+                    else None
+                )
+                await persist(
+                    sess.voice_session,
+                    config=cfg,
+                    channel=sess.channel,
+                    escalation_logs=list(sess.escalations),
+                    last_tier=sess.last_close_tier,
+                    episode_id=sess.live_episode_id,
+                    created_at=sess.live_created_at,
+                    outcome_override=override,
+                )
+        except Exception:
+            logger.warning("auto-demo finalize failed for session %s", sess.session_id)
+        finally:
+            try:
+                sess.gate.end()
+            except Exception:
+                pass
+            sessions.pop(sess.session_id, None)
+
+    async def _run_auto_demo(sess: _Session) -> None:
+        """Background task: stream _AUTO_DEMO_SCRIPT through the REAL brain + the SAME per-turn
+        live-upsert path /api/chat uses, paced so the operator watches the monitor populate. Runs
+        server-side so it SURVIVES the operator navigating away. ALWAYS finalizes (terminal persist +
+        evict) in a finally so no in_progress shell dangles."""
+        try:
+            vs = _ensure_voice_session(sess)
+            for i, line in enumerate(_AUTO_DEMO_SCRIPT):
+                if sess.ended:
+                    return
+                sess._speech_counter += 1
+                speech_id = f"s-{sess._speech_counter}"
+                try:
+                    pending = await vs.handle_user_turn(line, speech_id)
+                except ConsentError:
+                    break
+                committed = vs.commit_turn(speech_id)
+                # Record that the agent closed (at whatever tier) — used by _finalize_auto_demo to force
+                # a terminal outcome even if a LATER turn isn't a close. We run the WHOLE script (rather
+                # than stopping on the first close) so the demo always shows a full, watchable arc: the
+                # agent sometimes closes early (LLM variance) and a 2-turn dud would be a poor demo.
+                decided = committed if committed is not None else pending
+                if decided.decision.act == "attempt_close":
+                    sess.last_close_tier = decided.decision.tier
+                # Same heartbeat upsert /api/chat fires — surfaces the call in the Live monitor.
+                await _live_upsert(sess)
+                # A hard terminal act (disqualify / escalate) genuinely ends the call — stop there.
+                if decided.decision.act in ("disqualify", "escalate"):
+                    break
+                if i < len(_AUTO_DEMO_SCRIPT) - 1:
+                    await asyncio.sleep(_AUTO_DEMO_TURN_GAP_S)
+        except Exception:
+            logger.warning("auto-demo runner crashed for session %s", sess.session_id)
+        finally:
+            await _finalize_auto_demo(sess)
+
+    @router.post("/api/demo/auto/start", response_model=AutoDemoResponse)
+    async def demo_auto_start() -> AutoDemoResponse:
+        """Kick off a SERVER-SIDE scripted demo call (CB-08). Returns immediately with the stable
+        episode_id; a background task streams the call into the Live monitor (the /api/live/active
+        poll surfaces it) and it survives the operator navigating away. 503 when the real brain is
+        unavailable (no OPENROUTER_API_KEY) or the bounded session store is at capacity."""
+        if not os.environ.get("OPENROUTER_API_KEY"):
+            raise HTTPException(
+                status_code=503,
+                detail="demo unavailable: the language-model key is not configured.",
+            )
+        if len(sessions) >= max_sessions:
+            raise HTTPException(
+                status_code=503,
+                detail="demo session capacity reached; please retry shortly.",
+            )
+        # Consent PRE-CAPTURED (server-driven demo — no human consent UI): a non-minor accept, i.e.
+        # AI disclosure acknowledged + recording granted -> the gate permits conversation.
+        session_id = uuid.uuid4().hex
+        gate = ConsentGate(jurisdiction="", refusal_policy=refusal_policy)
+        gate.acknowledge_ai()
+        gate.grant_recording()
+        sess = _Session(session_id=session_id, gate=gate, channel="text")
+        sessions[session_id] = sess
+        task = asyncio.create_task(_run_auto_demo(sess))
+        _demo_tasks.add(task)
+        task.add_done_callback(_demo_tasks.discard)
+        return AutoDemoResponse(episode_id=sess.live_episode_id, started=True)
 
     # --- POST /api/consent/start ----------------------------------------------------------------
 
@@ -527,6 +673,7 @@ def create_demo_router(
                 escalation_logs=list(sess.escalations),
                 last_tier=sess.last_close_tier,
                 episode_id=sess.live_episode_id,
+                created_at=sess.live_created_at,
             )
         else:
             from src.api.persistence import persist_call_end
@@ -540,6 +687,7 @@ def create_demo_router(
                 escalation_logs=list(sess.escalations),
                 last_tier=sess.last_close_tier,
                 episode_id=sess.live_episode_id,
+                created_at=sess.live_created_at,
             )
         # Now end the gate (recorded already captured into the episode metrics above).
         sess.gate.end()

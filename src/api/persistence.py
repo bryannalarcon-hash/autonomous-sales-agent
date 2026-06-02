@@ -77,6 +77,8 @@ def episode_from_session(
     persona: Optional[str] = None,
     episode_id: Optional[str] = None,
     last_tier: Optional[str] = None,
+    created_at: Optional[datetime] = None,
+    outcome_override: Optional[str] = None,
 ) -> Episode:
     """Build a unified Episode from a finished VoiceSession's committed state (pure — no DB).
 
@@ -86,15 +88,33 @@ def episode_from_session(
     "voice" for the worker), the lead phone-hash key (raw phone NEVER stored), persona, cohort, the
     escalated flag, and metrics including ["recorded"]=session.recorded + turn_count. `last_tier`
     overrides the close tier when the caller tracked it out-of-band (the schema Turn carries no tier).
+    `created_at`, when passed (the stable call-start stamped at session creation), is preserved on the
+    Episode so the final /end upsert keeps the call's true start AND records metrics["duration_ms"]
+    (now − start) so the Live monitor + Review show how long the call ran. `outcome_override` lets a
+    caller force a terminal outcome for an end that reached no terminal ACT (e.g. a mid-call hang-up →
+    "abandoned"/"released") so the call no longer lingers as in_progress.
     """
     state = session.state
     turns: list[Turn] = list(state.turns)
     last_act, last_turn = _last_agent_decision(turns)
     # Prefer the explicitly-passed tier; else fall back to none (derive_outcome defaults safely).
     outcome, ladder_tier, qualified, escalated = derive_outcome(last_act, last_tier)
+    # An explicit override only applies when the conversation reached NO terminal act (outcome is the
+    # in_progress sentinel) — never overrides a real close/escalate/disqualify the brain actually made.
+    if outcome_override is not None and outcome == "in_progress":
+        outcome = outcome_override
 
     stamp = config.stamp()
     persona_name = persona or getattr(getattr(config, "persona", None), "name", None)
+
+    metrics: dict[str, Any] = {
+        "recorded": bool(getattr(session, "recorded", False)),
+        "turn_count": len(turns),
+    }
+    # duration_ms (now − stable start): only when created_at is known. Clamped at 0 (clock skew safe).
+    if created_at is not None:
+        elapsed_ms = int((datetime.now(timezone.utc) - created_at).total_seconds() * 1000)
+        metrics["duration_ms"] = max(0, elapsed_ms)
 
     return Episode(
         episode_id=episode_id or f"ep-{uuid.uuid4().hex}",
@@ -109,10 +129,8 @@ def episode_from_session(
         persona=persona_name,
         cohort=cohort,
         escalated=escalated,
-        metrics={
-            "recorded": bool(getattr(session, "recorded", False)),
-            "turn_count": len(turns),
-        },
+        metrics=metrics,
+        **({"created_at": created_at} if created_at is not None else {}),
     )
 
 
@@ -158,7 +176,13 @@ async def persist_call_live(
             # live_heartbeat = the moment of THIS upsert (last activity). _is_active (operate.py) reads
             # it to keep a call "live" only while fresh — so a real call stays live for its whole run
             # (the beat advances every turn) while an abandoned partial goes stale and drops out.
-            metrics={"turn_count": len(turns), "live_heartbeat": datetime.now(timezone.utc).isoformat()},
+            # duration_ms = now − stable start, so the Live monitor's running clock advances each turn
+            # (the per-second UI tick interpolates between these; clamped ≥0 for clock-skew safety).
+            metrics={
+                "turn_count": len(turns),
+                "live_heartbeat": datetime.now(timezone.utc).isoformat(),
+                "duration_ms": max(0, int((datetime.now(timezone.utc) - created_at).total_seconds() * 1000)),
+            },
             created_at=created_at,
         )
         await store.save_episode(episode)
@@ -179,8 +203,15 @@ async def persist_call_end(
     escalation_logs: Optional[list[Any]] = None,
     last_tier: Optional[str] = None,
     episode_id: Optional[str] = None,
+    created_at: Optional[datetime] = None,
+    outcome_override: Optional[str] = None,
 ) -> Episode:
     """Persist a finished demo call: lead -> episode -> escalations, plus per-lead memory (U2/U14/U15).
+
+    `created_at` (the stable call-start stamped at session creation) is threaded to episode_from_session
+    so the final upsert preserves the call's true start AND records metrics["duration_ms"] (call length).
+    `outcome_override` forces a terminal outcome ("abandoned"/"released") for an end that reached no
+    terminal act (a mid-call hang-up) so the call no longer lingers as in_progress / invisible in Calls.
 
     SINGLE-SOURCED LEAD KEY (FK-safe): the episode's lead_phone_hash must reference an EXISTING lead
     row (migrations/001_init.sql), so the key is derived/guaranteed server-side — a client-supplied
@@ -235,6 +266,8 @@ async def persist_call_end(
         cohort=cohort,
         last_tier=last_tier,
         episode_id=episode_id,
+        created_at=created_at,
+        outcome_override=outcome_override,
     )
     # 2. Episode (the FK target for escalations).
     await store.save_episode(episode)

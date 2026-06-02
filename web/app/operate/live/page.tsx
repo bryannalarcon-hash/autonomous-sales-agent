@@ -8,9 +8,12 @@
 // pre-translated by the backend; raw persona slug is humanized via @/lib/labels (archetypeLabel).
 // N3 invariant: LIVE pill + recording dot are ONLY shown when snap.active is true AND snap.sample
 // is NOT true. Internal episode IDs never render as primary labels; persona_label is used.
-// "Run demo call" (empty state): kicks off a scripted self-driving call (lib/demo-call) through the
-// real consent + chat endpoints so the monitor populates turn-by-turn without a phone; the existing
-// queue poll auto-selects it. Best-effort ends the demo session on unmount (no dangling shell).
+// "Run demo call" (empty state): POSTs /api/demo/auto/start (lib/api.startAutoDemo) to launch a
+// SERVER-SIDE demo call that streams turns into the monitor over ~1-2 min, independent of the
+// browser; the existing queue poll surfaces + auto-selects it (no navigation, no client orchestrator
+// — navigating away no longer kills the call). A 503 (no LLM key / capacity) shows its reason.
+// The call-duration timer ticks live (useNow, 1 s) off created_at for active calls; auto-scroll is a
+// real toggle that pins the transcript scroller to the newest turn while on.
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -19,9 +22,20 @@ import { Icon } from '@/components/cadence/Icon';
 import { fetchActiveCalls, fetchLive, fetchSampleCall, fmtDuration, initials } from '@/lib/operate-api';
 import { archetypeLabel, versionLabel } from '@/lib/labels';
 import type { ActiveCallSummary, ActiveCallsResponse, BeliefSnapshot, LiveSnapshot, Turn } from '@/lib/operate-types';
-import { runDemoCall, type DemoHandle, type DemoProgress } from '@/lib/demo-call';
+import { ApiError, startAutoDemo } from '@/lib/api';
 
 const POLL_MS = 5000;
+
+/** A `now` timestamp that ticks once a second so a live call's elapsed duration counts up in the UI
+ *  (the live snapshot has no duration_ms until the call ends). Pure clock — no data fetch. */
+function useNow(): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  return now;
+}
 
 function fmtPct(v: number | null | undefined): string {
   return v == null ? '—' : v.toFixed(2);
@@ -242,6 +256,25 @@ function CallMonitor({
   const isLive = snap.active === true && snap.sample !== true;
   const isSample = snap.sample === true;
 
+  // Live elapsed timer: an active call has no metrics.duration_ms until it ends, so for a live call
+  // count up from created_at against a 1 s ticking clock; a completed/sample call uses the recorded
+  // duration. created_at may be null (show "—" via fmtDuration(null)).
+  const now = useNow();
+  const startedMs = ep.created_at ? Date.parse(ep.created_at) : NaN;
+  const durationMs =
+    isLive && Number.isFinite(startedMs)
+      ? now - startedMs
+      : ((ep.metrics?.duration_ms as number | undefined) ?? null);
+
+  // Auto-scroll: when ON, pin the transcript scroller to the bottom as new turns stream in.
+  const [autoScroll, setAutoScroll] = useState(true);
+  const streamRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!autoScroll) return;
+    const el = streamRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [ep.turns.length, autoScroll]);
+
   return (
     <div className="lv">
       <div className="lv-body">
@@ -266,7 +299,7 @@ function CallMonitor({
               </div>
             </div>
             <div className="lv-pright">
-              <div className="lv-dur">{fmtDuration((ep.metrics?.duration_ms as number) ?? null)}</div>
+              <div className="lv-dur">{fmtDuration(durationMs)}</div>
               <div className="lv-vtag">
                 {versionLabel(ep.version)} · {ep.kb_version}
               </div>
@@ -297,12 +330,18 @@ function CallMonitor({
                 style={{ marginLeft: 'auto', fontSize: 11.5, color: 'var(--text-3)', fontWeight: 550 }}
               >
                 Auto-scroll
-                <span className="toggle on">
+                <span
+                  className={`toggle${autoScroll ? ' on' : ''}`}
+                  role="switch"
+                  aria-checked={autoScroll}
+                  aria-label="Toggle auto-scroll"
+                  onClick={() => setAutoScroll((v) => !v)}
+                >
                   <i />
                 </span>
               </span>
             </div>
-            <div className="lv-stream scroll">
+            <div className="lv-stream scroll" ref={streamRef}>
               {ep.turns.map((t) => (
                 <TranscriptTurn key={t.turn_id} turn={t} />
               ))}
@@ -369,19 +408,17 @@ function CallMonitor({
   );
 }
 
-/** Human-readable narration for the demo-call lifecycle (no internal phase slugs shown). */
-function demoStatusText(d: DemoProgress): string {
-  switch (d.phase) {
-    case 'consent':
-      return 'Connecting the demo call…';
-    case 'turn':
-      return `Demo call in progress — turn ${d.turn ?? 1} of ${d.total ?? '…'}…`;
-    case 'ending':
-      return 'Wrapping up the demo call…';
-    case 'done':
-      return 'Demo call complete.';
+/** Transient status for the server-side demo trigger. The call itself runs on the backend and shows
+ *  up via the live queue poll — this only narrates the kick-off ('starting') and any 503 ('error'). */
+type DemoStatus = { kind: 'idle' | 'starting' | 'error'; msg?: string };
+
+/** Human-readable narration for the demo-trigger status (no internal slugs shown). */
+function demoStatusText(d: DemoStatus): string {
+  switch (d.kind) {
+    case 'starting':
+      return 'Starting demo… it will appear here in a few seconds.';
     case 'error':
-      return d.error ? `Demo call failed: ${d.error}` : 'Demo call failed.';
+      return d.msg ?? 'Could not start the demo call.';
     default:
       return '';
   }
@@ -401,35 +438,27 @@ export default function LivePage() {
   const [sampleSnap, setSampleSnap] = useState<LiveSnapshot | null>(null);
   const [sampleLoading, setSampleLoading] = useState(false);
 
-  // "Run demo call" state — a self-driving scripted call so the monitor lights up without a phone.
-  const [demo, setDemo] = useState<DemoProgress | null>(null);
-  const demoHandleRef = useRef<DemoHandle | null>(null);
-  const demoAbortRef = useRef<AbortController | null>(null);
-  const demoRunning = demo != null && demo.phase !== 'done' && demo.phase !== 'error';
+  // "Run demo call" state — POSTs /api/demo/auto/start to launch a SERVER-SIDE demo call that runs
+  // independent of the browser; the queue poll surfaces + auto-selects it. We only track the
+  // transient kick-off ('starting', cleared after ~10 s) and any 503 reason ('error').
+  const [demoStatus, setDemoStatus] = useState<DemoStatus>({ kind: 'idle' });
+  const demoStarting = demoStatus.kind === 'starting';
 
-  const handleRunDemo = useCallback(() => {
-    if (demoRunning) return;
+  const handleRunDemo = useCallback(async () => {
+    if (demoStarting) return;
     setShowSample(false); // a real (demo) call is about to appear — drop the sample preview
-    const ac = new AbortController();
-    demoAbortRef.current = ac;
-    setDemo({ phase: 'consent' });
-    const handle = runDemoCall((p) => setDemo(p), ac.signal);
-    demoHandleRef.current = handle;
-    void handle.done.then((final) => {
-      demoHandleRef.current = null;
-      demoAbortRef.current = null;
-      // Auto-clear the status a few seconds after a clean finish so the empty state resets.
-      if (final.phase === 'done') setTimeout(() => setDemo((d) => (d === final ? null : d)), 6000);
-    });
-  }, [demoRunning]);
-
-  // Best-effort cleanup: if the operator navigates away mid-demo, abort + end the session so we don't
-  // leave a dangling in-progress shell (runDemoCall ends the session on abort-triggered error path).
-  useEffect(() => {
-    return () => {
-      demoAbortRef.current?.abort();
-    };
-  }, []);
+    setDemoStatus({ kind: 'starting' });
+    try {
+      await startAutoDemo();
+      // The server-side call now streams into the monitor via the queue poll (POLL_MS). Clear the
+      // transient "starting" note after a beat — by then the call has surfaced and taken over.
+      setTimeout(() => setDemoStatus((s) => (s.kind === 'starting' ? { kind: 'idle' } : s)), 10000);
+    } catch (e) {
+      // 503 → LLM key missing / demo capacity reached. Show the backend's human-readable reason.
+      const msg = e instanceof ApiError ? e.message : 'Could not start the demo call.';
+      setDemoStatus({ kind: 'error', msg });
+    }
+  }, [demoStarting]);
 
   // Keep a ref so the detail-polling interval always sees the current selectedEpisodeId
   const selectedRef = useRef<string | null>(null);
@@ -590,32 +619,28 @@ export default function LivePage() {
           <h3>No active call</h3>
           <p>Nothing is on the line right now. The monitor will light up the moment a call starts.</p>
 
-          {/* "Run demo call" — drives a scripted self-playing call through the real consent + chat
-              path so the operator can watch the live monitor populate without dialing in. */}
+          {/* "Run demo call" — POSTs /api/demo/auto/start to launch a SERVER-SIDE demo call. It runs
+              on the backend and surfaces in the monitor via the queue poll a few seconds later (no
+              navigation, and navigating away no longer kills it). */}
           <div className="lv-demo" data-testid="run-demo" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, marginTop: 4 }}>
             <button
               className="btn btn-primary"
               onClick={handleRunDemo}
-              disabled={demoRunning}
+              disabled={demoStarting}
               aria-label="Run a demo call"
             >
               <Icon name="broadcast" size={16} />
-              {demoRunning ? 'Demo call running…' : 'Run demo call'}
+              {demoStarting ? 'Starting demo…' : 'Run demo call'}
             </button>
-            {demo ? (
-              <span style={{ fontSize: 12.5, color: demo.phase === 'error' ? 'var(--danger)' : 'var(--text-3)' }}>
-                {demoStatusText(demo)}
+            {demoStatus.kind !== 'idle' ? (
+              <span style={{ fontSize: 12.5, color: demoStatus.kind === 'error' ? 'var(--danger)' : 'var(--text-3)' }}>
+                {demoStatusText(demoStatus)}
               </span>
             ) : (
               <span style={{ fontSize: 12, color: 'var(--text-faint)' }}>
-                Plays a scripted call into the monitor — no phone needed.
+                Plays a real call into the monitor — no phone needed.
               </span>
             )}
-            {demo?.phase === 'done' && demo.episodeId ? (
-              <button className="btn btn-ghost btn-sm" onClick={() => router.push(`/operate/review/${demo.episodeId}`)}>
-                View the call in Review
-              </button>
-            ) : null}
           </div>
 
           {/* "Show sample call" toggle — lets operators preview the monitor with real data */}
