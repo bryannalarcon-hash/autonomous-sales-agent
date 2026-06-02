@@ -38,6 +38,9 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
   // "Flag" has no backend in this demo, so it's an HONEST local-only marker: toggling it shows a
   // "Flagged" pill on the call strip (a clear state change), reset per visit. Not persisted.
   const [flagged, setFlagged] = useState(false);
+  // Timed replay: when playing, auto-advance the scrubber through the turns, pacing EACH turn by its
+  // real measured latency (Turn.latency_ms) so the replay unfolds at the agent's actual thinking speed.
+  const [playing, setPlaying] = useState(false);
 
   // "Export" — client-side download of the already-fetched episode as JSON. No silent no-op: it
   // produces a real file (the forensic record the operator is looking at) named by the call id.
@@ -80,6 +83,20 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
     }
     return null;
   }, [ep, cur]);
+
+  // Drive the timed replay: hold the CURRENT turn for its real latency, then advance one turn. A
+  // prospect turn (no measured latency) uses a short default; floored so 0-latency turns aren't
+  // instant. Stops at the last turn; cleared on pause/unmount.
+  useEffect(() => {
+    if (!playing || !ep) return;
+    if (cur >= ep.turns.length - 1) {
+      setPlaying(false);
+      return;
+    }
+    const ms = ep.turns[cur]?.latency_ms ?? 1000;
+    const id = setTimeout(() => setCur((c) => Math.min(c + 1, ep.turns.length - 1)), Math.max(350, ms));
+    return () => clearTimeout(id);
+  }, [playing, cur, ep]);
 
   if (error) {
     return (
@@ -135,6 +152,14 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
   const total = ep.turns.length;
   const denom = total - 1 || 1;
   const active = ep.turns[cur];
+  const togglePlay = () => {
+    if (playing) {
+      setPlaying(false);
+    } else {
+      if (cur >= denom) setCur(0); // restart from the top if parked at the end
+      setPlaying(true);
+    }
+  };
   const trust = driverValue(snap, 'trust');
   const bail = driverValue(snap, 'bail_risk');
   // key decision turns -> tick marks on the scrubber.
@@ -255,7 +280,15 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
               <span className="tag accent">Turn {cur + 1}</span>
             </div>
             <div className="rv-scrub">
-              <Icon name="play" size={16} style={{ color: 'var(--accent)' }} />
+              <button
+                type="button"
+                onClick={togglePlay}
+                aria-label={playing ? 'Pause replay' : 'Play replay'}
+                title={playing ? 'Pause' : 'Play — advances each turn at its real latency'}
+                style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', display: 'flex', alignItems: 'center' }}
+              >
+                <Icon name={playing ? 'pause' : 'play'} size={16} style={{ color: 'var(--accent)' }} />
+              </button>
               <div
                 className="rv-track"
                 onClick={(e) => {
@@ -276,7 +309,8 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
               </div>
             </div>
             <div className="faint" style={{ fontSize: 11 }}>
-              Drag the scrubber or click a turn — the belief state below reflects that moment.
+              Press play to replay the call turn-by-turn at its real per-turn latency, or drag the
+              scrubber / click a turn — the belief state below reflects that moment.
             </div>
           </div>
 

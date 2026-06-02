@@ -66,6 +66,12 @@ _PATIENCE_BASE_DECAY = 0.03          # patience lost every turn regardless of ag
                                      # still get walked early.
 _PATIENCE_PRESSURE_PENALTY = 0.18    # extra loss when a pressure act lands on low trust (kept sharp)
 
+# GenerativeTwin anchoring fraction (src/sim/twin.py): after each LLM turn the twin's soft drivers
+# are pulled this fraction of the way toward the real-call arc target at that turn. 0.5 = halfway.
+# Exported here (next to the other sim constants) so twin.py imports it cleanly and tests can
+# assert on it via `from src.sim.prospect import _TWIN_ANCHOR`.
+_TWIN_ANCHOR: float = 0.5
+
 # Conviction coupling (CB-03): purchase_intent realistically TRACKS conviction = mean(trust, need).
 # The sim-LLM left intent crawling ~3x behind trust/need (trust would hit 1.0 while intent was still
 # 0.3), so warm, qualified prospects WALKED before intent ever reached the commit bar — the binding
@@ -466,6 +472,11 @@ class ProspectSimulator:
             decay += _PATIENCE_PRESSURE_PENALTY
         self.state.patience = _clamp01(self.state.patience - decay)
 
+    def _sim_messages(self, agent_utterance: str, agent_act: Optional[str]) -> list[Message]:
+        """The sim-LLM chat messages for this turn. A thin instance seam over the module-level
+        builder so a subclass (GenerativeTwin) can override the prompt cleanly — no monkey-patching."""
+        return _build_sim_messages(self.persona, self.state, agent_utterance, agent_act)
+
     async def respond(
         self,
         agent_utterance: str,
@@ -501,7 +512,10 @@ class ProspectSimulator:
         # Ask the sim LLM for in-character talk + proposed soft-driver deltas (robust to bad JSON).
         utterance = ""
         disqualifier_signaled = False
-        messages = _build_sim_messages(self.persona, self.state, agent_utterance, agent_act)
+        # Called via self (not the bare module fn) so a subclass (GenerativeTwin) can override the
+        # prompt by overriding _sim_messages — NO module-global monkey-patching, so concurrent
+        # prospects/twins never race on a shared builder reference.
+        messages = self._sim_messages(agent_utterance, agent_act)
         try:
             reply = await llm_client.complete_json(messages, model=model or SIM_MODEL)
         except ValueError:

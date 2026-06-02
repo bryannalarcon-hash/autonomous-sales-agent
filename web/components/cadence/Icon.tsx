@@ -10,7 +10,7 @@ export type IconName =
   | 'filter' | 'arrowR' | 'arrowUR' | 'check' | 'x' | 'clock' | 'user' | 'play' | 'scrub' | 'flag'
   | 'diff' | 'promote' | 'rollback' | 'plus' | 'edit' | 'save' | 'sliders' | 'target' | 'layers'
   | 'clipboard' | 'bolt' | 'eye' | 'dots' | 'phone' | 'grid' | 'download' | 'sigma' | 'gauge'
-  | 'seedling' | 'note';
+  | 'seedling' | 'note' | 'pause';
 
 const PATHS: Record<IconName, string> = {
   pulse: 'M3 12h3.5l2-7 4 14 2.5-9 1.5 4H21',
@@ -39,6 +39,7 @@ const PATHS: Record<IconName, string> = {
   clock: 'M12 7v5l3.5 2M12 21a9 9 0 100-18 9 9 0 000 18z',
   user: 'M12 12a4 4 0 100-8 4 4 0 000 8zM5 20a7 7 0 0114 0',
   play: 'M7 5l12 7-12 7V5z',
+  pause: 'M9 5v14M15 5v14',
   scrub: 'M3 12h18M7 8v8M12 6v12M17 9v6',
   flag: 'M5 21V4M5 4h12l-2 4 2 4H5',
   diff: 'M12 3v18M5 8H3m0 8h2m14-8h2m-2 8h2M8 6L5 8l3 2M16 14l3 2-3 2',

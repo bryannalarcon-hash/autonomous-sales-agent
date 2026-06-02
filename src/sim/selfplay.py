@@ -4,10 +4,13 @@
 # agent trainable — U10's improvement loop runs batches through run_batch(). Two SEPARATE LLM
 # clients per episode (agent vs prospect are different model families, KTD5). Realism corruption
 # (inject_noise) is applied to the prospect text BEFORE the agent sees it — deterministic, seeded —
-# so the agent's robust DST is exercised on garbled (voice-shaped) input. Collaborators:
-# src.core.respond, src.core.belief_state, src.sim.prospect/personas, src.config.settings,
-# src.core.llm, src.memory.{schema,store}. This file MAY import the store (it is the harness, not
-# core/) but MUST NOT import LiveKit (R37: text substrate) and MUST NOT touch src/core/.
+# so the agent's robust DST is exercised on garbled (voice-shaped) input. An optional `prospect=`
+# kwarg on run_episode lets callers inject a pre-built prospect (e.g. a GenerativeTwin for replay
+# experiments — U15) instead of creating a fresh ProspectSimulator; default None = current behavior.
+# Collaborators: src.core.respond, src.core.belief_state, src.sim.prospect/personas,
+# src.config.settings, src.core.llm, src.memory.{schema,store}. This file MAY import the store
+# (it is the harness, not core/) but MUST NOT import LiveKit (R37: text substrate) and MUST NOT
+# touch src/core/.
 from __future__ import annotations
 
 import asyncio
@@ -170,6 +173,7 @@ async def run_episode(
     persist: bool = True,
     last_user_act: Optional[str] = None,
     on_turn: Optional[Callable[[dict[str, Any]], None]] = None,
+    prospect: Optional[Any] = None,
 ) -> Episode:
     """Run ONE self-play episode: the agent brain (respond()) alternates with the ProspectSimulator
     to a terminal state, logging every turn (decision + rationale + belief snapshot) to a unified
@@ -183,9 +187,15 @@ async def run_episode(
     `retrieve_facts(belief, corrupted_text) -> facts` is an optional KB-grounding hook threaded to
     respond() (U5). `last_user_act` (e.g. "human_request") is passed to respond() each agent turn so
     the escalation gate can see it. If `persist`, the Episode is saved via store.save_episode().
+
+    `prospect`: an optional pre-built prospect object to use instead of constructing a new
+    ProspectSimulator. Must implement the same async respond(...) interface and expose a `.state`
+    attribute with `.walked` and `.committed_tier`. When None (the default), a new ProspectSimulator
+    is created from `persona` and `seed` — existing behaviour is entirely unchanged.
     """
     rng = random.Random(seed)
-    prospect = ProspectSimulator(persona, seed=seed)
+    if prospect is None:
+        prospect = ProspectSimulator(persona, seed=seed)
     belief = BeliefState.fresh()
 
     # `history` is the list of dicts the gates + respond() read. Key contract (must match exactly):
