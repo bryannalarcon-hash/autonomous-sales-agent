@@ -213,8 +213,11 @@ def episode_detail(ep: Episode) -> dict[str, Any]:
     return detail
 
 
-# 0-turn in-progress calls older than this are abandoned dials, not live. Overridable.
-_LIVE_STALE_SECONDS = float(os.environ.get("LIVE_STALE_SECONDS", "600"))
+# An in-progress call whose last live_heartbeat is older than this is abandoned/ended, not live — it
+# drops off /api/live. A genuine live call upserts a fresh heartbeat every agent turn (~10-30s apart),
+# so 180s is ample headroom while making an ended/abandoned call vanish from the monitor in ~3 min
+# instead of lingering for 10 (the "phantom active call" the operator saw). Overridable via env.
+_LIVE_STALE_SECONDS = float(os.environ.get("LIVE_STALE_SECONDS", "180"))
 
 
 def live_snapshot(
