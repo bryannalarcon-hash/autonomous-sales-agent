@@ -87,6 +87,69 @@
 - **Acceptance:** a Playwright text scan of `/operate/kpi` (cohort dropdown open), `/improve/approvals`, and `/operate/review/<sim-id>` finds no `held_out` / `max_concession_band` / `bail_risk` / `pushiness_cap` / other snake_case slug rendered.
 - **Refs:** QA round 7 findings; CB-06 screenshot audit (`tests/e2e/verify_cb05_cb06_screens.py` flagged `bail_risk` in `rv-rat`); `web/lib/labels.ts` (`populationLabel`/`dimensionLabel` already exist).
 
+### CB-10 — Incoherent seed/sim episodes (terminal outcome ≠ transcript)
+- **Type / Surface / Size:** bug · `data` (seed/sim episodes) · `/operate/calls` · `/operate/review` · M
+- **Prereqs:** —
+- **Important files (candidates):** the seeded sim batch + `scripts/seed_demo.py` (escalation-coherence precedent), `src/sim/selfplay.py::run_episode` (produces coherent arcs), `src/memory/store.py` (query/purge).
+- **Current:** legacy 3-turn sim seed episodes carry a generic discovery transcript (greeting → "My son needs help with SAT math." → "What score is he aiming for?") but a MISMATCHED terminal outcome. Confirmed on `ep-98b95465e9ec456d9dab1ffa80eff9c5` (channel=sim, cohort `coh-cda860a7`, **outcome=enrolled, 3 turns, no close in the transcript**). The user: "says it hit enrollment but the transcript shows nothing." New live/demo calls (CB-08) are already coherent — this is only the old seeded stubs.
+- **Desired:** every episode shown in Calls/Review has transcript↔outcome coherence (a terminal outcome's transcript actually reaches that close). Either REGENERATE the demo dataset via real self-play (`run_episode`, which now reliably closes — CB-03) and replace the 3-turn stubs, or PURGE the incoherent stubs. (DB DELETE/regenerate needs explicit user authorization.)
+- **Acceptance:** no episode in the Calls list shows a terminal outcome (enrolled/consult_booked/…) whose transcript never reaches a close; spot-check ≥10 seeded episodes.
+- **Refs:** `ep-98b95465…` (the reported case); `scripts/seed_demo.py`; `src/sim/selfplay.run_episode`; CB-03 (self-play now reaches realistic closes).
+
+### CB-11 — Remove the redundant per-call "explore/improve" button
+- **Type / Surface / Size:** change · `/operate/review` (TBC) · S
+- **Prereqs:** — *(blocked on confirming the exact element — see Notes)*
+- **Important files (candidates):** `web/app/operate/review/[id]/page.tsx` (the **"Use in experiment"** button, ~line 496–503, flask icon → `/improve/lab`) — the leading candidate; confirm against the actual screen the user means.
+- **Current:** a per-call button opens the Experiment Lab ("explore/improve" the call). The user reports it's useless because "we see the entire list on the right hand side" — i.e. the call list / belief panel already provides the affordance.
+- **Desired:** remove the redundant button (and any now-dead handler/import); keep the layout balanced.
+- **Acceptance:** the button is gone; no orphaned import/handler; tsc clean; the page layout still reads cleanly (screenshot check).
+- **Refs:** review page buttons row (`Flag` / `Export` / `Use in experiment`). NOTE: confirm WHICH button/screen with the user before removing (the "list on the right" detail doesn't perfectly match the Review layout).
+
+### CB-12 — Demo as a real-time, generated back-and-forth (not poll-batched scripted lines)
+- **Type / Surface / Size:** feature · `/operate/live` · `api` · M/L
+- **Prereqs:** builds on CB-08 (server-side demo).
+- **Important files (candidates):** `src/api/demo_routes.py::_run_auto_demo` (swap the scripted `_AUTO_DEMO_SCRIPT` for the `ProspectSimulator` so the prospect is LLM-GENERATED), `src/sim/prospect.py` (the generated prospect side), the live transport — today `web/app/operate/live/page.tsx` polls `/api/live/active` every `POLL_MS=5000`, so turns appear in batches; real-time needs SSE/WebSocket OR sub-second polling of the in-progress turns.
+- **Current:** the demo plays FIXED prospect lines against the real brain, and the UI refreshes on the 5 s poll — so turns show up in clumps "every few seconds," not as a live exchange.
+- **Desired:** (1) the PROSPECT generates its turn via the brain/sim (varied run-to-run, a true self-play), then the AGENT generates its reply; (2) each turn STREAMS to the monitor as it's produced (prospect bubble appears, then agent bubble), in near-real-time — not batched on a 5 s poll.
+- **Acceptance:** watching a demo, each turn appears individually as generated (prospect → agent → prospect …), with sub-second latency from server commit to on-screen; prospect lines differ across two runs (proving generation, not a script).
+- **Refs:** `src/sim/selfplay.run_episode` (the self-play loop), `persist_call_live` heartbeat, the live poll cadence; an SSE endpoint pattern.
+
+### CB-13 — Demo end: clear "call ended" marker + the monitor must NOT auto-close
+- **Type / Surface / Size:** feature · `/operate/live` · S
+- **Prereqs:** builds on CB-08.
+- **Important files (candidates):** `web/app/operate/live/page.tsx` (the active-call → empty-state transition + the queue auto-select), the demo finalizer in `src/api/demo_routes.py` (terminal outcome).
+- **Current:** when the demo ends it goes terminal → drops out of `/api/live/active` → the monitor auto-clears (empty state / auto-selects another call). There's no explicit end-of-call signal in the transcript, and the just-watched call vanishes.
+- **Desired:** at end, render a clear **"Call ended"** marker in the transcript (with the outcome), and the monitor must NOT auto-close/clear — the finished call stays on screen until the operator explicitly dismisses it / returns to the live list.
+- **Acceptance:** after a demo completes, the transcript shows an unmistakable "Call ended — <outcome>" marker and the call remains displayed (no auto-clear); a manual control returns to the live queue.
+- **Refs:** `web/app/operate/live/page.tsx` empty-state + `pollQueue` auto-select; CB-08 demo finalizer.
+
+### CB-14 — Site-wide scroll/click jank from pervasive backdrop-filter blur
+- **Type / Surface / Size:** bug · `perf` · all surfaces (`cadence.css` global) · S
+- **Prereqs:** —
+- **Important files (candidates):** `web/app/cadence.css` (`--glass-blur: saturate(150%) blur(22px)` on `.card`+`.kpi`; `backdrop-filter: blur(8px)` on `.nav`+`.topbar`); minor: the CB-08 `useNow` 1 s timer (`web/app/operate/live/page.tsx`).
+- **Current:** the console feels slow on every scroll and click. Root cause: `backdrop-filter: blur(22px)` is applied to EVERY `.card` and `.kpi` (the KPI page alone renders ~15) plus the always-visible `.nav`/`.topbar` — the browser re-composites + re-blurs all those layers on every paint/scroll frame (a well-known scroll-jank source, amplified by `next dev`). Secondary: the live-page `useNow` interval re-renders `CallMonitor` every second even when idle.
+- **Desired:** smooth scroll/click. Drop `backdrop-filter` from the high-count, always-on surfaces (cards/kpi/nav/topbar) while KEEPING the translucent `--glass` gradient + sheen/shadow so the look is preserved (the blur is barely visible over the solid dark page bg). Keep blur only on transient overlays (`.drawer`/`.modal`/`.scrim`). Optionally gate the `useNow` tick to active calls only.
+- **Acceptance:** scrolling a card-heavy page (`/operate/kpi`) is smooth; before/after screenshots show the visual look preserved (translucent cards, sheen, borders intact); no `backdrop-filter` on `.card`/`.kpi`/`.nav`/`.topbar`; tsc/build unaffected.
+- **Refs:** `web/app/cadence.css` lines ~26–28 (`--glass`/`--glass-blur`), 112 (`.nav`), 144 (`.topbar`), 175 (`.card`), 256 (`.kpi`).
+
+### CB-15 — "Run experiment" freezes the page (synchronous minutes-long endpoint)
+- **Type / Surface / Size:** bug · `/improve/lab` · `api` · M
+- **Prereqs:** —
+- **Important files (candidates):** `src/api/improve.py::run_experiment_ep` (~line 519 — runs the full A/B inline under `asyncio.wait_for` + `run_semaphore`), `web/app/improve/lab/page.tsx` (`RunDrawer.submit` ~299 awaits the single fetch; the poll at ~494 already exists), `web/lib/improve-api.ts::runExperiment`.
+- **Current:** `POST /api/experiments/run` executes the ENTIRE A/B (`n×2` REAL model calls, minutes long in prod) SYNCHRONOUSLY before responding. The drawer `await`s that one request with the button stuck on "Running…", so the page looks frozen for the whole run; a second run returns 503 busy. No progress/cancel/escape.
+- **Desired:** make the run ASYNCHRONOUS — persist a `running` ExperimentRecord and return IMMEDIATELY (202) with it, spawn the A/B as a background task that updates the record to passed/blocked/etc. on completion (mirrors the CB-08 server-side task pattern). The drawer closes at once, the new "running" card appears, and the existing `/api/experiments` poll settles it. Page stays interactive; keep the concurrency guard (busy → clear message, not a hang). Bonus: a cancel.
+- **Acceptance:** clicking Run closes the drawer immediately + shows a "running" card; the page is interactive throughout; the card transitions to its result via poll; a contended run shows a clear "in progress" message, never a frozen button.
+- **Refs:** `src/api/improve.py` run_experiment_ep + `run_semaphore`/`wait_for`; `web/app/improve/lab/page.tsx` RunDrawer + poll; CB-08 background task.
+
+### CB-16 — Dashboard → "Talk to the agent" (demo call console) link
+- **Type / Surface / Size:** feature · dashboard shell (all `/operate`+`/improve`) · S
+- **Prereqs:** —
+- **Important files (candidates):** `web/components/cadence/DashboardShell.tsx` (topbar/nav — add the control), `web/app/demo/*` (the existing operator-dashboard link to mirror), `web/app/page.tsx`.
+- **Current:** the landing page links to both `/demo` and `/operate`, and `/demo` has an operator-dashboard link (commit `e78d0dc`), but the dashboard chrome has NO link back to the speaking/demo interface (`/demo`) — once in the dash you can't get to the talk-to-the-agent console without going home.
+- **Desired:** a clear control in the dashboard shell (topbar preferred) — "Talk to the agent" / "Call console" → `/demo` — mirroring the dashboard link that already lives on `/demo`, so the round-trip works both ways.
+- **Acceptance:** a visible Cadence-styled control in the dashboard shell navigates to `/demo`; it round-trips with `/demo`'s existing dashboard link; present on every dashboard page (it's in the shared shell).
+- **Refs:** `web/components/cadence/DashboardShell.tsx` topbar; the `/demo` dashboard-link precedent (`e78d0dc`).
+
 ---
 
 ## In Progress
