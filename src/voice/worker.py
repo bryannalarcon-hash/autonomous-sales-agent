@@ -417,6 +417,12 @@ def _make_session(stt: Any, tts: Any, vad: Any, *, version: str = "",
         min_interruption_duration=_MIN_INTERRUPTION_DURATION,
         min_endpointing_delay=_MIN_ENDPOINTING_DELAY,
         max_endpointing_delay=_MAX_ENDPOINTING_DELAY,
+        # MUST stay off: with preemptive generation, livekit creates the reply SpeechHandle BEFORE
+        # on_user_turn_completed sets _pending_speech_id, so _wire_commit_on_speech sees None and never
+        # attaches the done-callback -> commit_turn never fires -> NO turns persist and the committed
+        # belief never advances (every brain turn logged turn=1, and a real call saved an empty
+        # in_progress shell that never reached the Calls list). Sequential generation fixes that.
+        preemptive_generation=False,
     )
 
 

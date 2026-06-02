@@ -788,3 +788,24 @@ async def test_passthrough_llm_chat_is_inert_well_formed_stream():
     assert isinstance(stream, lkllm.LLMStream)
     chunks = [c async for c in stream]
     assert chunks == []  # inert: emits nothing
+
+
+def test_make_session_disables_preemptive_generation(monkeypatch):
+    """Regression for the first real-phone-call bug: preemptive_generation MUST be False. With it ON,
+    livekit creates the reply SpeechHandle BEFORE on_user_turn_completed sets _pending_speech_id, so
+    _wire_commit_on_speech sees None and never attaches the done-callback -> commit_turn never fires ->
+    NO voice turns persist (a real call saved an empty in_progress episode that never reached Calls,
+    and every brain turn logged turn=1 because the committed belief never advanced)."""
+    pytest.importorskip("livekit.agents")
+    import src.voice.worker as w
+
+    captured: dict = {}
+
+    class _CapSession:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(w, "AgentSession", _CapSession)
+    w._make_session(None, None, None, version="v", kb_version="k")
+    assert captured.get("preemptive_generation") is False
+    assert captured.get("llm") is not None  # the pass-through llm (dead-air fix) must remain
