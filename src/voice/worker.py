@@ -42,8 +42,10 @@
 # Built against livekit-agents 1.5.15 (AgentSession / WorkerOptions / cli.run_app / JobContext APIs
 # were read from the installed package, not guessed): on_user_turn_completed(turn_ctx, new_message)
 # runs the brain + buffers the reply, the AgentSession (with a non-None pass-through llm) then calls
-# llm_node which returns that buffered str, SpeechHandle.add_done_callback gates commit-vs-discard on
-# .interrupted.
+# llm_node which returns that buffered str AND COMMITS the turn (the reliable state write — the
+# SpeechHandle.add_done_callback path did not fire on live calls, so turns/belief never persisted;
+# llm_node provably runs every turn). The done-callback is kept as a redundant barge-in backstop
+# (commit_turn is idempotent). Committing in llm_node means a post-reply barge-in no longer discards.
 from __future__ import annotations
 
 import asyncio
@@ -259,6 +261,9 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
         # every in_progress upsert AND the final _register_persistence call so both target the same row.
         self.live_episode_id: str = f"ep-{uuid.uuid4().hex}"
         self.live_created_at: datetime = datetime.now(timezone.utc)
+        # Live AgentConfig, set by _build_brain. llm_node commits the turn (the reliable state write)
+        # and needs config for _capture_post_commit (escalation handling + the live in_progress upsert).
+        self._config: Optional[AgentConfig] = None
 
     # --- SIP spoken-consent sub-flow (the no-browser phone path) --------------------------------
 
@@ -370,7 +375,23 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
         if sid is None:
             return ""
         pending = self.voice_session.state.pending.get(sid)
-        return pending.reply_text if pending is not None else ""
+        if pending is None:
+            return ""
+        reply = pending.reply_text
+        # COMMIT HERE — the RELIABLE state write. The intended commit-on-uninterrupted-playout path
+        # (_wire_commit_on_speech's SpeechHandle done-callback) did NOT fire on live calls, so turns
+        # were never saved and the committed belief never advanced (every brain turn logged turn=1, and
+        # calls saved an empty in_progress shell that never reached the Calls list / Live monitor).
+        # llm_node provably runs every turn, so committing once the reply is surfaced guarantees the
+        # turn is recorded + the Live monitor tracks it. commit_turn is idempotent (pops the pending),
+        # so the done-callback's later commit is a harmless no-op. Trade-off: a barge-in AFTER the reply
+        # starts no longer discards the turn — acceptable (keeping the transcript beats dropping it).
+        committed = self.voice_session.commit_turn(sid)
+        if committed is not None:
+            logger.info("turn %s committed (llm_node)", sid)
+            if self._config is not None:
+                _capture_post_commit(self, committed, sid, self._config)
+        return reply
 
 
 def _passthrough_llm() -> Any:  # pragma: no cover - requires livekit-agents installed
@@ -454,7 +475,9 @@ def _build_brain(config: AgentConfig, *, consent_gate: ConsentGate,
         consent_gate=consent_gate,
         lead_phone_hash=lead_phone_hash,
     )
-    return WorkerVoiceAgent(base)
+    agent = WorkerVoiceAgent(base)
+    agent._config = config  # llm_node's commit -> _capture_post_commit needs the live config
+    return agent
 
 
 # --- Room metadata parsing (pure, livekit-free) ---------------------------------------------------
@@ -569,6 +592,15 @@ def _wire_commit_on_speech(session: Any, agent: WorkerVoiceAgent, config: AgentC
     committed-state write (R5/R10)."""
 
     def _on_speech_created(ev: Any) -> None:
+        # DIAGNOSTIC (commit-path debugging): record the real event shape so we can see WHY the
+        # done-callback commit wasn't firing on live calls — source + user_initiated decide whether we
+        # process it. (The reliable commit now happens in llm_node; this path is a redundant backstop.)
+        logger.info(
+            "speech_created: source=%s user_initiated=%s pending=%s",
+            getattr(ev, "source", None),
+            getattr(ev, "user_initiated", None),
+            agent._pending_speech_id,
+        )
         # Only agent replies carry a buffered brain turn; ignore user-initiated speech.
         if getattr(ev, "user_initiated", False):
             return

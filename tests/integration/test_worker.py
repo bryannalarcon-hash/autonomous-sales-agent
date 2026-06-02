@@ -233,6 +233,21 @@ async def test_llm_node_returns_empty_on_none_branches():
     assert await agent.llm_node(None, None, None) == ""
 
 
+async def test_llm_node_commits_the_turn_reliably():
+    """Regression for the live-call bug: llm_node COMMITS the turn (the reliable state write). The
+    SpeechHandle done-callback did NOT fire on real calls, so turns/belief never persisted (every
+    brain turn logged turn=1; a real call saved an empty in_progress shell that never reached Calls
+    or Live). After llm_node: the pending is drained, an agent Turn is captured, history grew."""
+    agent = _make_worker_agent()
+    await agent.on_user_turn_completed(None, _StubMessage("How much for SAT prep?"))
+    sid = agent._pending_speech_id
+    assert sid in agent.voice_session.state.pending  # buffered by on_user_turn_completed, not committed
+    await agent.llm_node(None, None, None)
+    assert sid not in agent.voice_session.state.pending  # committed -> pending drained
+    assert agent.voice_session.turn_for_speech_id(sid) is not None  # captured agent Turn
+    assert len(agent.voice_session.state.history) == 2  # user + agent
+
+
 # =============================== commit-vs-discard done-callback ================================
 
 
