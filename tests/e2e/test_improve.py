@@ -241,11 +241,20 @@ def test_experiments_empty_is_not_error():
 
 
 # =============================== P6 — RUN AN A/B (POST /api/experiments/run) =====================
-# The "run an A/B between two values" path: build the champion config + a challenger via the
-# generator's pure mutators for the requested dimension/value, run the experiment on a frozen held-out
-# set with the app's injected LLM client (MockLLM in tests = free), persist the resulting
-# ExperimentRecord per the gate, and return it. A deterministic runner is injected so the outcome is
-# decoupled from self-play scoring (production uses real self-play + a real OpenRouterClient = paid).
+# The "run an A/B between two values" path is ASYNCHRONOUS (CB-15): build the champion config + a
+# challenger via the generator's pure mutators for the requested dimension/value, PERSIST a `running`
+# record + return 202 IMMEDIATELY, then run the experiment on a frozen held-out set with the app's
+# injected LLM client (MockLLM in tests = free) in a BACKGROUND task that settles the SAME record to a
+# terminal state (CB-20 — never a perpetual `running`). A deterministic runner is injected so the
+# outcome is decoupled from self-play scoring (production uses real self-play + an OpenRouterClient =
+# paid). The async tests drive the ASGI app on one event loop so the background task can run + settle.
+
+import asyncio  # noqa: E402
+
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+
+from src.api.improve import create_improve_router  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
 
 
 def _routed_mock() -> MockLLMClient:
@@ -283,179 +292,193 @@ def _dominating_runner(champ_version: str):
     return runner
 
 
-def _run_client() -> tuple[TestClient, FakeImproveStore]:
-    """A DB-free TestClient wired for the run endpoint: empty injected store, MockLLM factory (free),
-    and a deterministic dominating runner so the A/B outcome is reproducible without self-play."""
+def _run_app(*, runner=None, run_timeout_s: float = 5.0) -> tuple[FastAPI, FakeImproveStore]:
+    """A DB-free ASGI app wired for the run endpoint: empty injected store, MockLLM factory (free), and
+    a deterministic dominating runner so the A/B outcome is reproducible without self-play. Mounts ONLY
+    the Improve router so the background task runs on the SAME event loop the AsyncClient drives — a
+    generous default timeout so the run settles rather than tripping the budget."""
     champ = load_config("champion_v0")
     store = FakeImproveStore([], [])
-    app = create_app(
-        improve_store=store,
-        config=champ,
-        llm_client_factory=_routed_mock,
-        experiment_runner=_dominating_runner(champ.version),
+    app = FastAPI()
+    app.include_router(
+        create_improve_router(
+            improve_store=store,
+            champion_config_provider=lambda: champ,
+            llm_client_factory=_routed_mock,
+            experiment_runner=runner if runner is not None else _dominating_runner(champ.version),
+            run_timeout_s=run_timeout_s,
+            run_max_concurrency=1,
+        )
     )
-    return TestClient(app), store
+    return app, store
 
 
-def test_run_experiment_discovery_reorder_creates_and_persists():
-    """POST /api/experiments/run with a discovery-sequence reorder builds + runs + persists a real
-    ExperimentRecord (state from the gate), returns the before/after, and it appears in
-    /api/experiments. MockLLM + a dominating runner = free + deterministic.
+async def _settle(ac: AsyncClient, experiment_id: str, *, tries: int = 50) -> dict:
+    """Poll /api/experiments until `experiment_id` leaves `running` (the background A/B settled it), and
+    return the settled row. Mirrors the dashboard poll — the run is async, so the terminal state arrives
+    via this poll, not the 202 response. Asserts it actually settles (CB-20: never stuck `running`)."""
+    for _ in range(tries):
+        body = (await ac.get("/api/experiments")).json()
+        row = next((e for e in body["experiments"] if e["experiment_id"] == experiment_id), None)
+        if row is not None and row["state"] != "running":
+            return row
+        await asyncio.sleep(0.02)  # let the background task make progress
+    raise AssertionError(f"experiment {experiment_id} never settled out of `running` (CB-20)")
 
-    FAIL-CLOSED (R36): the inline run does NOT measure sim-to-real divergence, so an otherwise
-    auto-promote-eligible challenger is routed to the human queue (blocked), never silently shipped."""
-    client, store = _run_client()
+
+async def test_run_experiment_returns_202_running_immediately():
+    """CB-15: POST /api/experiments/run returns 202 IMMEDIATELY with a `running` record — it never
+    blocks for the (minutes-long, paid) A/B. The drawer closes + the running card shows at once."""
+    app, store = _run_app()
     champ = load_config("champion_v0")
     seq = list(champ.playbooks["discovery_sequence"])
-    seq[0], seq[-1] = seq[-1], seq[0]  # a reordered list = the challenger "value"
+    seq[0], seq[-1] = seq[-1], seq[0]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6},
+        )
+        assert r.status_code == 202, r.text  # Accepted — started, not finished
+        exp = r.json()["experiment"]
+        assert exp["state"] == "running"
+        assert r.json()["decision"] == "running"
+        assert exp["dimension_label"] == "Discovery sequencing"
+        assert "." not in exp["dimension_label"]
+        assert exp["n"] == 6
+        # it is queryable in the lab the instant the run starts (the running card).
+        body = (await ac.get("/api/experiments")).json()
+        assert any(e["experiment_id"] == exp["experiment_id"] for e in body["experiments"])
+        # the background task then settles the SAME record to a terminal state (the poll catches it).
+        await _settle(ac, exp["experiment_id"])
 
-    r = client.post(
-        "/api/experiments/run",
-        json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6},
-    )
-    assert r.status_code == 200, r.text
-    exp = r.json()["experiment"]
+
+async def test_run_experiment_background_settles_to_terminal():
+    """CB-15/CB-20: the background A/B settles the SAME record to a terminal state via the poll — the
+    dominating challenger is clearly better, and FAIL-CLOSED (R36) routes the unmeasured auto-promote
+    to the human queue (blocked), never silently shipped."""
+    app, store = _run_app()
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6},
+        )
+        exp_id = r.json()["experiment"]["experiment_id"]
+        settled = await _settle(ac, exp_id)
     # before/after: the dominating challenger is clearly better (tier 4 vs tier 0).
-    assert exp["challenger_kpi"] > exp["champion_kpi"]
-    assert exp["delta"] > 0
-    assert exp["challenger_better"] is True
+    assert settled["challenger_kpi"] > settled["champion_kpi"]
+    assert settled["delta"] > 0
+    assert settled["challenger_better"] is True
     # FAIL-CLOSED: an unmeasured auto-promote lands in the human queue (blocked), not promoted.
-    assert exp["state"] == "blocked"
-    assert r.json()["decision"] == "pending_approval"
-    assert exp["dimension_label"] == "Discovery sequencing"
-    assert "." not in exp["dimension_label"]
-    assert exp["is_extreme"] is False
-    assert exp["n"] == 6
-
-    # persisted + queryable in the lab (the whole point — running the A/B SHOWS in /api/experiments).
-    body = client.get("/api/experiments").json()
-    assert any(e["experiment_id"] == exp["experiment_id"] for e in body["experiments"])
-    assert exp["experiment_id"] in store._experiments
+    assert settled["state"] == "blocked"
+    assert settled["is_extreme"] is False
+    assert exp_id in store._experiments  # persisted (the SAME id was upserted to its result)
 
 
-def test_run_experiment_unmeasured_autopromote_fails_closed_to_pending_approval():
-    """FAIL-CLOSED (R36): a non-extreme challenger that would AUTO-PROMOTE but has NO sim-to-real
-    divergence measured is routed to pending_approval (blocked), NOT silently promoted — the central-
-    risk gate must not be bypassed by the inline run path."""
-    client, store = _run_client()
+async def test_run_experiment_pricing_threshold_settles_blocked_for_approval():
+    """A pricing-concession threshold value is EXTREME: even a clean pass settles in `blocked` state
+    (the human-gate), so it lands in the approval queue, not auto-promoted."""
+    app, _ = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "thresholds.max_concession_band", "value": 0.4, "n": 6},
+        )
+        assert r.status_code == 202, r.text
+        exp_id = r.json()["experiment"]["experiment_id"]
+        settled = await _settle(ac, exp_id)
+        assert settled["is_extreme"] is True
+        assert settled["state"] == "blocked"
+        apr = (await ac.get("/api/approvals")).json()
+        assert any(e["experiment_id"] == exp_id for e in apr["approvals"])
+
+
+async def test_run_experiment_default_n_is_modest():
+    """N defaults to a modest value (cost control: each call spends real credit in prod) when omitted —
+    visible on the immediate `running` record."""
+    app, _ = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "thresholds.pushiness_cap", "value": 0.5},  # champion 0.7 -> a real diff
+        )
+        assert r.status_code == 202, r.text
+        exp = r.json()["experiment"]
+        assert 1 <= exp["n"] <= 24  # modest by default (the spec suggests ~12)
+        assert exp["n"] == 12  # the documented default when omitted
+        await _settle(ac, exp["experiment_id"])
+
+
+async def test_run_experiment_record_target_equals_n():
+    """The persisted record's `target` is the run's effective N (not left at 0): the lab progress chip
+    needs a non-zero target, and for a held-out run target == the sampled N — set on the running record
+    up front AND preserved through to the settled one."""
+    app, _ = _run_app()
     champ = load_config("champion_v0")
     seq = list(champ.playbooks["discovery_sequence"])
     seq[0], seq[-1] = seq[-1], seq[0]
-    r = client.post(
-        "/api/experiments/run",
-        json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6},
-    )
-    assert r.status_code == 200, r.text
-    decision = r.json()["decision"]
-    exp = r.json()["experiment"]
-    assert decision == "pending_approval", "an unmeasured auto-promote must fail closed"
-    assert exp["state"] == "blocked"  # not 'promoted'
-    # it surfaces in the approval queue for a human, not shipped.
-    apr = client.get("/api/approvals").json()
-    assert any(e["experiment_id"] == exp["experiment_id"] for e in apr["approvals"])
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6},
+        )
+        exp = r.json()["experiment"]
+        assert exp["n"] == 6
+        assert exp["target"] == 6, "the running record's target must equal the effective N, not 0"
+        settled = await _settle(ac, exp["experiment_id"])
+        assert settled["target"] == 6
 
 
-def test_run_experiment_pricing_threshold_blocks_for_approval():
-    """A pricing-concession threshold value is EXTREME: even a clean pass is persisted in `blocked`
-    state (the human-gate), so it lands in the approval queue, not auto-promoted."""
-    client, _ = _run_client()
-    r = client.post(
-        "/api/experiments/run",
-        json={"dimension": "thresholds.max_concession_band", "value": 0.4, "n": 6},
-    )
-    assert r.status_code == 200, r.text
-    exp = r.json()["experiment"]
-    assert exp["is_extreme"] is True
-    assert exp["state"] == "blocked"
-    # it shows up in the approval queue.
-    apr = client.get("/api/approvals").json()
-    assert any(e["experiment_id"] == exp["experiment_id"] for e in apr["approvals"])
+async def test_run_experiment_rejects_unknown_dimension():
+    """An unsupported dimension is a 400 (validation at the boundary) — not a crash, not a persisted
+    `running` row, not a spawned paid run."""
+    app, store = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post("/api/experiments/run", json={"dimension": "code.something", "value": 1})
+        assert r.status_code == 400, r.text
+        assert store._experiments == {}  # nothing persisted before the run is validated
 
 
-def test_run_experiment_default_n_is_modest():
-    """N defaults to a modest value (cost control: each call spends real credit in prod) when omitted."""
-    client, store = _run_client()
-    r = client.post(
-        "/api/experiments/run",
-        json={"dimension": "thresholds.pushiness_cap", "value": 0.5},  # champion is 0.7 -> a real diff
-    )
-    assert r.status_code == 200, r.text
-    exp = r.json()["experiment"]
-    assert 1 <= exp["n"] <= 24  # modest by default (the spec suggests ~12)
-    assert exp["n"] == 12  # the documented default when omitted
+async def test_run_experiment_rejects_no_op_value():
+    """A value equal to the current champion's is a no-op (zero changed dimensions) -> 400 BEFORE
+    anything is persisted, with a clear message (never the opaque R17 minimal-diff error)."""
+    app, store = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "thresholds.pushiness_cap", "value": 0.7},  # champion is already 0.7
+        )
+        assert r.status_code == 400, r.text
+        assert "nothing to A/B test" in r.json()["detail"]
+        assert store._experiments == {}  # nothing persisted (no zombie `running` row)
 
 
-def test_run_experiment_record_target_equals_n():
-    """The persisted record's `target` is the run's effective N (not left at 0): the lab progress
-    chip ('184 / 400') needs a non-zero target, and for a held-out run target == the sampled N."""
-    client, _ = _run_client()
-    champ = load_config("champion_v0")
-    seq = list(champ.playbooks["discovery_sequence"])
-    seq[0], seq[-1] = seq[-1], seq[0]
-    r = client.post(
-        "/api/experiments/run",
-        json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6},
-    )
-    assert r.status_code == 200, r.text
-    exp = r.json()["experiment"]
-    assert exp["n"] == 6
-    assert exp["target"] == 6, "the record's target must equal the effective N, not 0"
-
-
-def test_run_experiment_rejects_unknown_dimension():
-    """An unsupported dimension is a 400 (validation at the boundary) — not a crash, not a paid run."""
-    client, _ = _run_client()
-    r = client.post(
-        "/api/experiments/run",
-        json={"dimension": "code.something", "value": 1},
-    )
-    assert r.status_code == 400, r.text
-
-
-def test_run_experiment_rejects_no_op_value():
-    """A value equal to the current champion's is a no-op (zero changed dimensions) -> 400 BEFORE any
-    paid run, with a clear message (never the opaque R17 minimal-diff error)."""
-    client, store = _run_client()
-    r = client.post(
-        "/api/experiments/run",
-        json={"dimension": "thresholds.pushiness_cap", "value": 0.7},  # champion is already 0.7
-    )
-    assert r.status_code == 400, r.text
-    assert "nothing to A/B test" in r.json()["detail"]
-    assert store._experiments == {}  # nothing persisted
-
-
-def test_run_experiment_n_floor_is_raised_above_one():
+async def test_run_experiment_n_floor_is_raised_above_one():
     """COST + statistical floor: even n=1 is bumped to the minimum sample (>=5) so a tiny request can
     never produce a degenerate single-sample 'significant' comparison (pairs with the grading floor)."""
-    client, _ = _run_client()
-    r = client.post(
-        "/api/experiments/run",
-        json={"dimension": "thresholds.pushiness_cap", "value": 0.5, "n": 1},
-    )
-    assert r.status_code == 200, r.text
-    exp = r.json()["experiment"]
-    assert exp["n"] >= 5, "the run N floor must be at least the minimum trustworthy sample"
+    app, _ = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "thresholds.pushiness_cap", "value": 0.5, "n": 1},
+        )
+        assert r.status_code == 202, r.text
+        exp = r.json()["experiment"]
+        assert exp["n"] >= 5, "the run N floor must be at least the minimum trustworthy sample"
+        await _settle(ac, exp["experiment_id"])
 
 
-# =============================== P6 — RUN IS BOUNDED + CONCURRENCY-GUARDED =======================
-# /api/experiments/run awaits a full real self-play A/B inline (minutes, paid in prod). It must be
-# bounded (a timeout returns a clear error instead of hanging) and guarded against concurrent runs
-# (a second concurrent run returns 503 instead of stacking paid work). Tested via the ASGI app on a
-# single event loop with a runner that blocks on an event the test controls.
-
-import asyncio  # noqa: E402
-
-import pytest  # noqa: E402
-from httpx import ASGITransport, AsyncClient  # noqa: E402
-
-from src.api.improve import create_improve_router  # noqa: E402
-from fastapi import FastAPI  # noqa: E402
+# =============================== P6 — RUN IS ASYNC + BOUNDED + CONCURRENCY-GUARDED ===============
+# /api/experiments/run runs a full real self-play A/B in a BACKGROUND task (minutes, paid in prod). It
+# must (CB-15) return 202 immediately, (CB-20) never linger `running` — a timeout/crash settles the
+# record to a terminal state — and keep the concurrency guard (a 2nd run while one is in flight -> 503).
 
 
 def _blocking_runner(gate: "asyncio.Event"):
-    """A runner that waits on `gate` before returning episodes — lets a test hold the run 'in flight'
-    so it can drive the timeout / concurrency guard deterministically (no real self-play)."""
+    """A runner that waits on `gate` before returning episodes — lets a test hold the background run
+    'in flight' so it can drive the timeout / concurrency guard deterministically (no real self-play)."""
 
     from src.memory.schema import Episode, Turn
 
@@ -475,64 +498,109 @@ def _blocking_runner(gate: "asyncio.Event"):
     return runner
 
 
-def _bounded_run_app(*, runner, run_timeout_s: float, run_max_concurrency: int) -> FastAPI:
-    """A bare FastAPI app mounting ONLY the Improve router, with the run budget + concurrency cap
-    injected (server.create_app uses the defaults; the router accepts overrides for testability)."""
-    champ = load_config("champion_v0")
-    app = FastAPI()
-    app.include_router(
-        create_improve_router(
-            improve_store=FakeImproveStore([], []),
-            champion_config_provider=lambda: champ,
-            llm_client_factory=_routed_mock,
-            experiment_runner=runner,
-            run_timeout_s=run_timeout_s,
-            run_max_concurrency=run_max_concurrency,
-        )
-    )
-    return app
-
-
-async def test_run_experiment_times_out_with_clear_error():
-    """A run that exceeds the budget returns a clear timeout error (503), not a hang. The blocking
-    runner never releases; a tiny timeout trips the asyncio.wait_for bound."""
+async def test_run_experiment_returns_202_then_settles_terminal_on_timeout():
+    """CB-20: a background run that exceeds the budget NEVER lingers `running` — the request still
+    returns 202 immediately, and the timed-out run settles the SAME record to a terminal state (the
+    poll catches it as no-longer-running). The blocking runner never releases; a tiny timeout trips it."""
     gate = asyncio.Event()  # never set -> the runner blocks past the timeout
     champ = load_config("champion_v0")
     seq = list(champ.playbooks["discovery_sequence"])
     seq[0], seq[-1] = seq[-1], seq[0]
-    app = _bounded_run_app(runner=_blocking_runner(gate), run_timeout_s=0.05, run_max_concurrency=2)
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+    app, _ = _run_app(runner=_blocking_runner(gate), run_timeout_s=0.05)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         r = await ac.post(
             "/api/experiments/run",
             json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6},
         )
-    assert r.status_code == 503, r.text
-    assert "timed out" in r.json()["detail"].lower()
+        assert r.status_code == 202, r.text  # never hangs, even though the A/B will time out
+        exp_id = r.json()["experiment"]["experiment_id"]
+        settled = await _settle(ac, exp_id)  # CB-20: it MUST leave `running`
+    assert settled["state"] in ("rejected", "blocked", "passed", "promoted")
+    # a timed-out run settles failed-terminal with a clear reason (not a fabricated positive).
+    assert settled["state"] == "rejected"
+    assert "did not complete" in (settled["guardrail_reason"] or "").lower()
 
 
 async def test_run_experiment_concurrent_run_returns_503():
     """A second concurrent run hits the concurrency guard (max 1) and returns 503 — paid work is not
-    stacked. The first run holds the semaphore (blocked on the gate); the second is rejected fast."""
+    stacked. The first background run holds the permit (blocked on the gate); the second is rejected
+    fast (never a frozen button)."""
     gate = asyncio.Event()
     champ = load_config("champion_v0")
     seq = list(champ.playbooks["discovery_sequence"])
     seq[0], seq[-1] = seq[-1], seq[0]
-    # generous timeout so the FIRST run doesn't time out; concurrency cap of 1 forces contention.
-    app = _bounded_run_app(runner=_blocking_runner(gate), run_timeout_s=5.0, run_max_concurrency=1)
+    # generous timeout so the FIRST run's background task doesn't time out; cap of 1 forces contention.
+    app, _ = _run_app(runner=_blocking_runner(gate), run_timeout_s=5.0)
     body = {"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6}
 
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        first = asyncio.create_task(ac.post("/api/experiments/run", json=body))
-        await asyncio.sleep(0.05)  # let the first run acquire the semaphore + enter the runner
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        first = await ac.post("/api/experiments/run", json=body)  # 202; background task holds the permit
+        assert first.status_code == 202, first.text
+        first_id = first.json()["experiment"]["experiment_id"]
+        await asyncio.sleep(0.05)  # let the background task acquire the permit + enter the runner
         second = await ac.post("/api/experiments/run", json=body)  # contends -> 503
         assert second.status_code == 503, second.text
         assert "in progress" in second.json()["detail"].lower() or "busy" in second.json()["detail"].lower()
-        gate.set()  # release the first run so it completes cleanly
-        first_resp = await first
-        assert first_resp.status_code == 200, first_resp.text
+        gate.set()  # release the first run so it settles cleanly
+        await _settle(ac, first_id)  # the first run completes + frees the permit
+
+
+# =============================== P6 — SCAFFOLD FROM A REVIEWED CALL (CB-19) ======================
+# The review page's "Use in experiment" no longer lands on a blank lab; it scaffolds a DRAFT experiment
+# seeded from THAT call and opens its per-experiment review. POST /api/experiments/scaffold builds the
+# draft WITHOUT running anything, persists it as `draft`, and carries the originating episode.
+
+
+async def test_scaffold_creates_draft_seeded_from_episode():
+    """CB-19: scaffolding from a reviewed call builds a NON-extreme DRAFT experiment (a discovery
+    reorder by default), persists it as `draft` (not running, nothing launched), carries the episode,
+    and is queryable in the lab so the per-experiment review view can open it pre-populated."""
+    app, store = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post("/api/experiments/scaffold", json={"episode_id": "ep-abc123"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["is_scaffold"] is True
+        assert body["episode_id"] == "ep-abc123"
+        draft = body["experiment"]
+        assert draft["state"] == "draft"  # scaffolded, NOT running — nothing launched
+        assert draft["is_extreme"] is False
+        assert draft["dimension_label"] == "Discovery sequencing"
+        assert "ep-abc123" in draft["population"]  # the originating call is attached
+        # queryable in the lab as a draft (the review view reads it by id).
+        lab = (await ac.get("/api/experiments", params={"state": "draft"})).json()
+        assert any(e["experiment_id"] == draft["experiment_id"] for e in lab["experiments"])
+        # NO record_version side effect — a scaffold never mutates the champion (R20).
+        assert store._lineage == {}
+
+
+async def test_scaffold_with_explicit_dimension_and_value():
+    """CB-19: an explicit dimension/value pre-picks the change (e.g. a threshold the operator wants to
+    trial against this call) — still a draft, still seeded from the episode, nothing launched."""
+    app, _ = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/scaffold",
+            json={"episode_id": "ep-xyz", "dimension": "thresholds.pushiness_cap", "value": 0.5},
+        )
+        assert r.status_code == 200, r.text
+        draft = r.json()["experiment"]
+        assert draft["state"] == "draft"
+        assert draft["dimension"] == "thresholds.pushiness_cap"
+        assert "." not in draft["dimension_label"]
+
+
+async def test_scaffold_rejects_no_op_value():
+    """A scaffold value equal to the champion's is a no-op -> 400 (validated at the boundary), nothing
+    persisted — same guard the run path uses."""
+    app, store = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/scaffold",
+            json={"episode_id": "ep-1", "dimension": "thresholds.pushiness_cap", "value": 0.7},
+        )
+        assert r.status_code == 400, r.text
+        assert store._experiments == {}
 
 
 # =============================== P7 — APPROVAL QUEUE (AE6) =======================================
@@ -745,6 +813,88 @@ def test_rollback_unknown_version_404():
     client = _seeded_client()
     r = client.post("/api/versions/v999/rollback")
     assert r.status_code == 404, r.text
+
+
+# =============================== CB-02 — VERSION LINEAGE CHANGE DIMENSION ========================
+# A promoted version whose lineage row stored NO change-dimension (legacy rows carry only
+# {"ladder": ...}) must still render its real change label — recovered (non-migration) from the
+# matching experiment record. A genesis version (no parent) legitimately keeps "—".
+
+
+def _cb02_client() -> TestClient:
+    """A client whose lineage has a promoted node with NO kpi['dimension'] (the bug shape), a genesis
+    node, AND an experiment table that carries the dimension for the promoted version's BASE — so the
+    /api/versions serializer can backfill the change label from the experiment (CB-02)."""
+    # Lineage mirrors the production bug: a hash-suffixed promoted version with only a ladder KPI, and a
+    # genesis parent. NEITHER stores a dimension.
+    lineage = [
+        VersionLineage(
+            version="v1-1fb2bc0e", parent_version="v0-213df354", kb_version="kb_v0",
+            kpi={"ladder": 0.51}, is_champion=True,
+            created_at=datetime.now(timezone.utc) - timedelta(days=1),
+        ),
+        VersionLineage(
+            version="v0-213df354", parent_version=None, kb_version="kb_v0",
+            kpi={"ladder": 0.40}, is_champion=False,
+            created_at=datetime.now(timezone.utc) - timedelta(days=2),
+        ),
+    ]
+    # The promoted experiment whose challenger_version normalizes to the SAME base ("v1") as the lineage
+    # node, carrying the real dimension — even though the literal version strings differ.
+    experiments = [
+        _exp(
+            "exp-promo", challenger="champion_v1", parent="champion_v0",
+            dimension="playbooks.discovery_sequence", state="promoted", is_extreme=False,
+            name="Discovery sequencing — value before price",
+        ),
+    ]
+    app = create_app(
+        improve_store=FakeImproveStore(experiments, lineage),
+        config=load_config("champion_v0"),
+    )
+    return TestClient(app)
+
+
+def test_versions_backfill_change_dimension_from_experiment():
+    """CB-02: a promoted version with no stored dimension shows its real change label (recovered from
+    the experiment table by version BASE), NOT '—'; the genesis version still shows null/'—'; and no
+    raw slug leaks."""
+    client = _cb02_client()
+    body = client.get("/api/versions").json()
+    promoted = next(v for v in body["versions"] if v["version"] == "v1-1fb2bc0e")
+    genesis = next(v for v in body["versions"] if v["version"] == "v0-213df354")
+    # the promoted node recovered its human change label (no longer "CHANGE —").
+    assert promoted["dimension_label"] == "Discovery sequencing"
+    assert "." not in promoted["dimension_label"]  # no raw "playbooks.discovery_sequence" slug
+    assert "_" not in promoted["dimension_label"]
+    # the genesis node has no change (it IS the origin) -> null so the UI renders "—".
+    assert genesis["dimension_label"] is None
+
+
+def test_versions_dimension_label_prefers_stored_kpi_dimension():
+    """When a lineage row DID store kpi['dimension'] (promote()/approve stamp it), that wins — the
+    backfill is only a fallback for legacy rows, never an override."""
+    lineage = [
+        VersionLineage(
+            version="v2-aaaa", parent_version="v1-bbbb", kb_version="kb_v0",
+            kpi={"ladder": 0.6, "dimension": "thresholds.pushiness_cap"}, is_champion=True,
+            created_at=datetime.now(timezone.utc),
+        ),
+        VersionLineage(
+            version="v1-bbbb", parent_version=None, kb_version="kb_v0", kpi={"ladder": 0.5},
+            created_at=datetime.now(timezone.utc) - timedelta(days=1),
+        ),
+    ]
+    # an experiment that would backfill a DIFFERENT dimension if the stored one were ignored.
+    experiments = [
+        _exp("exp-other", challenger="champion_v2", parent="champion_v1",
+             dimension="playbooks.discovery_sequence", state="promoted", is_extreme=False),
+    ]
+    app = create_app(improve_store=FakeImproveStore(experiments, lineage), config=load_config("champion_v0"))
+    body = TestClient(app).get("/api/versions").json()
+    v2 = next(v for v in body["versions"] if v["version"] == "v2-aaaa")
+    # the stored dimension wins (Pushiness cap), not the experiment-table backfill.
+    assert v2["dimension_label"] == "Pushiness cap"
 
 
 # =============================== NO INTERNAL INDEX LEAKS INTO LABELS =============================

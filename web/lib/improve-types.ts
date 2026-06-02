@@ -1,6 +1,8 @@
 // Operator-dashboard (Improve mode, U16) API contract — mirrors the JSON the FastAPI Improve router
-// (src/api/improve.py) returns for /api/experiments, /api/approvals(+approve/reject), /api/kb,
-// /api/playbook, /api/versions(+rollback). Keep in lockstep with that module. The backend has already
+// (src/api/improve.py) returns for /api/experiments, /api/experiments/run (ASYNC — 202 + a `running`
+// record, CB-15), /api/experiments/scaffold (seed a draft from a reviewed call, CB-19),
+// /api/approvals(+approve/reject), /api/kb, /api/playbook, /api/versions(+rollback). Keep in lockstep
+// with that module. The backend has already
 // translated every internal index (dimension slug -> dimension_label, lifecycle state -> state_label)
 // into human-readable fields; the raw `dimension`/`state` slugs are kept ONLY for client branching
 // (chip color, action gating) and MUST NOT render in operator text — the UI shows the *_label fields.
@@ -50,18 +52,40 @@ export interface ExperimentListResponse {
 /** A "run an A/B between two values" request (POST /api/experiments/run). `dimension` is a supported
  *  mutation surface: 'playbooks.discovery_sequence' (value = a reordered slot-name list) or
  *  'thresholds.<key>' (value = the new number). `n` is the held-out sample PER ARM — modest, since
- *  each call spends real model credit in prod. */
+ *  each call spends real model credit in prod. `episode_id` (optional, CB-19) records the reviewed
+ *  call a run was scaffolded from; it never changes the A/B (the held-out set is frozen by seed). */
 export interface RunExperimentRequest {
   dimension: string;
   value: string[] | number;
   n?: number;
   name?: string;
+  episode_id?: string;
 }
 
-/** The run result: the freshly-persisted experiment (already label-translated) + the gate decision. */
+/** The run result (CB-15 — the run is ASYNC): the freshly-persisted `running` experiment (already
+ *  label-translated) + the gate decision, which is "running" until the background A/B settles it (the
+ *  /api/experiments poll catches the terminal state). The endpoint replies 202 Accepted, not 200. */
 export interface RunExperimentResponse {
   experiment: Experiment;
   decision: string;
+}
+
+/** Scaffold-an-experiment-from-a-call request (POST /api/experiments/scaffold, CB-19). `episode_id` is
+ *  the reviewed call; an optional `dimension`/`value` pre-picks the change (omitted -> a default
+ *  minimal discovery reorder). Builds a DRAFT — it launches nothing. */
+export interface ScaffoldExperimentRequest {
+  episode_id: string;
+  dimension?: string;
+  value?: string[] | number;
+  name?: string;
+}
+
+/** The scaffold result (CB-19): the persisted `draft` experiment + the originating episode id, for the
+ *  lab's per-experiment review view to open pre-populated before the operator launches the run. */
+export interface ScaffoldExperimentResponse {
+  experiment: Experiment;
+  episode_id: string;
+  is_scaffold: true;
 }
 
 export interface ApprovalListResponse {

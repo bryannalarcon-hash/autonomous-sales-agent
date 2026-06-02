@@ -1,20 +1,22 @@
-// The SHARED Cadence dashboard shell — left nav rail (two modes: Operate / Improve + their
-// destinations) + global top bar — that wraps BOTH modes. U15 (Operate) builds it; U16 (Improve)
-// reuses it unchanged: the Improve pages now live at /improve/{lab,approvals,kb,versions} and drop
-// into this chrome. The route registry (NAV) is the single source of truth for label/title/icon/
-// badge per destination and maps 1:1 to App Router paths. Active nav state derives from the pathname
-// (the Call Review detail keeps "Calls" highlighted). Operator-facing titles are human-readable —
-// NO internal P-id ever renders.
-// The top bar carries the champion-version chip (REAL champion version humanized + kb_version from
-// /api/versions, BOTH with their internal `__…`/`-hash` suffix stripped via versionLabel/kbVersionTag
-// — never a raw index or fabricated id), the persona chip (the REAL agent persona from config —
-// "Alex", warm-consultative), and the Sandbox/Live environment toggle (local UI state). The KB nav
-// entry's title reads "KB / Playbook" (no "Editor") since that page is read-only. Pure chrome: pages
-// render as {children} inside .main.
+// The SHARED Cadence dashboard shell — left nav rail (the full Operate + Improve nav groups) + global
+// top bar — that wraps BOTH areas. U15 (Operate) builds it; U16 (Improve) reuses it unchanged: the
+// Improve pages live at /improve/{lab,approvals,kb,versions} and drop into this chrome. The route
+// registry (NAV) is the single source of truth for label/title/icon/badge per destination and maps
+// 1:1 to App Router paths. Active nav state derives from the pathname (the Call Review detail keeps
+// "Calls" highlighted). Operator-facing titles are human-readable — NO internal P-id ever renders.
+// CB-11: the redundant Operate/Improve mode toggle was removed (both full nav groups are always shown).
+// The top bar carries a "Talk to the agent" link → /demo (CB-16, round-trips with /demo's dashboard
+// link), the champion-version chip (REAL champion version humanized + kb_version from /api/versions,
+// BOTH with their internal `__…`/`-hash` suffix stripped via versionLabel/kbVersionTag — never a raw
+// index or fabricated id), the persona chip (the REAL agent persona from config — "Alex",
+// warm-consultative), and the Sandbox/Live environment toggle (local UI state). The nav-rail badges
+// (Escalations/Approvals counts) REVALIDATE without a refresh — a ~15s poll + focus/visibility refetch
+// in useNavBadges (CB-17). The KB nav entry's title reads "KB / Playbook" (no "Editor") since that
+// page is read-only. Pure chrome: pages render as {children} inside .main.
 'use client';
 
 import Link from 'next/link';
-import { usePathname, useRouter } from 'next/navigation';
+import { usePathname } from 'next/navigation';
 import { useEffect, useState, type ReactNode } from 'react';
 import { fetchVersions, fetchApprovals } from '@/lib/improve-api';
 import { fetchEscalations } from '@/lib/operate-api';
@@ -79,23 +81,48 @@ const NAV: NavDest[] = [
 // breadcrumb back to the list, per the handoff §86/§90.
 const REVIEW_PREFIX = '/operate/review';
 
+// How often to re-poll the badge counts so they don't go stale between explicit refreshes (CB-17).
+const BADGE_POLL_MS = 15000;
+
 // Bind the nav rail's count badges to REAL backend counts (escalations: unreviewed; approvals:
 // pending) rather than hardcoded literals. Non-fatal: a failed/empty fetch just shows no badge.
+// CB-17: the counts REVALIDATE without a full refresh — a ~15s interval poll PLUS a refetch whenever
+// the tab regains focus / becomes visible. So after an operator rejects an approval or reviews an
+// escalation (on its own page), the badge here catches up within a poll / on the next focus, instead
+// of staying stale until the shell remounts. All timers/listeners are cleaned up on unmount.
 function useNavBadges(): Record<string, number> {
   const [badges, setBadges] = useState<Record<string, number>>({});
   useEffect(() => {
     let cancelled = false;
-    Promise.allSettled([fetchEscalations(), fetchApprovals()]).then(([esc, app]) => {
-      if (cancelled) return;
-      const next: Record<string, number> = {};
-      if (esc.status === 'fulfilled') {
-        next['/operate/escalations'] = esc.value.counts?.unreviewed ?? esc.value.count ?? 0;
-      }
-      if (app.status === 'fulfilled') next['/improve/approvals'] = app.value.count ?? 0;
-      setBadges(next);
-    });
+
+    const refetch = () => {
+      Promise.allSettled([fetchEscalations(), fetchApprovals()]).then(([esc, app]) => {
+        if (cancelled) return;
+        const next: Record<string, number> = {};
+        if (esc.status === 'fulfilled') {
+          next['/operate/escalations'] = esc.value.counts?.unreviewed ?? esc.value.count ?? 0;
+        }
+        if (app.status === 'fulfilled') next['/improve/approvals'] = app.value.count ?? 0;
+        setBadges(next);
+      });
+    };
+
+    refetch(); // initial load on mount
+    const interval = setInterval(refetch, BADGE_POLL_MS);
+
+    // Refetch when the operator returns to this tab (after acting on the approvals/escalations page,
+    // or a background change) — visibilitychange covers tab switches, focus covers window refocus.
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') refetch();
+    };
+    window.addEventListener('focus', refetch);
+    document.addEventListener('visibilitychange', onVisible);
+
     return () => {
       cancelled = true;
+      clearInterval(interval);
+      window.removeEventListener('focus', refetch);
+      document.removeEventListener('visibilitychange', onVisible);
     };
   }, []);
   return badges;
@@ -141,6 +168,14 @@ function GlobalControls() {
 
   return (
     <>
+      {/* CB-16: round-trip to the speaking/demo console. Mirrors the /demo page's "Operator dashboard"
+          .gctl link (chart icon + arrowR chev) so the two surfaces link to each other. Lives in the
+          shared shell → present on every dashboard page. */}
+      <Link href="/demo" className="gctl" title="Talk to the agent — open the call console">
+        <Icon name="phone" size={15} />
+        <span>Talk to the agent</span>
+        <Icon name="arrowR" className="gctl-chev" />
+      </Link>
       <Link href="/improve/versions" className="gctl" title="Champion version — open Version History">
         <Icon name="shield" size={15} />
         <span>
@@ -165,7 +200,6 @@ function GlobalControls() {
 
 export function DashboardShell({ children }: { children: ReactNode }) {
   const pathname = usePathname() ?? '';
-  const router = useRouter();
   const isReview = pathname.startsWith(REVIEW_PREFIX);
 
   // Active destination: the longest NAV href that prefixes the path; review maps to Calls.
@@ -176,7 +210,6 @@ export function DashboardShell({ children }: { children: ReactNode }) {
         .sort((a, b) => b.length - a.length)[0] ?? '';
 
   const current = NAV.find((n) => n.href === activeHref);
-  const mode: 'operate' | 'improve' = current?.group ?? (pathname.startsWith('/improve') ? 'improve' : 'operate');
   const title = isReview ? 'Call Review' : current?.title ?? 'Operate';
   const showLivePill = !isReview && current?.live;
 
@@ -199,19 +232,8 @@ export function DashboardShell({ children }: { children: ReactNode }) {
             <div className="brand-word">Cadence</div>
           </div>
 
-          {/* Mode switch: the active segment is raised; switching mode jumps to that mode's first
-              page (Operate→Live, Improve→Experiment Lab), per the handoff §81. */}
-          <div className="mode">
-            <button className={mode === 'operate' ? 'on' : ''} onClick={() => router.push('/operate/live')}>
-              <Icon name="broadcast" size={15} />
-              Operate
-            </button>
-            <button className={mode === 'improve' ? 'on' : ''} onClick={() => router.push('/improve/lab')}>
-              <Icon name="flask" size={15} />
-              Improve
-            </button>
-          </div>
-
+          {/* CB-11: the redundant Operate/Improve mode toggle was removed — both full nav groups
+              render below, so the toggle added no reach. The group headers stay as section labels. */}
           <div className="nav-group">Operate</div>
           <div className="nav-list">
             {operate.map((dest) => (

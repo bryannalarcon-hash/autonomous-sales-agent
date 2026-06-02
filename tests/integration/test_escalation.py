@@ -195,6 +195,30 @@ async def test_escalation_reason_falls_back_to_rationale_and_captures_moment():
     assert outcome.escalation_log.moment == "Can you guarantee my kid gets into Harvard?"
 
 
+async def test_escalation_never_persists_an_empty_moment():
+    """CB-18: a blank/None `moment` must NOT yield a contentless review-queue row — it is backfilled
+    with the in-persona deferral line the agent spoke (so 'empty escalations' can't be created)."""
+    config = _config()
+    decision = Decision(act="escalate", rationale="explicit human request; deferring to a specialist")
+    captured: list[EscalationLog] = []
+
+    async def store_hook(log: EscalationLog) -> None:
+        captured.append(log)
+
+    for blank in (None, "", "   "):
+        captured.clear()
+        belief = BeliefState.fresh()
+        belief.last_user_act = "human_request"
+        outcome = await handle_escalation(
+            decision, belief, episode_id="ep-empty", turn_id=2, config=config,
+            store_hook=store_hook, moment=blank,
+        )
+        assert len(captured) == 1
+        # The persisted moment is non-empty and equals the agent's actual deferral line.
+        assert (captured[0].moment or "").strip(), f"empty moment persisted for input {blank!r}"
+        assert captured[0].moment == outcome.deferral_text.strip() or captured[0].moment.startswith("Escalation:")
+
+
 # =============================== OPERATOR MANUAL TAKEOVER =========================================
 
 

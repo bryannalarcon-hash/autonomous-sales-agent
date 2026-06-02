@@ -1,6 +1,7 @@
 // Typed fetch client for the Improve dashboard (U16). One thin wrapper per Improve endpoint
-// (experiments list, approvals list + approve/reject, KB/playbook read + draft-save, versions list +
-// rollback) returning the typed contract from lib/improve-types. Reuses the same ApiError + API_BASE
+// (experiments list, run an A/B [ASYNC — 202 + a running record, CB-15], scaffold a draft from a
+// reviewed call [CB-19], approvals list + approve/reject, KB/playbook read + draft-save, versions list
+// + rollback) returning the typed contract from lib/improve-types. Reuses the same ApiError + API_BASE
 // convention as lib/api.ts (never embeds secrets); GETs are no-store, mutations POST JSON. All
 // SEMANTIC labels arrive pre-translated from the backend, so nothing here re-derives a human label
 // from an internal index.
@@ -15,6 +16,8 @@ import type {
   RollbackResponse,
   RunExperimentRequest,
   RunExperimentResponse,
+  ScaffoldExperimentRequest,
+  ScaffoldExperimentResponse,
   VersionListResponse,
 } from './improve-types';
 
@@ -74,10 +77,21 @@ export function fetchExperiments(params?: { state?: string }): Promise<Experimen
   return getJson<ExperimentListResponse>('/api/experiments', params);
 }
 
-/** RUN a champion-vs-value A/B and persist the result. COST: in prod this spends real model credit
- *  (n calls per arm) — the caller surfaces an explicit "this runs N real model calls" note. */
+/** KICK OFF a champion-vs-value A/B ASYNCHRONOUSLY (CB-15). The endpoint persists a `running` record
+ *  and replies 202 Accepted IMMEDIATELY — it does NOT wait for the (minutes-long, paid) run. The
+ *  caller shows the returned `running` card at once; the /api/experiments poll settles it to its
+ *  terminal state. COST: in prod the background run spends real model credit (n calls per arm). */
 export function runExperiment(req: RunExperimentRequest): Promise<RunExperimentResponse> {
   return postJson<RunExperimentResponse>('/api/experiments/run', req);
+}
+
+/** SCAFFOLD a draft experiment seeded from a reviewed call (CB-19) — launches nothing. Returns the
+ *  persisted `draft` + the originating episode so the lab's per-experiment review view can open it
+ *  pre-populated for the operator to confirm before running. */
+export function scaffoldExperiment(
+  req: ScaffoldExperimentRequest,
+): Promise<ScaffoldExperimentResponse> {
+  return postJson<ScaffoldExperimentResponse>('/api/experiments/scaffold', req);
 }
 
 // --- P7 Approval Queue ---------------------------------------------------------------------------

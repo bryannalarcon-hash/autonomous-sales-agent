@@ -495,8 +495,21 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
             </button>
             <button
               className="btn btn-ghost btn-sm"
-              onClick={() => router.push('/improve/lab')}
-              title="Open the Experiment Lab to trial a config change against calls like this"
+              onClick={async () => {
+                // CB-19: scaffold an experiment SEEDED FROM THIS CALL, then open its review-and-launch
+                // view in the lab (?episode=<id>) — not a blank lab landing. The scaffold seam persists
+                // a draft built around this episode; the lab pre-populates from the episode + lets the
+                // operator confirm before running. A scaffold failure still routes (the lab degrades to
+                // a pre-seeded run drawer), so the button never dead-ends.
+                try {
+                  const { scaffoldExperiment } = await import('@/lib/improve-api');
+                  await scaffoldExperiment({ episode_id: ep.episode_id });
+                } catch {
+                  /* non-fatal — the lab still opens pre-seeded from the episode below. */
+                }
+                router.push(`/improve/lab?episode=${encodeURIComponent(ep.episode_id)}`);
+              }}
+              title="Scaffold an experiment from this call and open it in the Experiment Lab to review and run"
             >
               <Icon name="flask" size={14} />
               Use in experiment

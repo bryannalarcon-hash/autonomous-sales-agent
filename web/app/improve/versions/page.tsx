@@ -5,6 +5,9 @@
 // /api/versions/{v}/rollback, which re-promotes that prior version as champion (the single-champion
 // invariant demotes the current one). Data from /api/versions (the lineage tree + current champion).
 // The KPI snapshot per node renders as mini ladder bars; no internal index renders in the version text.
+// CB-02: each node's `dimension_label` is the human CHANGE label — the backend now backfills it for
+// legacy promoted rows that stored no dimension (so a promoted version shows its real change, not
+// "CHANGE —"); a genesis version's label stays null and renders "—". This page just renders the field.
 'use client';
 
 import { useEffect, useState } from 'react';

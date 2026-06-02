@@ -8,10 +8,14 @@
 # an escalation with a PII-scrubbed moment, and reports `done` for terminal acts; LIVE PERSISTENCE
 # (Layer 2): after each /api/chat turn the live_upsert_hook (default: persist_call_live) upserts an
 # in_progress Episode using a stable episode_id + created_at stamped at session creation, so the Live
-# monitor can query the call WHILE it is happening; POST /api/demo/auto/start (CB-08) kicks off a
-# SERVER-SIDE scripted demo call (consent pre-captured) that streams the real brain through that same
-# per-turn live-upsert path as a background task — so the Live monitor populates without a phone AND
-# the demo survives the operator navigating away (it is not browser-bound); /api/livekit/token (503 without creds) mints a
+# monitor can query the call WHILE it is happening; POST /api/demo/auto/start (CB-08 + CB-12) kicks off
+# a SERVER-SIDE demo call (consent pre-captured) that runs a REAL self-play — the agent brain vs an
+# LLM-GENERATED ProspectSimulator (src.sim, NOT a fixed script, so each demo varies) — streaming each
+# committed turn through that same per-turn live-upsert path as a background task, so the Live monitor
+# populates without a phone AND the demo survives the operator navigating away (it is not browser-bound);
+# GET /api/demo/auto/stream?episode_id=<id> (CB-12) is an SSE stream that emits a per-turn `turn` event
+# (and a terminal `end` event) so the live page appends turns in near-real-time instead of waiting on
+# its 5 s poll (which stays a fallback); /api/livekit/token (503 without creds) mints a
 # token via the injected builder AND stamps the already-captured consent onto the room metadata
 # (consent_state/recording_granted/jurisdiction/phone_hash/conversable — no secrets) so the live
 # voice worker SEEDS its ConsentGate from it instead of deadlocking on a pending gate waiting for
@@ -34,6 +38,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -71,24 +76,23 @@ LiveUpsertHook = Callable[..., Awaitable[Any]]
 # the in-memory dict grow without bound. Overridable via MAX_DEMO_SESSIONS for load tests.
 _DEFAULT_MAX_SESSIONS = 5000
 
-# Server-side auto-demo (POST /api/demo/auto/start): a scripted, realistic QUALIFIED-parent arc the
-# backend plays against the real brain so the Live monitor populates turn-by-turn WITHOUT a phone and,
-# crucially, INDEPENDENT of the browser (it survives the operator navigating away + back). The arc
-# warms toward an explicit move-forward so the close gate can fire (terminal "Consultation booked"
-# rather than lingering in_progress). Agent replies are the real brain; only these lines are scripted.
-_AUTO_DEMO_SCRIPT: tuple[str, ...] = (
-    "Hi — my daughter's a high-school sophomore and she's really struggling with Algebra 2 right before finals.",
-    "She does all the homework but still gets C's and D's on the tests, and her confidence is shot.",
-    "We tried one of those free tutoring apps and she just didn't stick with it. What makes you different?",
-    "That actually sounds like what she needs. How does the pricing work — is it worth it?",
-    "Okay, that's reasonable. How soon could she actually start with someone?",
-    "Great — let's go ahead and get her set up. What's the next step?",
-    "Yes, I'm ready to move forward today — sign us up.",
-    "Perfect. Please go ahead and book the first session for us.",
-)
+# Server-side auto-demo (POST /api/demo/auto/start): a REAL self-play the backend plays against the
+# brain so the Live monitor populates turn-by-turn WITHOUT a phone and, crucially, INDEPENDENT of the
+# browser (it survives the operator navigating away + back). CB-12: the prospect side is now
+# LLM-GENERATED (src.sim.ProspectSimulator) rather than a fixed script — so each demo is a varied
+# self-play (a fresh qualified persona + a different sim-model run each time), and the agent's close
+# is honestly earned through the deterministic buy_gate. The CB-08 outcome_override still applies: if
+# the agent closed at any point the demo lands terminal (e.g. "Consultation booked"), never in_progress.
+#
 # Gap BETWEEN turns (on top of the ~6 s real-brain latency per turn) so the operator can watch each
 # turn land in the monitor and the heartbeat stays fresh. Kept short — the brain is the real pacer.
 _AUTO_DEMO_TURN_GAP_S = 1.5
+# Hard turn budget for a generated demo so a non-closing run can't stream forever. A qualified
+# prospect typically closes well within this; reaching it ends the demo "released" (terminal).
+_AUTO_DEMO_MAX_TURNS = 20
+# The agent's canned opener (turn 0 — no brain call yet, mirroring src.sim.selfplay._opener). The
+# generated prospect responds to THIS first.
+_AUTO_DEMO_OPENER = "Hi, this is Alex from Nerdy. How can I help you today?"
 
 
 # --- request/response DTOs (the EXACT contract the front-end depends on) -------------------------
@@ -182,6 +186,11 @@ class _Session:
     assigned_voice: Optional[str] = None
     raw_phone: Optional[str] = None
     last_close_tier: Optional[str] = None
+    # CB-12: the terminal outcome a GENERATED demo reached on the PROSPECT side when no agent close
+    # tier applies — "walked" (patience exhausted) or "released" (turn budget hit / no terminal act).
+    # Used as the outcome_override at finalize so a non-closing demo still lands terminal (never
+    # in_progress). A real close (last_close_tier) takes precedence over this.
+    demo_terminal_override: Optional[str] = None
     ended: bool = False
     # A returning caller's hydrated belief (U6), seeded into the VoiceSession when it is built.
     hydrated_belief: Optional[Any] = None
@@ -352,10 +361,29 @@ def create_demo_router(
     # this a demo could be garbage-collected mid-run). Each task discards itself on completion.
     _demo_tasks: "set[asyncio.Task[Any]]" = set()
 
+    # CB-12 real-time streaming: per-episode fan-out of SSE subscriber queues. _run_auto_demo PUSHES a
+    # small event ("turn"/"end") after each committed turn / at finalize; each open SSE connection for
+    # that episode_id has a bounded queue here that it drains and forwards to the browser. A dict of
+    # LISTS so multiple monitors can watch the same demo. Queues are bounded so a slow/abandoned client
+    # can't grow memory without bound (overflow events are dropped — the 5 s poll reconciles).
+    _demo_streams: "dict[str, list[asyncio.Queue[dict[str, Any]]]]" = {}
+    _DEMO_STREAM_QUEUE_MAX = 64
+
+    def _publish_demo_event(episode_id: str, event: dict[str, Any]) -> None:
+        """Fan an SSE event out to every subscriber queue for this episode (non-blocking). A full
+        queue (slow client) drops the event rather than blocking the demo runner — the per-turn live
+        upsert + the page's 5 s poll are the durable source of truth, SSE is only the low-latency nudge."""
+        for q in _demo_streams.get(episode_id, ()):  # iterate a snapshot-safe view
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass  # slow/abandoned subscriber — drop; the poll will reconcile
+
     async def _finalize_auto_demo(sess: _Session) -> None:
         """Persist the finished auto-demo terminal + evict it — mirrors /end's persist branch but runs
         server-side. Passes the stable created_at so duration_ms is recorded. Idempotent on `ended`;
-        swallows failures so a finalize hiccup never leaks the background task."""
+        swallows failures so a finalize hiccup never leaks the background task. Emits the SSE "end"
+        event so a subscribed monitor refreshes once more (the page then freezes the ended call, CB-13)."""
         if sess.ended:
             return
         sess.ended = True
@@ -369,13 +397,15 @@ def create_demo_router(
 
                     persist = _pce
                 # If the agent closed at ANY point in the call, force that terminal outcome even when
-                # the LAST turn wasn't the close (the script keeps talking past a mid-call close) — so
-                # the demo lands in the Calls list as e.g. "Consultation booked", not in_progress.
-                override = (
-                    derive_outcome("attempt_close", sess.last_close_tier)[0]
-                    if sess.last_close_tier
-                    else None
-                )
+                # the LAST turn wasn't the close — so the demo lands in the Calls list as e.g.
+                # "Consultation booked", not in_progress (CB-08 override; episode_from_session ignores
+                # the override once a real close is on the transcript). With CB-12's generated prospect
+                # a non-closing run instead ends "walked"/"released" (demo_terminal_override) so it is
+                # ALWAYS terminal, never in_progress.
+                if sess.last_close_tier:
+                    override = derive_outcome("attempt_close", sess.last_close_tier)[0]
+                else:
+                    override = sess.demo_terminal_override
                 await persist(
                     sess.voice_session,
                     config=cfg,
@@ -389,43 +419,108 @@ def create_demo_router(
         except Exception:
             logger.warning("auto-demo finalize failed for session %s", sess.session_id)
         finally:
+            # Tell any SSE subscriber the demo is over (last refresh + close), then drop the gate/session.
+            _publish_demo_event(sess.live_episode_id, {"event": "end"})
             try:
                 sess.gate.end()
             except Exception:
                 pass
             sessions.pop(sess.session_id, None)
 
+    def _make_demo_prospect() -> Any:
+        """Build the LLM-GENERATED prospect for one demo (CB-12). A fresh QUALIFIED persona (so the
+        agent can realistically earn a close) sampled with a per-run seed so each demo VARIES; the
+        sim's commit/walk is still the deterministic buy_gate, so honesty holds. Imported lazily so
+        the demo router stays cheap to import (the sim package is pure: no LiveKit/DB)."""
+        from src.sim.personas import sample_population
+        from src.sim.prospect import ProspectSimulator
+
+        seed = uuid.uuid4().int & 0xFFFFFFFF  # vary the persona + tie-breaking run to run
+        persona = sample_population(1, seed=seed, unqualified_fraction=0.0)[0]
+        return ProspectSimulator(persona, seed=seed)
+
     async def _run_auto_demo(sess: _Session) -> None:
-        """Background task: stream _AUTO_DEMO_SCRIPT through the REAL brain + the SAME per-turn
-        live-upsert path /api/chat uses, paced so the operator watches the monitor populate. Runs
-        server-side so it SURVIVES the operator navigating away. ALWAYS finalizes (terminal persist +
-        evict) in a finally so no in_progress shell dangles."""
+        """Background task: a REAL self-play (CB-12) — the agent BRAIN alternates with an LLM-GENERATED
+        ProspectSimulator, streaming each committed turn through the SAME per-turn live-upsert path
+        /api/chat uses AND an SSE per-turn event, paced so the operator watches the monitor populate.
+        Runs server-side so it SURVIVES the operator navigating away. The prospect's commit/walk is the
+        deterministic buy_gate (honesty preserved); the agent's close sets last_close_tier so the CB-08
+        outcome_override forces a terminal outcome. ALWAYS finalizes (terminal persist + evict) in a
+        finally so no in_progress shell dangles."""
+        from src.sim.prospect import SIM_MODEL
+
+        ep_id = sess.live_episode_id
+        prospect = _make_demo_prospect()
+        prospect_llm = make_llm()  # the prospect side uses SIM_MODEL on the same injected client/seam
         try:
             vs = _ensure_voice_session(sess)
-            for i, line in enumerate(_AUTO_DEMO_SCRIPT):
+            # Turn 0: the agent's canned opener (no brain call yet — mirrors selfplay._opener). The
+            # generated prospect responds to this first.
+            agent_text = _AUTO_DEMO_OPENER
+            agent_act: Optional[str] = "greeting"
+            agent_tier: Optional[str] = None
+
+            reached_terminal = False
+            for _turn in range(_AUTO_DEMO_MAX_TURNS):
                 if sess.ended:
                     return
+                # 1. PROSPECT generates its turn (LLM talk + clamped soft deltas; commit/walk via the
+                #    pure buy_gate against the agent's last offered tier).
+                try:
+                    pt = await prospect.respond(
+                        agent_text, agent_act, prospect_llm, agent_tier=agent_tier, model=SIM_MODEL
+                    )
+                except Exception:
+                    logger.warning("auto-demo prospect turn failed for session %s", sess.session_id)
+                    break
+                prospect_text = pt.text or "…"
+                # A WALK is terminal on the prospect side (no close tier applies) — remember it so the
+                # finalize forces a terminal "walked" outcome (never in_progress).
+                if pt.walked:
+                    sess.demo_terminal_override = "walked"
+
+                # 2. Feed the prospect's turn to the agent brain (commit writes the transcript: a
+                #    prospect turn + the agent's closing/confirming reply). The brain is REAL (no mock).
                 sess._speech_counter += 1
                 speech_id = f"s-{sess._speech_counter}"
                 try:
-                    pending = await vs.handle_user_turn(line, speech_id)
+                    pending = await vs.handle_user_turn(prospect_text, speech_id)
                 except ConsentError:
                     break
                 committed = vs.commit_turn(speech_id)
-                # Record that the agent closed (at whatever tier) — used by _finalize_auto_demo to force
-                # a terminal outcome even if a LATER turn isn't a close. We run the WHOLE script (rather
-                # than stopping on the first close) so the demo always shows a full, watchable arc: the
-                # agent sometimes closes early (LLM variance) and a 2-turn dud would be a poor demo.
                 decided = committed if committed is not None else pending
+
+                # Surface the call in the Live monitor (heartbeat upsert) + nudge SSE subscribers so
+                # the prospect+agent bubbles appear in near-real-time, not on the 5 s poll.
+                await _live_upsert(sess)
+                _publish_demo_event(ep_id, {"event": "turn", "turn": sess._speech_counter})
+
+                # 3. The prospect COMMITTED (the deterministic buy_gate fired in response to the agent's
+                #    close) or WALKED -> terminal. The agent's close already set last_close_tier (commit)
+                #    or demo_terminal_override is "walked", so the finalize persists a terminal outcome.
+                if pt.committed_tier is not None or pt.walked:
+                    reached_terminal = True
+                    break
+
+                # 4. Record the agent's move for the NEXT prospect turn; track a close tier so the
+                #    finalize can force a terminal outcome (CB-08).
+                agent_text = decided.reply_text
+                agent_act = decided.decision.act
+                agent_tier = decided.decision.tier
                 if decided.decision.act == "attempt_close":
                     sess.last_close_tier = decided.decision.tier
-                # Same heartbeat upsert /api/chat fires — surfaces the call in the Live monitor.
-                await _live_upsert(sess)
-                # A hard terminal act (disqualify / escalate) genuinely ends the call — stop there.
+                # 5. A hard terminal agent act (disqualify / escalate) ends the call — its own decision
+                #    is terminal (derive_outcome handles it), so no override is needed.
                 if decided.decision.act in ("disqualify", "escalate"):
+                    reached_terminal = True
                     break
-                if i < len(_AUTO_DEMO_SCRIPT) - 1:
-                    await asyncio.sleep(_AUTO_DEMO_TURN_GAP_S)
+
+                await asyncio.sleep(_AUTO_DEMO_TURN_GAP_S)
+
+            # Hit the turn budget without any terminal -> "released" (a real ended call, never a
+            # lingering in_progress), unless the agent had closed (last_close_tier wins at finalize).
+            if not reached_terminal and not sess.last_close_tier:
+                sess.demo_terminal_override = sess.demo_terminal_override or "released"
         except Exception:
             logger.warning("auto-demo runner crashed for session %s", sess.session_id)
         finally:
@@ -433,10 +528,11 @@ def create_demo_router(
 
     @router.post("/api/demo/auto/start", response_model=AutoDemoResponse)
     async def demo_auto_start() -> AutoDemoResponse:
-        """Kick off a SERVER-SIDE scripted demo call (CB-08). Returns immediately with the stable
-        episode_id; a background task streams the call into the Live monitor (the /api/live/active
-        poll surfaces it) and it survives the operator navigating away. 503 when the real brain is
-        unavailable (no OPENROUTER_API_KEY) or the bounded session store is at capacity."""
+        """Kick off a SERVER-SIDE demo call — a REAL self-play vs an LLM-GENERATED prospect (CB-08 +
+        CB-12). Returns immediately with the stable episode_id; a background task streams the call into
+        the Live monitor (the /api/live/active poll surfaces it; /api/demo/auto/stream pushes per-turn
+        events) and it survives the operator navigating away. 503 when the real brain is unavailable
+        (no OPENROUTER_API_KEY) or the bounded session store is at capacity."""
         if not os.environ.get("OPENROUTER_API_KEY"):
             raise HTTPException(
                 status_code=503,
@@ -459,6 +555,56 @@ def create_demo_router(
         _demo_tasks.add(task)
         task.add_done_callback(_demo_tasks.discard)
         return AutoDemoResponse(episode_id=sess.live_episode_id, started=True)
+
+    @router.get("/api/demo/auto/stream")
+    async def demo_auto_stream(episode_id: str) -> StreamingResponse:
+        """Server-Sent-Events stream of per-turn nudges for ONE demo episode (CB-12 real-time).
+
+        The page subscribes for the SELECTED call and, on each event, re-fetches the live snapshot —
+        so prospect/agent bubbles appear within sub-second of the server committing them instead of
+        only on the 5 s poll (which stays as a fallback). Events are NAMED:
+          - `event: turn`  data: {"turn": <n>}   — a turn was committed + live-upserted.
+          - `event: end`   data: {}              — the demo went terminal; the client refreshes once
+                                                    more, then the page freezes the ended call (CB-13).
+        A periodic `: keep-alive` comment keeps intermediaries from closing an idle connection.
+        Disconnect-safe: the subscriber queue is always removed in `finally`, and the runner DROPS
+        events for a full/slow queue rather than blocking, so a dead client never wedges a demo.
+        """
+        queue: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue(maxsize=_DEMO_STREAM_QUEUE_MAX)
+        _demo_streams.setdefault(episode_id, []).append(queue)
+
+        async def _event_gen() -> Any:
+            try:
+                # An initial comment opens the stream immediately (some clients wait for first bytes).
+                yield ": stream-open\n\n"
+                while True:
+                    try:
+                        evt = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"  # idle heartbeat; keeps proxies from dropping us
+                        continue
+                    name = str(evt.get("event", "turn"))
+                    data = {k: v for k, v in evt.items() if k != "event"}
+                    yield f"event: {name}\ndata: {json.dumps(data)}\n\n"
+                    if name == "end":
+                        break  # terminal — close the stream cleanly
+            finally:
+                # Always detach this subscriber so _demo_streams doesn't leak queues per connection.
+                subs = _demo_streams.get(episode_id)
+                if subs is not None and queue in subs:
+                    subs.remove(queue)
+                    if not subs:
+                        _demo_streams.pop(episode_id, None)
+
+        return StreamingResponse(
+            _event_gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",  # disable nginx proxy buffering so events flush promptly
+                "Connection": "keep-alive",
+            },
+        )
 
     # --- POST /api/consent/start ----------------------------------------------------------------
 

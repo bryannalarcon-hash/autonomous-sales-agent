@@ -158,8 +158,9 @@ async def handle_escalation(
          lifecycle="unreviewed") and PERSIST it to the review queue via `store_hook` (tests) or the
          default store.save_escalation (runtime). The escalation is reviewed later, not live.
 
-    `moment` is the offending quote/turn to record on the log (the dashboard P5 shows it). Returns an
-    EscalationOutcome carrying the three deliverables.
+    `moment` is the offending quote/turn to record on the log (the dashboard P5 shows it); if blank it
+    is backfilled (deferral line → reason) so the queue NEVER holds a contentless row (CB-18). Returns
+    an EscalationOutcome carrying the three deliverables.
     """
     category = _reason_category(decision, belief, config)
     deferral_text = _deferral_text(category, config)
@@ -175,11 +176,17 @@ async def handle_escalation(
         note="captured at async deferral; specialist follows up (no live human required)",
     )
 
+    # CB-18: NEVER persist a contentless escalation — an empty/blank `moment` renders as a blank,
+    # useless review-queue row (the "empty escalations" the operator kept seeing). When no trigger
+    # quote was captured, fall back to the in-persona deferral line the agent actually spoke (and, as
+    # a last resort, the human reason) so every queued escalation has meaningful, reviewable content.
+    clean_moment = (moment or "").strip() or (deferral_text or "").strip() or f"Escalation: {reason}"
+
     log = EscalationLog(
         escalation_id=f"esc-{uuid.uuid4().hex}",
         episode_id=episode_id,
         reason=reason,
-        moment=moment,
+        moment=clean_moment,
         turn_id=turn_id,
         lifecycle="unreviewed",
     )

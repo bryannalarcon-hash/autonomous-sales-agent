@@ -68,15 +68,7 @@
 - **Desired:** an operator sees a **queue/list of ALL active calls** (each in-progress, non-stale call — phone + web), can select any to watch its live transcript + belief, and can **take over any one** of them — a real mechanism that connects the operator into that call's LiveKit room (or transfers the call to a human), with the agent gracefully yielding. Must respect R37 (don't fork the brain), consent/recording state, and the stale-call guard already in `live_snapshot` (a 0-turn in-progress call older than `LIVE_STALE_SECONDS` is not "active").
 - **Acceptance:** with N concurrent active calls, the live page lists N entries (newest-first, each with caller/persona + stage + trust/bail signal); selecting one streams its live transcript; "Take over" on an entry connects the operator audio into that LiveKit room (verified with a real or stubbed second participant) and the AI yields; an integration test covers the multi-active list endpoint (≥2 active calls → ≥2 entries, stale ones excluded) and the take-over hand-off. No raw episode/room id rendered as a primary label.
 - **Refs:** `src/api/operate.py::live_snapshot` + `live_ep`; LiveKit Agents room/participant model + SIP dispatch (`scripts/setup_sip_dispatch.py`, rule `SDR_hKYQYAwz96uA`); the disabled take-over control (`web/app/operate/live/page.tsx`); R37 in `src/core/respond.py`.
-
-### CB-02 — Show the real change dimension on the version lineage (kill "CHANGE —")
-- **Type / Surface / Size:** change · `/improve/versions` · `api` · `data` · M
-- **Prereqs:** — *(deferred during the QA loop as a data-model limitation; tracked here so it isn't lost.)*
-- **Important files (candidates):** `src/api/improve.py` (`/api/versions` serialization), `src/memory/store.py` + the `version_lineage` table/schema, `web/app/improve/versions/page.tsx`.
-- **Current:** the lineage renders "CHANGE —" for promoted versions because `version_lineage` rows store only `version / parent_version / config_ref / kb_version / kpi / is_champion` — there is **no change-dimension field**. The human change ("Pricing concession band", "Discovery sequencing") lives on the `experiment` table, which these seed lineage rows aren't cleanly linked to.
-- **Desired:** each promoted version shows its human change dimension (via `dimensionLabel`) instead of "—" — either by joining lineage → experiment, or by stamping the dimension onto the lineage row at promotion time (the cleaner fix; the loop's `promote` path is where it's known).
-- **Acceptance:** a promoted version on `/improve/versions` shows its change dimension label (not "—"); a genesis version still shows "—"; no raw `__dimension__` slug leaks.
-- **Refs:** `src/loop/promotion.py` (where the dimension is known at promote time); `version_lineage` schema; `web/lib/labels.ts::dimensionLabel`.
+- **Take-over spec (user, 2026-06-02) — refines CB-01.c:** on "Take over", the AI must (1) be INTERRUPTED mid-conversation and (2) speak a DEFAULT TTS hand-off line (e.g. "Let me bring in a specialist to help — one moment. They may type some of their responses, so there might be a brief pause between answers."). Then the OPERATOR talks into their own device (browser mic / WebRTC into the call's LiveKit room) and is heard by the caller through the phone — operator audio is published as a room participant, NOT a dial-in (presume the operator is NOT calling from their own phone number, so no SIP bridge / caller-ID concerns). The agent stops auto-generating; the operator may ALSO TYPE responses that are TTS'd to the caller ("the agent might be typing their responses"). So take-over = interrupt + disclosure TTS + operator mic→room audio + optional operator-typed→TTS, with the AI yielded. Consent/recording state must carry over; respect R37 (don't fork the brain — the brain just stops).
 
 ### CB-04 — Humanize three remaining raw-slug leaks (KPI cohort + Approvals diff + Review rationale)
 - **Type / Surface / Size:** bug · `/operate/kpi` · `/improve/approvals` · `/operate/review` · S
@@ -96,59 +88,25 @@
 - **Acceptance:** no episode in the Calls list shows a terminal outcome (enrolled/consult_booked/…) whose transcript never reaches a close; spot-check ≥10 seeded episodes.
 - **Refs:** `ep-98b95465…` (the reported case); `scripts/seed_demo.py`; `src/sim/selfplay.run_episode`; CB-03 (self-play now reaches realistic closes).
 
-### CB-11 — Remove the redundant per-call "explore/improve" button
-- **Type / Surface / Size:** change · `/operate/review` (TBC) · S
-- **Prereqs:** — *(blocked on confirming the exact element — see Notes)*
-- **Important files (candidates):** `web/app/operate/review/[id]/page.tsx` (the **"Use in experiment"** button, ~line 496–503, flask icon → `/improve/lab`) — the leading candidate; confirm against the actual screen the user means.
-- **Current:** a per-call button opens the Experiment Lab ("explore/improve" the call). The user reports it's useless because "we see the entire list on the right hand side" — i.e. the call list / belief panel already provides the affordance.
-- **Desired:** remove the redundant button (and any now-dead handler/import); keep the layout balanced.
-- **Acceptance:** the button is gone; no orphaned import/handler; tsc clean; the page layout still reads cleanly (screenshot check).
-- **Refs:** review page buttons row (`Flag` / `Export` / `Use in experiment`). NOTE: confirm WHICH button/screen with the user before removing (the "list on the right" detail doesn't perfectly match the Review layout).
-
-### CB-12 — Demo as a real-time, generated back-and-forth (not poll-batched scripted lines)
-- **Type / Surface / Size:** feature · `/operate/live` · `api` · M/L
-- **Prereqs:** builds on CB-08 (server-side demo).
-- **Important files (candidates):** `src/api/demo_routes.py::_run_auto_demo` (swap the scripted `_AUTO_DEMO_SCRIPT` for the `ProspectSimulator` so the prospect is LLM-GENERATED), `src/sim/prospect.py` (the generated prospect side), the live transport — today `web/app/operate/live/page.tsx` polls `/api/live/active` every `POLL_MS=5000`, so turns appear in batches; real-time needs SSE/WebSocket OR sub-second polling of the in-progress turns.
-- **Current:** the demo plays FIXED prospect lines against the real brain, and the UI refreshes on the 5 s poll — so turns show up in clumps "every few seconds," not as a live exchange.
-- **Desired:** (1) the PROSPECT generates its turn via the brain/sim (varied run-to-run, a true self-play), then the AGENT generates its reply; (2) each turn STREAMS to the monitor as it's produced (prospect bubble appears, then agent bubble), in near-real-time — not batched on a 5 s poll.
-- **Acceptance:** watching a demo, each turn appears individually as generated (prospect → agent → prospect …), with sub-second latency from server commit to on-screen; prospect lines differ across two runs (proving generation, not a script).
-- **Refs:** `src/sim/selfplay.run_episode` (the self-play loop), `persist_call_live` heartbeat, the live poll cadence; an SSE endpoint pattern.
-
-### CB-13 — Demo end: clear "call ended" marker + the monitor must NOT auto-close
-- **Type / Surface / Size:** feature · `/operate/live` · S
-- **Prereqs:** builds on CB-08.
-- **Important files (candidates):** `web/app/operate/live/page.tsx` (the active-call → empty-state transition + the queue auto-select), the demo finalizer in `src/api/demo_routes.py` (terminal outcome).
-- **Current:** when the demo ends it goes terminal → drops out of `/api/live/active` → the monitor auto-clears (empty state / auto-selects another call). There's no explicit end-of-call signal in the transcript, and the just-watched call vanishes.
-- **Desired:** at end, render a clear **"Call ended"** marker in the transcript (with the outcome), and the monitor must NOT auto-close/clear — the finished call stays on screen until the operator explicitly dismisses it / returns to the live list.
-- **Acceptance:** after a demo completes, the transcript shows an unmistakable "Call ended — <outcome>" marker and the call remains displayed (no auto-clear); a manual control returns to the live queue.
-- **Refs:** `web/app/operate/live/page.tsx` empty-state + `pollQueue` auto-select; CB-08 demo finalizer.
-
-### CB-14 — Site-wide scroll/click jank from pervasive backdrop-filter blur
-- **Type / Surface / Size:** bug · `perf` · all surfaces (`cadence.css` global) · S
+### CB-18 — Empty escalations keep reappearing (23 orphan `ep-esc-` rows, no moment)
+- **Type / Surface / Size:** bug · `data` (escalations) · `/operate/escalations` · M
 - **Prereqs:** —
-- **Important files (candidates):** `web/app/cadence.css` (`--glass-blur: saturate(150%) blur(22px)` on `.card`+`.kpi`; `backdrop-filter: blur(8px)` on `.nav`+`.topbar`); minor: the CB-08 `useNow` 1 s timer (`web/app/operate/live/page.tsx`).
-- **Current:** the console feels slow on every scroll and click. Root cause: `backdrop-filter: blur(22px)` is applied to EVERY `.card` and `.kpi` (the KPI page alone renders ~15) plus the always-visible `.nav`/`.topbar` — the browser re-composites + re-blurs all those layers on every paint/scroll frame (a well-known scroll-jank source, amplified by `next dev`). Secondary: the live-page `useNow` interval re-renders `CallMonitor` every second even when idle.
-- **Desired:** smooth scroll/click. Drop `backdrop-filter` from the high-count, always-on surfaces (cards/kpi/nav/topbar) while KEEPING the translucent `--glass` gradient + sheen/shadow so the look is preserved (the blur is barely visible over the solid dark page bg). Keep blur only on transient overlays (`.drawer`/`.modal`/`.scrim`). Optionally gate the `useNow` tick to active calls only.
-- **Acceptance:** scrolling a card-heavy page (`/operate/kpi`) is smooth; before/after screenshots show the visual look preserved (translucent cards, sheen, borders intact); no `backdrop-filter` on `.card`/`.kpi`/`.nav`/`.topbar`; tsc/build unaffected.
-- **Refs:** `web/app/cadence.css` lines ~26–28 (`--glass`/`--glass-blur`), 112 (`.nav`), 144 (`.topbar`), 175 (`.card`), 256 (`.kpi`).
+- **STATUS (2026-06-02):** CODE DONE — `handle_escalation` now backfills a blank `moment` (→ deferral line/reason) so no future contentless row can be created, + regression test (`test_escalation.py`, 7 pass). Confirmed lifecycle review ALREADY persists (`store.update_escalation_lifecycle` + `POST /api/escalations/{id}/lifecycle`), so "reappearing" = the legacy orphans, not a persist bug. **PENDING:** one-time purge of 30 `ep-esc-`/empty rows (dry-run confirmed: 30 deleted, 48 real remain) — awaiting explicit DB-delete authorization.
+- **Important files (candidates):** `src/voice/escalation.py::handle_escalation` (builds the log; stores whatever `episode_id`/`moment` it's handed), `scripts/seed_demo.py` (PURGES + reseeds 48 COHERENT escalations — its purge clearly isn't catching these), `src/memory/store.py` (escalation list/purge), the escalation review/lifecycle persistence path.
+- **Current:** the review queue has **23 escalations** (incl. the user's `esc-b4cf1626056a46eb9497874d06226a6c`) that all share: `episode_id="ep-esc-<uuid>"` (a synthetic episode that is NOT a real call), reason "explicit human request; deferring to a specialist", and an **empty `moment`** (no trigger quote) → they render as empty/contentless rows. 22 are `unreviewed`, 1 `resolved`. **No current source code (src/ or scripts/) generates `ep-esc-` ids or empty-moment escalations** — they are LEGACY/ORPHAN DB rows from a removed path; they coexist with seed_demo's 48 coherent ones (48 + 23 = 71). "Keep reappearing" → likely the escalation review/lifecycle change isn't persisted (reverts to unreviewed on refresh, same class of bug as CB-17) OR a re-seed re-adds them.
+- **Desired:** (1) find why they reappear — confirm whether marking an escalation reviewed/resolved PERSISTS to the DB (if not, fix it); (2) PURGE the 23 orphan empty-moment / `ep-esc-` escalations (DB delete — needs explicit user authorization); (3) ensure nothing recreates contentless escalations — `handle_escalation` should never persist an empty `moment` (skip or backfill the trigger turn), and `seed_demo`'s purge should cover ALL escalations.
+- **Acceptance:** zero escalations with an empty `moment` or an `ep-esc-` (non-call) episode id in the queue; reviewing/resolving one sticks across a refresh; a fresh seed run leaves only coherent escalations.
+- **Refs:** `esc-b4cf1626…` + 22 siblings (reason "explicit human request; deferring to a specialist", empty moment, `ep-esc-` episode ids); `src/voice/escalation.py`; `scripts/seed_demo.py` purge; CB-17 (same revalidation/persistence theme).
 
-### CB-15 — "Run experiment" freezes the page (synchronous minutes-long endpoint)
-- **Type / Surface / Size:** bug · `/improve/lab` · `api` · M
-- **Prereqs:** —
-- **Important files (candidates):** `src/api/improve.py::run_experiment_ep` (~line 519 — runs the full A/B inline under `asyncio.wait_for` + `run_semaphore`), `web/app/improve/lab/page.tsx` (`RunDrawer.submit` ~299 awaits the single fetch; the poll at ~494 already exists), `web/lib/improve-api.ts::runExperiment`.
-- **Current:** `POST /api/experiments/run` executes the ENTIRE A/B (`n×2` REAL model calls, minutes long in prod) SYNCHRONOUSLY before responding. The drawer `await`s that one request with the button stuck on "Running…", so the page looks frozen for the whole run; a second run returns 503 busy. No progress/cancel/escape.
-- **Desired:** make the run ASYNCHRONOUS — persist a `running` ExperimentRecord and return IMMEDIATELY (202) with it, spawn the A/B as a background task that updates the record to passed/blocked/etc. on completion (mirrors the CB-08 server-side task pattern). The drawer closes at once, the new "running" card appears, and the existing `/api/experiments` poll settles it. Page stays interactive; keep the concurrency guard (busy → clear message, not a hang). Bonus: a cancel.
-- **Acceptance:** clicking Run closes the drawer immediately + shows a "running" card; the page is interactive throughout; the card transitions to its result via poll; a contended run shows a clear "in progress" message, never a frozen button.
-- **Refs:** `src/api/improve.py` run_experiment_ep + `run_semaphore`/`wait_for`; `web/app/improve/lab/page.tsx` RunDrawer + poll; CB-08 background task.
-
-### CB-16 — Dashboard → "Talk to the agent" (demo call console) link
-- **Type / Surface / Size:** feature · dashboard shell (all `/operate`+`/improve`) · S
-- **Prereqs:** —
-- **Important files (candidates):** `web/components/cadence/DashboardShell.tsx` (topbar/nav — add the control), `web/app/demo/*` (the existing operator-dashboard link to mirror), `web/app/page.tsx`.
-- **Current:** the landing page links to both `/demo` and `/operate`, and `/demo` has an operator-dashboard link (commit `e78d0dc`), but the dashboard chrome has NO link back to the speaking/demo interface (`/demo`) — once in the dash you can't get to the talk-to-the-agent console without going home.
-- **Desired:** a clear control in the dashboard shell (topbar preferred) — "Talk to the agent" / "Call console" → `/demo` — mirroring the dashboard link that already lives on `/demo`, so the round-trip works both ways.
-- **Acceptance:** a visible Cadence-styled control in the dashboard shell navigates to `/demo`; it round-trips with `/demo`'s existing dashboard link; present on every dashboard page (it's in the shared shell).
-- **Refs:** `web/components/cadence/DashboardShell.tsx` topbar; the `/demo` dashboard-link precedent (`e78d0dc`).
+### CB-20 — Remove stuck/mock experiments (drafts stuck "running" forever)
+- **Type / Surface / Size:** bug · `data` (experiments) · `/improve/lab` · S/M
+- **Prereqs:** related to CB-15 (root cause of the stuck state)
+- **STATUS (2026-06-02):** CODE DONE (via CB-15) — a run can no longer linger `running`: the background task settles every run to a terminal state (`_settle_failed_run` → `rejected` on timeout/crash), verified (`verify-async` settled to `rejected`). **PENDING:** one-time purge of the 2 zombie `DRAFT-*` running rows (`…playbooks_discovery_sequence__0` + `…playbooks_rebuttals__0`) — awaiting explicit DB-delete authorization.
+- **Important files (candidates):** `src/api/improve.py` (run/persist + state transitions; the `DRAFT-champion_v0_*` records), `src/memory/store.py` (experiment list/delete), `web/app/improve/lab/page.tsx` (state chips + the "running" card).
+- **Current:** the lab shows experiments stuck in `running` that never settle — confirmed: of 4 experiment records, TWO are `running` drafts that never completed: "KB edit · Competitor comparisons" (created **2026-06-01**, "running all day") and a bare "draft" (2026-06-02 21:32); the rebuttal/KB-edit dimension renders as **"Objection rebuttals"** (the user's report). They look like mock/zombie runs because a synchronous run (CB-15) started, never finished, and left a `running` `DRAFT-*` row with no terminal state.
+- **Desired:** remove the stuck/mock experiment records (DB delete needs explicit user authorization), and ensure a run can NEVER linger in `running` forever — on completion/timeout/crash it must settle to a terminal state (passed/blocked/rejected/failed) or be cancellable (depends on CB-15 backgrounding). No perpetual "running" chips.
+- **Acceptance:** no experiment sits in `running` longer than a real run takes; the two zombie `DRAFT-*` rows are gone; a failed/timed-out run shows a clear terminal/failed state, not an eternal spinner.
+- **Refs:** the 2 stuck `DRAFT-champion_v0_*` running records (Jun 1 + Jun 2); `src/api/improve.py` run state transitions; CB-15 (sync run freeze — same root); `src/api/labels.py:121` (`playbooks.rebuttals` → "Objection rebuttals").
 
 ---
 
@@ -247,3 +205,18 @@
 - **Verification:** test-first RED→GREEN (`test_disconnect_outcome.py` 7 cases: ImportError→7 passed); `.venv` 427 passed / 5 skipped; the voice worker was restarted by explicit PID (pid 96812) and **re-registered with LiveKit** so real calls now get the fix.
 - **Constraints checked:** never maps a hang-up to enrolled/booked (returns None when a real close/escalate/disqualify fired → derive_outcome wins); consent/PII invariants untouched (reads only already-committed scrubbed turns); the `abandoned` slug renders via its label, never raw (no-internal-index rule).
 - **Follow-ups / known gaps:** the user's ORIGINAL episode `ep-e8a4f96b…` was persisted BEFORE the fix so it stays in_progress (historical) — only calls from now on get the terminal mapping.
+
+### CB-02/11/12/13/14/15/16/17/19 — Wave 1 batch (3 parallel coders + orchestrator)
+- **Completed:** 2026-06-02
+- **Verification (shared):** `.venv` suite **438 passed / 5 skipped**; `web` `tsc --noEmit` exit 0; integration screenshots (`tests/e2e/verify_wave1.py`, `/tmp/cb_wave1/*`) + endpoint checks; API + worker restarted. 0 JS errors on the verified pages.
+- **CB-11** (remove Operate/Improve mode toggle) — `DashboardShell.tsx`/`cadence.css`; toggle + unused `mode`/`router` removed; nav groups intact. Verified: `.mode` count = 0.
+- **CB-14** (scroll/click jank) — removed `backdrop-filter` from `.card`/`.kpi`/`.nav`/`.topbar` (kept translucent `--glass` bg + sheen/shadow; blur only on `.drawer`/`.modal`/`.scrim`). Verified: glass look preserved in screenshot.
+- **CB-16** (dash→demo link) — topbar `.gctl` "Talk to the agent" → `/demo`. Verified: `a[href="/demo"]` present.
+- **CB-17** (stale nav badges) — `useNavBadges` now polls (15 s) + refetches on focus/visibilitychange; self-contained in the shell.
+- **CB-12** (real-time generated demo) — `_run_auto_demo` now drives an LLM-generated `ProspectSimulator` (varied per run) vs the real brain; new SSE `GET /api/demo/auto/stream` streams per-turn (5 s poll fallback); terminal-guarantee extended (`walked`/`released`). Verified: generated skeptical prospect streamed live.
+- **CB-13** (call-ended marker + no auto-close) — ended call freezes its last snapshot + "Call ended — <outcome>" marker + "Back to live"; no auto-clear. Frontend-only.
+- **CB-15** (experiment Run freeze) — `/api/experiments/run` returns immediately with a `running` record; background asyncio task settles it. Verified: run returned instantly; `verify-async` settled to `rejected` (no hang).
+- **CB-19** (Use-in-experiment scaffold) — new `POST /api/experiments/scaffold` from an episode; review-page button scaffolds + routes to `/improve/lab?episode=<id>` (auto-opens a pre-seeded review), not a blank lab.
+- **CB-02** (version lineage dimension) — `/api/versions` backfills `dimension_label` from the experiment table (non-migration JOIN); `promotion.py` already stamps it for future. Verified: champion v1 renders "Discovery sequencing" (was "CHANGE —"); genesis "—".
+- **Files:** `DashboardShell.tsx`, `cadence.css`, `operate/live/page.tsx`, `demo_routes.py`, `improve.py`, `improve/lab/page.tsx`, `improve/versions/page.tsx`, `operate/review/[id]/page.tsx` (button only), `improve-api.ts`, `improve-types.ts` + tests (`test_demo_generated_stream.py`, `test_improve.py`).
+- **Follow-ups:** `demo_routes.py` (879) + `live/page.tsx` (968) exceed 500 lines (pre-existing; flagged). SSE *streaming* path is orchestrator-verified (not unit-tested — TestClient single-loop limitation).

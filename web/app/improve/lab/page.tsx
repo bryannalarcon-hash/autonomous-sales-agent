@@ -6,7 +6,12 @@
 // state-dependent CTA (a blocked challenger links to the Approval Queue, per the handoff §183). The
 // "Run experiment" control opens a RunDrawer: pick a dimension (Discovery sequencing reorder, or a
 // threshold + new value), see an explicit "this runs N real model calls" cost note, submit to
-// /api/experiments/run, then watch the new card transition running -> result (we poll /api/experiments).
+// /api/experiments/run. CB-15: that run is ASYNC — the POST returns 202 with a `running` record, the
+// drawer closes IMMEDIATELY, the running card shows at once, and the /api/experiments poll transitions
+// it running -> result (the page never freezes; the backend settles every run to a terminal state).
+// CB-19: arriving via /improve/lab?episode=<id> (from a call's "Use in experiment") auto-opens the
+// RunDrawer pre-seeded + showing the reviewed call's context, so the operator reviews + launches the
+// scaffolded experiment — never a blank lab landing.
 // Data from /api/experiments; the discovery-sequencing before/after is the headline demo artifact. All
 // semantic labels (state, dimension, version, population/cohort) are humanized before render — no raw
 // slug, `__…__` experiment suffix, or DRAFT-/exp- id renders. Cards/drawer show the human version +
@@ -17,8 +22,8 @@
 // human change label as its title instead (titleOf), so no bold "draft" renders.
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchExperiments, fetchPlaybook, runExperiment } from '@/lib/improve-api';
 import type { Experiment, PlaybookResponse, RunExperimentRequest } from '@/lib/improve-types';
@@ -236,15 +241,22 @@ function moved<T>(arr: T[], from: number, to: number): T[] {
 }
 
 // The Run-an-A/B drawer. Picks ONE dimension + value, shows the explicit cost note, and submits.
+// CB-19: an optional `episodeId` (when the drawer was opened by scaffolding from a reviewed call)
+// is shown as context AND threaded onto the run request, and `prefillKind` pre-selects the dimension
+// so the operator confirms the scaffolded experiment before launching the (async) run.
 function RunDrawer({
   onClose,
   onStarted,
+  episodeId,
+  prefillKind,
 }: {
   onClose: () => void;
   onStarted: (exp: Experiment) => void;
+  episodeId?: string;
+  prefillKind?: RunKind;
 }) {
   const [playbook, setPlaybook] = useState<PlaybookResponse | null>(null);
-  const [kind, setKind] = useState<RunKind>('discovery');
+  const [kind, setKind] = useState<RunKind>(prefillKind ?? 'discovery');
   const [seq, setSeq] = useState<string[]>([]);
   const [thrKey, setThrKey] = useState<string>(THRESHOLD_OPTIONS[0].key);
   const [thrValue, setThrValue] = useState<string>('');
@@ -298,8 +310,8 @@ function RunDrawer({
     setErr(null);
     const req: RunExperimentRequest =
       kind === 'discovery'
-        ? { dimension: 'playbooks.discovery_sequence', value: seq, n, name: name || undefined }
-        : { dimension: `thresholds.${thrKey}`, value: Number(thrValue), n, name: name || undefined };
+        ? { dimension: 'playbooks.discovery_sequence', value: seq, n, name: name || undefined, episode_id: episodeId }
+        : { dimension: `thresholds.${thrKey}`, value: Number(thrValue), n, name: name || undefined, episode_id: episodeId };
     try {
       const res = await runExperiment(req);
       onStarted(res.experiment);
@@ -316,9 +328,13 @@ function RunDrawer({
       <div className="drawer">
         <div className="card-head">
           <div className="grow">
-            <div className="b" style={{ fontSize: 15.5, fontFamily: 'var(--font-display)' }}>Run an experiment</div>
+            <div className="b" style={{ fontSize: 15.5, fontFamily: 'var(--font-display)' }}>
+              {episodeId ? 'Review & run experiment' : 'Run an experiment'}
+            </div>
             <div className="muted" style={{ fontSize: 12, marginTop: 2 }}>
-              A/B the live champion against one changed value on a held-out persona set.
+              {episodeId
+                ? 'Scaffolded from a reviewed call — confirm the change, then launch the A/B.'
+                : 'A/B the live champion against one changed value on a held-out persona set.'}
             </div>
           </div>
           <button className="gctl" onClick={onClose} disabled={busy} style={{ width: 36, padding: 0, justifyContent: 'center' }}>
@@ -327,6 +343,15 @@ function RunDrawer({
         </div>
 
         <div className="scroll" style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 16, overflow: 'auto' }}>
+          {/* CB-19: the originating reviewed call (context for a scaffolded experiment). */}
+          {episodeId ? (
+            <div className="row" style={{ gap: 8, alignItems: 'center', padding: '9px 12px', borderRadius: 10, background: 'var(--surface-2)', border: '1px solid var(--border)' }}>
+              <Icon name="flask" size={15} style={{ color: 'var(--accent-strong)' }} />
+              <span style={{ fontSize: 12.5, color: 'var(--text-2)' }}>
+                Seeded from the call you just reviewed — this experiment is built around it.
+              </span>
+            </div>
+          ) : null}
           {/* what to change */}
           <div>
             <div className="faint" style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 8 }}>
@@ -458,23 +483,31 @@ function RunDrawer({
   );
 }
 
-export default function LabPage() {
+function LabPageInner() {
+  const searchParams = useSearchParams();
   const [tab, setTab] = useState<'active' | 'past'>('active');
   const [rows, setRows] = useState<Experiment[]>([]);
   const [sel, setSel] = useState<Experiment | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [runOpen, setRunOpen] = useState(false);
+  // CB-19: the reviewed call this lab visit was scaffolded from (via /improve/lab?episode=<id>). When
+  // present, the RunDrawer opens auto, pre-seeded + showing the call context, so "Use in experiment"
+  // from a review lands on a review-and-launch view — never a blank lab. Cleared when the drawer closes.
+  const scaffoldEpisode = searchParams.get('episode') ?? undefined;
+  const [reviewEpisode, setReviewEpisode] = useState<string | undefined>(undefined);
   // experiment_ids freshly started this session, so a new card reads "Just run" until it settles.
   const [freshIds, setFreshIds] = useState<Set<string>>(new Set());
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (): Promise<Experiment[] | undefined> => {
     try {
       const res = await fetchExperiments();
       setRows(res.experiments);
       setError(null);
+      return res.experiments;
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load experiments.');
+      return undefined;
     }
   }, []);
 
@@ -482,8 +515,21 @@ export default function LabPage() {
     void load();
   }, [load]);
 
-  // A run returns the finished record synchronously; insert it immediately, then poll a few times so
-  // the card reflects the settled state (the backend persisted running -> result in one call).
+  // CB-19: arriving from a call's "Use in experiment" (/improve/lab?episode=<id>) opens the review-and-
+  // launch drawer pre-seeded with that call's context — never a blank lab landing. Runs once when the
+  // episode param appears.
+  useEffect(() => {
+    if (scaffoldEpisode) {
+      setReviewEpisode(scaffoldEpisode);
+      setRunOpen(true);
+    }
+  }, [scaffoldEpisode]);
+
+  // CB-15: a run now returns 202 with a `running` record (the background A/B settles it later). Insert
+  // the running card IMMEDIATELY (the drawer is already closing), then POLL until that experiment
+  // leaves `running` — so the card transitions running -> result on its own without a refresh. Bounded
+  // by a max tick count so a stuck/failed run (which the backend also settles to a terminal state, CB-20)
+  // can't poll forever; the card still reflects whatever terminal state the backend lands on.
   const onStarted = useCallback(
     (exp: Experiment) => {
       setRows((prev) => [exp, ...prev.filter((e) => e.experiment_id !== exp.experiment_id)]);
@@ -491,10 +537,14 @@ export default function LabPage() {
       setTab(ACTIVE_STATES.includes(exp.state) ? 'active' : 'past');
       if (pollRef.current) clearInterval(pollRef.current);
       let ticks = 0;
-      pollRef.current = setInterval(() => {
+      const MAX_TICKS = 200; // ~5 min at 1.5s/tick — covers a real background run, never infinite.
+      pollRef.current = setInterval(async () => {
         ticks += 1;
-        void load();
-        if (ticks >= 4 && pollRef.current) {
+        const res = await load();
+        const cur = res?.find((e) => e.experiment_id === exp.experiment_id);
+        // Stop once the run settled out of `running`/`draft`, or the safety cap is hit.
+        const settled = cur != null && cur.state !== 'running' && cur.state !== 'draft';
+        if ((settled || ticks >= MAX_TICKS) && pollRef.current) {
           clearInterval(pollRef.current);
           pollRef.current = null;
         }
@@ -632,7 +682,27 @@ export default function LabPage() {
         </div>
       </div>
       {sel ? <ExpDrawer e={sel} onClose={() => setSel(null)} /> : null}
-      {runOpen ? <RunDrawer onClose={() => setRunOpen(false)} onStarted={onStarted} /> : null}
+      {runOpen ? (
+        <RunDrawer
+          onClose={() => {
+            setRunOpen(false);
+            setReviewEpisode(undefined);
+          }}
+          onStarted={onStarted}
+          episodeId={reviewEpisode}
+          prefillKind={reviewEpisode ? 'discovery' : undefined}
+        />
+      ) : null}
     </div>
+  );
+}
+
+// useSearchParams (CB-19's ?episode= read) requires a Suspense boundary in the App Router so the page
+// doesn't bail out of static optimization; the inner component holds all the lab logic.
+export default function LabPage() {
+  return (
+    <Suspense fallback={<div className="page" />}>
+      <LabPageInner />
+    </Suspense>
   );
 }

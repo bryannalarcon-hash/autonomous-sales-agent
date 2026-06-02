@@ -14,6 +14,16 @@
 // — navigating away no longer kills the call). A 503 (no LLM key / capacity) shows its reason.
 // The call-duration timer ticks live (useNow, 1 s) off created_at for active calls; auto-scroll is a
 // real toggle that pins the transcript scroller to the newest turn while on.
+// CB-12 (real-time streaming): for the SELECTED active call the page ALSO opens an SSE stream
+// (GET /api/demo/auto/stream?episode_id=<id>) and re-fetches the detail snapshot on each per-turn
+// event, so prospect/agent bubbles appear within sub-second of the server committing them instead of
+// only on the 5 s poll (which stays as a fallback). The demo's prospect is now LLM-GENERATED (varied
+// run-to-run), not a fixed script — handled server-side in demo_routes._run_auto_demo.
+// CB-13 (call ended): when the selected call transitions active -> ended it does NOT auto-clear.
+// The page FREEZES the last snapshot, renders a "Call ended — <outcome>" banner at the bottom of the
+// transcript, and shows a "Back to live" control; the operator stays on the finished call until they
+// explicitly dismiss it. The ended episode's detail persists because /api/live?episode_id=<id>
+// returns {active:false, episode:<detail>} for a terminal call (transcript never vanishes).
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -22,7 +32,7 @@ import { Icon } from '@/components/cadence/Icon';
 import { fetchActiveCalls, fetchLive, fetchSampleCall, fmtDuration, initials } from '@/lib/operate-api';
 import { archetypeLabel, versionLabel } from '@/lib/labels';
 import type { ActiveCallSummary, ActiveCallsResponse, BeliefSnapshot, LiveSnapshot, Turn } from '@/lib/operate-types';
-import { ApiError, startAutoDemo } from '@/lib/api';
+import { ApiError, API_BASE, startAutoDemo } from '@/lib/api';
 
 const POLL_MS = 5000;
 
@@ -240,21 +250,32 @@ function QueueEntry({
   );
 }
 
-/** The detailed call monitor (transcript + belief column). Shared between real-live and sample. */
+/** The detailed call monitor (transcript + belief column). Shared between real-live, sample, and the
+ *  CB-13 ENDED (frozen) view. When `ended` is set, the call has gone terminal: the transcript shows a
+ *  "Call ended — <outcome>" marker at the bottom and the action bar offers "Back to live" (it does NOT
+ *  show any LIVE/recording affordance, and there is no live typing indicator). */
 function CallMonitor({
   snap,
   onOpenReview,
+  ended,
+  onBackToLive,
 }: {
   snap: LiveSnapshot;
   onOpenReview: (id: string) => void;
+  ended?: boolean;
+  onBackToLive?: () => void;
 }) {
   const ep = snap.episode!;
   const lastBelief = [...ep.turns].reverse().find((t) => t.belief)?.belief ?? null;
   const escalationImminent = snap.priority?.escalation_imminent ?? lastBelief?.escalation_imminent ?? false;
   const lastAct = snap.priority?.last_act_label ?? null;
-  // "Genuinely live" — active AND not a sample preview. Controls all LIVE affordances (pill, dot).
-  const isLive = snap.active === true && snap.sample !== true;
+  // "Genuinely live" — active AND not a sample preview AND not the frozen ended view. Controls all
+  // LIVE affordances (pill, dot, typing indicator).
+  const isLive = snap.active === true && snap.sample !== true && !ended;
   const isSample = snap.sample === true;
+  // The human outcome label the backend already translated (e.g. "Consultation booked"); shown only
+  // in the ended marker. Falls back to a neutral phrase so the marker is never blank.
+  const endedOutcome = ep.outcome && ep.outcome !== '—' ? ep.outcome : 'Call complete';
 
   // Live elapsed timer: an active call has no metrics.duration_ms until it ends, so for a live call
   // count up from created_at against a 1 s ticking clock; a completed/sample call uses the recorded
@@ -320,6 +341,10 @@ function CallMonitor({
                 <span className="tag warn" style={{ marginLeft: 10, fontWeight: 700, letterSpacing: '0.04em' }}>
                   SAMPLE
                 </span>
+              ) : ended ? (
+                <span className="tag" style={{ marginLeft: 10, fontWeight: 700, letterSpacing: '0.04em' }}>
+                  Call ended
+                </span>
               ) : (
                 <span className="tag" style={{ marginLeft: 10 }}>
                   Most recent call
@@ -357,6 +382,33 @@ function CallMonitor({
                   </div>
                 </div>
               ) : null}
+              {/* CB-13: an unmistakable end-of-call marker at the BOTTOM of the transcript. Shown
+                  only on the frozen ended view (never on a live/sample call). The outcome is the
+                  backend-humanized label — no raw outcome slug renders here. */}
+              {ended ? (
+                <div
+                  className="lv-ended-marker"
+                  data-testid="call-ended-marker"
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: 8,
+                    margin: '16px auto 6px',
+                    padding: '10px 16px',
+                    borderRadius: 999,
+                    border: '1px solid var(--border)',
+                    background: 'var(--surface-2, rgba(255,255,255,0.04))',
+                    fontSize: 13,
+                    fontWeight: 650,
+                    color: 'var(--text-2)',
+                    width: 'fit-content',
+                  }}
+                >
+                  <Icon name="check" size={15} style={{ color: 'var(--ok)' }} />
+                  {`Call ended — ${endedOutcome}`}
+                </div>
+              ) : null}
             </div>
             <div className="lv-fade" />
           </div>
@@ -379,9 +431,11 @@ function CallMonitor({
           />
           {isLive
             ? `Recording · Turn ${ep.turn_count}`
-            : isSample
-              ? 'Sample call (not live)'
-              : 'Most recent call (not live)'}
+            : ended
+              ? `Call ended · ${endedOutcome}`
+              : isSample
+                ? 'Sample call (not live)'
+                : 'Most recent call (not live)'}
         </span>
         <div className="lv-tl">
           <span style={{ fontSize: 11, fontWeight: 650, color: 'var(--text-3)' }}>Last act</span>
@@ -392,16 +446,29 @@ function CallMonitor({
             <Icon name="eye" size={16} />
             Open review
           </button>
-          {/* Operator live-takeover (barging into the live LiveKit room as a human) isn't wired in
-              this build, so the control is honestly disabled rather than a click-that-does-nothing. */}
-          <button
-            className="btn btn-primary btn-lg"
-            disabled
-            title="Live takeover isn't available in this build — the monitor is view-only. Interact via the demo console or the phone line."
-          >
-            <Icon name="hand" size={17} />
-            Take over
-          </button>
+          {/* CB-13: on the frozen ended view, the primary control returns the operator to the live
+              queue (it does NOT auto-revert) instead of the disabled "Take over". */}
+          {ended ? (
+            <button
+              className="btn btn-primary btn-lg"
+              data-testid="back-to-live"
+              onClick={() => onBackToLive?.()}
+            >
+              <Icon name="broadcast" size={17} />
+              Back to live
+            </button>
+          ) : (
+            /* Operator live-takeover (barging into the live LiveKit room as a human) isn't wired in
+               this build, so the control is honestly disabled rather than a click-that-does-nothing. */
+            <button
+              className="btn btn-primary btn-lg"
+              disabled
+              title="Live takeover isn't available in this build — the monitor is view-only. Interact via the demo console or the phone line."
+            >
+              <Icon name="hand" size={17} />
+              Take over
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -433,6 +500,10 @@ export default function LivePage() {
   // The detailed snapshot for the selected call (or empty-state / sample)
   const [snap, setSnap] = useState<LiveSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // CB-13: the FROZEN snapshot of a call the operator was watching when it went terminal. While set,
+  // the page shows that finished call (transcript + "Call ended" marker) and does NOT auto-revert to
+  // the empty/queue state — the operator dismisses it explicitly via "Back to live" (handleBackToLive).
+  const [endedSnap, setEndedSnap] = useState<LiveSnapshot | null>(null);
   // Sample toggle state — only active when no real calls
   const [showSample, setShowSample] = useState(false);
   const [sampleSnap, setSampleSnap] = useState<LiveSnapshot | null>(null);
@@ -463,6 +534,25 @@ export default function LivePage() {
   // Keep a ref so the detail-polling interval always sees the current selectedEpisodeId
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selectedEpisodeId;
+
+  // CB-13 bookkeeping (refs so the polling closures see the latest without re-subscribing):
+  //  - seenActiveRef: episode ids we have observed as ACTIVE this session — the precondition for an
+  //    active->ended freeze (we never "freeze" a call we never watched live).
+  //  - dismissedEndedRef: ended calls the operator already dismissed via "Back to live" — so a stale
+  //    in-progress->terminal row that lingers in a recent-episodes scan can't re-freeze the page.
+  //  - frozenIdRef: the episode currently frozen (mirrors endedSnap) so the poll closure can read it.
+  const seenActiveRef = useRef<Set<string>>(new Set());
+  const dismissedEndedRef = useRef<Set<string>>(new Set());
+  const frozenIdRef = useRef<string | null>(null);
+  frozenIdRef.current = endedSnap?.episode?.episode_id ?? null;
+
+  // CB-13: dismiss the frozen ended call and return to the live queue. The dismissed id is remembered
+  // so the next poll cannot immediately re-freeze the same finished call.
+  const handleBackToLive = useCallback(() => {
+    const id = frozenIdRef.current;
+    if (id) dismissedEndedRef.current.add(id);
+    setEndedSnap(null);
+  }, []);
 
   // Load the sample snapshot when toggle is turned on
   const loadSample = useCallback(async () => {
@@ -497,9 +587,43 @@ export default function LivePage() {
         setActiveCalls(q);
         setError(null);
 
+        const ids = q.calls.map((c) => c.episode_id);
+        // Remember every call seen active this session (the freeze precondition below).
+        for (const id of ids) seenActiveRef.current.add(id);
+
+        // CB-13: did the call the operator is WATCHING just leave the active queue? If we saw it
+        // active before and it isn't currently frozen/dismissed, FREEZE its last snapshot instead of
+        // reverting to empty. We fetch /api/live?episode_id=<id>, which returns the now-terminal
+        // episode's full detail with active:false (the transcript persists), and pin it as endedSnap.
+        const watching = selectedRef.current;
+        if (
+          watching &&
+          !ids.includes(watching) &&
+          seenActiveRef.current.has(watching) &&
+          frozenIdRef.current === null &&
+          !dismissedEndedRef.current.has(watching)
+        ) {
+          // Claim the freeze slot optimistically so a second poll tick (the fetch below is async)
+          // can't double-fetch the same ended call.
+          frozenIdRef.current = watching;
+          try {
+            const ended = await fetchLive(watching);
+            // Only freeze a real finished call (it has a transcript + is no longer active). A 0-turn
+            // stale dial returns {active:false, episode:null} — nothing to freeze, so release the
+            // optimistic claim and fall through to the normal (auto-select/empty) behavior.
+            if (!cancelled && ended.episode && ended.active !== true && ended.episode.turns.length > 0) {
+              setEndedSnap(ended);
+            } else {
+              frozenIdRef.current = null;
+            }
+          } catch {
+            // couldn't fetch the ended detail — release the claim and degrade gracefully.
+            frozenIdRef.current = null;
+          }
+        }
+
         // Auto-select the first call if nothing is selected (or selected call left the queue)
         if (q.count > 0) {
-          const ids = q.calls.map((c) => c.episode_id);
           setSelectedEpisodeId((prev) => {
             if (prev && ids.includes(prev)) return prev;
             return ids[0];
@@ -555,8 +679,68 @@ export default function LivePage() {
     return () => { cancelled = true; };
   }, [selectedEpisodeId]);
 
-  // N3: gate the shell's top-title LIVE pill on whether we're genuinely active (not sample)
-  const titleActive = snap?.active === true && snap.sample !== true;
+  // CB-12 (real-time streaming): subscribe to the server's per-turn SSE for the SELECTED call so each
+  // prospect/agent bubble appears within sub-second of the server committing it — not only on the 5 s
+  // poll. On each "turn" event we re-fetch the detail snapshot (cheap, and reuses the exact same
+  // rendering path as the poll, so the SSE never assembles turns client-side or diverges from the
+  // poll). The 5 s poll stays as a fallback if SSE is unavailable (older backend / proxy buffering).
+  // Skipped while a call is frozen-ended (endedSnap) — a finished call has nothing left to stream.
+  useEffect(() => {
+    if (!selectedEpisodeId || endedSnap) return;
+    if (typeof window === 'undefined' || typeof EventSource === 'undefined') return;
+
+    let cancelled = false;
+    let refreshing = false;
+    const epId = selectedEpisodeId;
+    const url = `${API_BASE}/api/demo/auto/stream?episode_id=${encodeURIComponent(epId)}`;
+    let es: EventSource | null = null;
+
+    // Pull the latest detail when the server signals a new turn. Guarded so overlapping events
+    // collapse into one in-flight fetch (no request pile-up under a burst).
+    const refresh = async () => {
+      if (cancelled || refreshing) return;
+      refreshing = true;
+      try {
+        const s = await fetchLive(epId);
+        if (!cancelled) {
+          setSnap(s);
+          setError(null);
+        }
+      } catch {
+        // transient — the 5 s poll will reconcile.
+      } finally {
+        refreshing = false;
+      }
+    };
+
+    try {
+      es = new EventSource(url);
+      // The backend emits a named "turn" event per committed turn and an "end" event at terminal.
+      es.addEventListener('turn', () => void refresh());
+      es.addEventListener('end', () => {
+        // Refresh once more so the final turn is on screen, then let the queue poll handle the
+        // active->ended freeze (CB-13). Close the stream — nothing more will arrive.
+        void refresh();
+        es?.close();
+      });
+      // onerror fires on close/network hiccup; EventSource auto-reconnects, but if the endpoint is
+      // unavailable entirely we close to avoid a reconnect storm — the poll remains the fallback.
+      es.onerror = () => {
+        if (es && es.readyState === EventSource.CLOSED) es = null;
+      };
+    } catch {
+      es = null; // EventSource construction failed — rely on the poll.
+    }
+
+    return () => {
+      cancelled = true;
+      es?.close();
+    };
+  }, [selectedEpisodeId, endedSnap]);
+
+  // N3: gate the shell's top-title LIVE pill on whether we're genuinely active (not sample, and not
+  // showing the frozen ended view — a finished call is never "live").
+  const titleActive = endedSnap === null && snap?.active === true && snap.sample !== true;
   useEffect(() => {
     const pill = document.querySelector<HTMLElement>('.top-title .live-pill');
     if (pill) pill.style.display = titleActive ? '' : 'none';
@@ -579,6 +763,34 @@ export default function LivePage() {
           <h3>Can&apos;t reach the call feed</h3>
           <p>{error}</p>
         </div>
+      </div>
+    );
+  }
+
+  // --- CB-13: FROZEN ENDED CALL (takes precedence — the monitor must NOT auto-clear) ---
+  // The call the operator was watching went terminal. Keep it on screen (transcript + "Call ended"
+  // marker) until the operator explicitly returns to the live queue. We render the queue rail above
+  // it when other calls are still active so the operator can switch away if they want to.
+  if (endedSnap?.episode) {
+    return (
+      <div className="page" style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        {activeCalls && activeCalls.count > 1 ? (
+          <QueueRail
+            calls={activeCalls.calls}
+            selectedId={selectedEpisodeId}
+            onSelect={(id) => {
+              // Switching to another call dismisses the frozen view and resumes live watching.
+              handleBackToLive();
+              setSelectedEpisodeId(id);
+            }}
+          />
+        ) : null}
+        <CallMonitor
+          snap={endedSnap}
+          ended
+          onBackToLive={handleBackToLive}
+          onOpenReview={(id) => router.push(`/operate/review/${id}`)}
+        />
       </div>
     );
   }

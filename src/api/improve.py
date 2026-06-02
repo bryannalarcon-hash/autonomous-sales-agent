@@ -1,7 +1,11 @@
 # Operator-dashboard IMPROVE API (plan U16 — Improve mode). The 4 Improve screens read/write JSON
 # through these endpoints: P6 Experiment Lab (GET /api/experiments — the before/after champion-vs-
-# challenger records; POST /api/experiments/run RUNS a live A/B between the champion and a single
-# changed value and persists the result), P7 Approval Queue (GET /api/approvals = experiments in
+# challenger records; POST /api/experiments/run kicks off a live A/B between the champion and a single
+# changed value ASYNCHRONOUSLY — it persists a `running` record + returns 202 IMMEDIATELY, then runs
+# the (paid, minutes-long) A/B in a BACKGROUND task that settles the SAME record to its terminal state
+# on completion/timeout/crash (CB-15/CB-20: the button never hangs and a run never lingers `running`
+# forever); POST /api/experiments/scaffold builds a draft experiment seeded from a reviewed call so the
+# review page can open a per-experiment review before running, CB-19), P7 Approval Queue (GET /api/approvals = experiments in
 # `blocked` state, plus POST .../approve -> promote the challenger to champion, POST .../reject), P8
 # KB/Playbook Editor (GET /api/kb returns the REAL grounded corpus from the kb_chunk table grouped by
 # section — the facts/objection-rebuttals the agent grounds answers on, NOT placeholder strings; GET
@@ -19,11 +23,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from typing import Any, Awaitable, Callable, Optional, Protocol
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 from src.api import labels
 from src.config.settings import AgentConfig, load_config
@@ -182,11 +190,65 @@ def experiment_to_dict(exp: ExperimentRecord) -> dict[str, Any]:
     }
 
 
-def lineage_to_dict(node: VersionLineage) -> dict[str, Any]:
+# CB-02 — recover the human CHANGE DIMENSION for a lineage node that has none stored.
+#
+# version_lineage rows carry the dimension under kpi["dimension"] when written by promote()/approve
+# (both stamp it). But pre-existing/legacy rows store only {"ladder": ...}, so the version history
+# rendered "CHANGE —" for a genuinely-promoted version. The NON-MIGRATION fix: look the dimension up
+# from a matching `experiment` record. The lineage `version` and an experiment's `challenger_version`
+# don't always share a literal string (e.g. "v1-1fb2bc0e" vs "champion_v1"), so we match on a NORMALIZED
+# version BASE: strip the experiment-suffix ("__dim__seed"), strip a trailing short hash ("-1fb2bc0e"),
+# and strip a leading "champion_". Genesis nodes (no parent) intentionally KEEP "—".
+
+
+def _version_base(version: Optional[str]) -> str:
+    """Normalize a lineage/experiment version to a comparable BASE so a lineage node can be matched to
+    the experiment that produced it (CB-02). Drops the "__dimension__seed" experiment suffix, a trailing
+    "-<hash>" disambiguator, and a leading "champion_" prefix — so "v1-1fb2bc0e" and "champion_v1" both
+    reduce to "v1"."""
+    if not version:
+        return ""
+    base = version.split("__", 1)[0]
+    base = base.rsplit("-", 1)[0] if "-" in base else base
+    if base.startswith("champion_"):
+        base = base[len("champion_"):]
+    return base
+
+
+def build_dimension_index(experiments: list[ExperimentRecord]) -> dict[str, str]:
+    """Map a normalized version BASE -> the change-dimension slug, from experiments (CB-02 backfill).
+
+    PROMOTED/BLOCKED experiments win (a shipped/decided change is the authoritative source of a
+    version's dimension); any other experiment fills a base only if nothing decided already claimed it.
+    Used to recover the dimension for legacy lineage rows that stored no kpi["dimension"]."""
+    decided: dict[str, str] = {}
+    other: dict[str, str] = {}
+    for e in experiments:
+        if not e.dimension:
+            continue
+        base = _version_base(e.challenger_version)
+        if not base:
+            continue
+        if e.state in ("promoted", "blocked"):
+            decided.setdefault(base, e.dimension)
+        else:
+            other.setdefault(base, e.dimension)
+    return {**other, **decided}  # decided overrides other on a base collision
+
+
+def lineage_to_dict(
+    node: VersionLineage, dimension_index: Optional[dict[str, str]] = None
+) -> dict[str, Any]:
     """Flatten one lineage node for the version history (P9). The KPI snapshot is passed through as
-    stored (already numeric, no internal index); the dimension inside it is labeled."""
+    stored (already numeric, no internal index); the dimension inside it is labeled.
+
+    CB-02: when the node stores no kpi["dimension"] AND it is NOT a genesis node (it has a parent —
+    a genesis version legitimately shows "—"), recover the dimension from `dimension_index` (built from
+    the experiment table) so a promoted version shows its real change label instead of "CHANGE —"."""
     kpi = node.kpi or {}
     dim = kpi.get("dimension")
+    if not dim and node.parent_version and dimension_index:
+        dim = dimension_index.get(_version_base(node.version))
     return {
         "version": node.version,
         "parent_version": node.parent_version,
@@ -408,6 +470,37 @@ def _challenger_for(champion: AgentConfig, dimension: str, value: Any, *, seed: 
     )
 
 
+def _running_record(
+    experiment_id: str,
+    champion: AgentConfig,
+    challenger: Any,
+    *,
+    n: int,
+    population: str,
+    name: str,
+) -> ExperimentRecord:
+    """Build the `running` ExperimentRecord persisted the instant a run is kicked off (CB-15), BEFORE
+    the A/B produces any comparison. The before/after fields stay at their neutral schema defaults
+    (the background task upserts the SAME experiment_id with the real result on completion). Carries
+    the declared one-dimension diff + is_extreme so the running card already shows what's being tested.
+    """
+    return ExperimentRecord(
+        experiment_id=experiment_id,
+        challenger_version=challenger.challenger_version,
+        parent_version=challenger.parent_version,
+        name=name,
+        dimension=challenger.dimension,
+        declared_diff=sorted(declared_diff(champion, challenger.config)),
+        diff_description=challenger.diff_description,
+        population=population,
+        n=n,
+        target=n,
+        kb_version=challenger.config.kb_version,
+        is_extreme=challenger.is_extreme,
+        state="running",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Request DTOs
 # ---------------------------------------------------------------------------
@@ -433,11 +526,13 @@ _MIN_RUN_N = 5
 # A fixed held-out seed so a given (dimension, value, n) re-runs the SAME frozen scenarios (R20).
 _RUN_HELD_OUT_SEED = 7
 
-# COST/availability bound for the inline A/B (Fix: it awaits a full real self-play run — minutes,
-# paid — so it must be bounded + serialized rather than hang or stack paid work). The run is wrapped
-# in asyncio.wait_for(_RUN_TIMEOUT_S) and guarded by a semaphore of _RUN_CONCURRENCY permits; a run
-# that exceeds the budget returns 503 (clear timeout), and a concurrent run that can't get a permit
-# returns 503 (busy) instead of starting more paid work. A full job-queue is out of scope here.
+# COST/availability bound for the A/B (CB-15: it is a full real self-play run — minutes, paid — so it
+# runs in a BACKGROUND task, not inline, and is bounded + serialized rather than hanging the request or
+# stacking paid work). The background run is wrapped in asyncio.wait_for(_RUN_TIMEOUT_S) and guarded by
+# a semaphore of _RUN_CONCURRENCY permits acquired BEFORE the task is spawned: a 2nd run while one holds
+# the permit returns 503 (busy) without starting more paid work; a run that exceeds the timeout settles
+# the record to a terminal `rejected` (CB-20 — never a perpetual `running`). A full job-queue is out of
+# scope here.
 _DEFAULT_RUN_TIMEOUT_S = 180.0
 _DEFAULT_RUN_CONCURRENCY = 1
 
@@ -446,11 +541,32 @@ class RunExperimentRequest(BaseModel):
     """A "run an A/B between two values" request (POST /api/experiments/run). `dimension` is a
     mutation-surface label the loop supports: "playbooks.discovery_sequence" (with `value` = a
     reordered slot list) or "thresholds.<key>" (with `value` = the new number). `n` is the held-out
-    sample size PER ARM — modest by default because each call spends real model credit in prod."""
+    sample size PER ARM — modest by default because each call spends real model credit in prod.
+
+    `episode_id` (optional, CB-19): the reviewed call this run was scaffolded from. It is carried onto
+    the persisted record's population label so the lab/review surface can show "seeded from this call";
+    it never changes the A/B itself (the held-out set is frozen by seed)."""
 
     dimension: str
     value: Any
     n: int = _DEFAULT_RUN_N
+    name: str = ""
+    episode_id: Optional[str] = None
+
+
+class ScaffoldExperimentRequest(BaseModel):
+    """Scaffold a DRAFT experiment seeded from a reviewed call (CB-19, POST /api/experiments/scaffold).
+
+    The review page hands the episode it is inspecting; this builds a NON-extreme draft (a discovery-
+    sequence reorder by default — the safe, auto-promote-eligible dimension) WITHOUT running anything,
+    persists it as a `draft` ExperimentRecord, and returns it so the lab's per-experiment review view
+    can open it pre-populated (episode context attached) for the operator to confirm before running.
+    The optional `dimension`/`value` let a caller pre-pick the change; omitted -> a minimal default
+    reorder so the scaffold always yields a real one-dimension diff."""
+
+    episode_id: str
+    dimension: Optional[str] = None
+    value: Any = None
     name: str = ""
 
 
@@ -480,16 +596,22 @@ def create_improve_router(
     optional run_experiment runner seam (tests inject a deterministic deck so the A/B is reproducible
     without self-play; prod leaves it None -> real self-play).
 
-    `run_timeout_s` / `run_max_concurrency` BOUND the paid inline A/B: each run is wrapped in
-    asyncio.wait_for(run_timeout_s) and guarded by a semaphore of run_max_concurrency permits — a run
-    past the budget or a contended concurrent run returns 503 rather than hanging or stacking paid
-    work (server.create_app uses the defaults; tests override them for fast, deterministic coverage).
-    All endpoints are async."""
+    `run_timeout_s` / `run_max_concurrency` BOUND the paid BACKGROUND A/B (CB-15): POST
+    /api/experiments/run persists a `running` record + returns 202 immediately, then a background task
+    runs the A/B wrapped in asyncio.wait_for(run_timeout_s) and guarded by a semaphore of
+    run_max_concurrency permits — a contended concurrent run returns 503 (busy) up front, and a run
+    past the budget settles the record to a terminal state rather than hanging or lingering `running`
+    forever (CB-20). server.create_app uses the defaults; tests override them for fast, deterministic
+    coverage. All endpoints are async."""
     store: ImproveStore = improve_store if improve_store is not None else _StoreBackedImproveStore()
     get_config = champion_config_provider or (lambda: load_config("champion_v0"))
     # One semaphore for the whole router instance bounds concurrent paid runs. Created here (3.10+
     # binds it to the loop lazily on first use), shared across requests served by this router.
     run_semaphore = asyncio.Semaphore(max(1, int(run_max_concurrency)))
+    # Strong refs to in-flight background run tasks: asyncio only weakly references tasks, so without
+    # this an A/B could be garbage-collected mid-run (mirrors demo_routes._demo_tasks, CB-08). Each
+    # task discards itself from the set on completion.
+    _run_tasks: "set[asyncio.Task[Any]]" = set()
 
     def _make_llm() -> LLMClient:
         if llm_client_factory is not None:
@@ -516,29 +638,119 @@ def create_improve_router(
             "counts": {"active": len(active), "past": len(past)},
         }
 
-    @router.post("/api/experiments/run")
-    async def run_experiment_ep(req: RunExperimentRequest) -> dict[str, Any]:
-        """RUN an A/B between the current champion and a single changed value (P6 "Run experiment").
+    async def _run_ab_background(
+        *,
+        experiment_id: str,
+        champion: AgentConfig,
+        challenger: Any,
+        n: int,
+        population: str,
+        name: str,
+    ) -> None:
+        """Background task (CB-15/CB-20): run the (paid, minutes-long) A/B and SETTLE the already-
+        persisted `running` record to its TERMINAL state — passed/blocked/rejected/promoted per the
+        gate, or `rejected` on timeout/crash. The semaphore permit is held for the WHOLE run and
+        released in the finally, so the concurrency guard is honest and a permit is never leaked.
+
+        GUARANTEE (CB-20): the record can never linger `running` forever — every exit path (success,
+        timeout, crash) re-saves the SAME experiment_id with a terminal state. Mirrors the CB-08
+        server-side task discipline (try/except + always-settle in finally).
+
+        FAIL-CLOSED (R36): this run does NOT measure sim-to-real divergence, so an otherwise auto-
+        promote-eligible (clean, non-extreme) result is downgraded to pending_approval (blocked) —
+        the central-risk divergence gate is never bypassed by this path.
+        """
+        settled = False
+        try:
+            held_out = frozen_held_out(seed=_RUN_HELD_OUT_SEED, n=n, rotation_index=0)
+            experiment = await asyncio.wait_for(
+                run_experiment(
+                    champion,
+                    challenger,
+                    held_out,
+                    _make_llm,
+                    _make_llm,
+                    seed=_RUN_HELD_OUT_SEED,
+                    runner=experiment_runner,
+                ),
+                timeout=run_timeout_s,
+            )
+            decision = evaluate_promotion(experiment, is_extreme=challenger.is_extreme)
+            if decision.status == "promoted":
+                decision = PromotionDecision(
+                    status="pending_approval",
+                    promote=False,
+                    requires_human=True,
+                    reasons=[
+                        "passed the bar but sim-to-real divergence was NOT measured on this run "
+                        "(R36) — routed to human approval instead of auto-promoting (fail-closed)"
+                    ],
+                )
+            record = experiment_record_from(
+                experiment,
+                decision,
+                challenger=challenger,
+                n=n,
+                target=n,
+                population=population,
+                name=name,
+                experiment_id=experiment_id,  # SAME id -> upserts the `running` row to its result
+            )
+            await store.save_experiment(record)
+            settled = True
+        except asyncio.TimeoutError:
+            logger.warning("experiment run %s timed out after %ss", experiment_id, run_timeout_s)
+        except Exception:
+            logger.warning("experiment run %s crashed", experiment_id, exc_info=True)
+        finally:
+            # CB-20 guard: if the run never produced a terminal record (timeout/crash), settle the
+            # row to `rejected` so it can NEVER stay `running` forever. Swallow a settle failure so a
+            # hiccup here doesn't leak the task — the run is already off the request path.
+            if not settled:
+                try:
+                    await _settle_failed_run(experiment_id, champion, challenger, n, population, name)
+                except Exception:
+                    logger.warning("failed to settle stuck run %s to terminal", experiment_id)
+            run_semaphore.release()
+
+    async def _settle_failed_run(
+        experiment_id: str,
+        champion: AgentConfig,
+        challenger: Any,
+        n: int,
+        population: str,
+        name: str,
+    ) -> None:
+        """Re-save a timed-out/crashed run's record in a TERMINAL `rejected` state (CB-20) — never
+        `running`. Keeps the before/after fields at their neutral defaults (the A/B never produced a
+        comparison) and carries a clear guardrail_reason so the lab card explains the failure."""
+        record = _running_record(
+            experiment_id, champion, challenger, n=n, population=population, name=name
+        )
+        record.state = "rejected"
+        record.guardrail = "trip"
+        record.guardrail_reason = "the run did not complete (timed out or failed) — no result recorded"
+        await store.save_experiment(record)
+
+    @router.post("/api/experiments/run", status_code=202)
+    async def run_experiment_ep(req: RunExperimentRequest) -> JSONResponse:
+        """Kick off an A/B between the current champion and a single changed value, ASYNCHRONOUSLY
+        (P6 "Run experiment"; CB-15).
 
         Builds the champion config + a minimal-diff challenger for {dimension, value} via the
-        generator's pure mutators (is_extreme set per R19), runs run_experiment on a FROZEN held-out
-        set of `n` adversarial personas using the app's injected LLM client, evaluates the promotion
-        gate, flattens the graded result into an ExperimentRecord (state passed/blocked/etc. per the
-        gate), PERSISTS it, and returns it — so the run SHOWS in the lab immediately.
+        generator's pure mutators (is_extreme set per R19), PERSISTS a `running` ExperimentRecord, and
+        RETURNS IT IMMEDIATELY (202) — so the UI button never hangs (it closes the drawer + shows the
+        running card at once; the existing /api/experiments poll settles it). The full (paid, minutes-
+        long in prod) self-play A/B then runs in a BACKGROUND task that settles the SAME record to its
+        terminal state on completion/timeout/crash (CB-20 — never a perpetual `running`).
 
-        BOUNDED + SERIALIZED: the inline A/B is a full (paid, minutes-long in prod) self-play run, so
-        it is wrapped in asyncio.wait_for(run_timeout_s) and guarded by a concurrency semaphore — a
-        run past the budget returns 503 (clear timeout) and a contended concurrent run returns 503
-        (busy) instead of hanging or stacking paid work.
+        CONCURRENCY GUARD (kept): a 2nd run while one holds the permit returns 503 (busy) up front,
+        without starting more paid work — never a frozen button.
 
-        FAIL-CLOSED (R36): the inline run does NOT measure sim-to-real divergence, so an otherwise
-        AUTO-PROMOTE-eligible (clean, non-extreme) result is routed to `pending_approval` rather than
-        silently promoted — the central-risk divergence gate is never bypassed by this path.
-
-        COST: in the running app the injected client is a REAL OpenRouterClient, so this spends model
-        credit — `n` is modest by default (floored to a minimum sample, capped at the max). Tests
-        inject a MockLLMClient + a deterministic runner (free). Input is validated at the boundary
-        (400) BEFORE any paid run begins.
+        COST: in the running app the injected client is a REAL OpenRouterClient, so the background run
+        spends model credit — `n` is modest by default (floored to a minimum sample, capped at the
+        max). Tests inject a MockLLMClient + a deterministic runner (free). Input is validated at the
+        boundary (400) BEFORE anything is persisted or any paid run is spawned.
         """
         # Floor N to the minimum trustworthy sample (>=_MIN_RUN_N) and cap it — never run a degenerate
         # tiny sample that the grading floor would reject anyway, and never let a UI typo bill a huge N.
@@ -549,64 +761,94 @@ def create_improve_router(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        # Concurrency guard: refuse to START a second paid run while one is in flight (no permit ->
-        # 503 busy). acquire is non-blocking via locked() so the contended caller fails fast.
+        # Concurrency guard: refuse to START a second paid run while one holds the permit (-> 503 busy,
+        # NOT a hang). Acquire BEFORE spawning so the background task owns the permit for its whole run.
         if run_semaphore.locked():
             raise HTTPException(
                 status_code=503,
                 detail="an experiment run is already in progress — retry once it completes",
             )
         await run_semaphore.acquire()
-        try:
-            held_out = frozen_held_out(seed=_RUN_HELD_OUT_SEED, n=n, rotation_index=0)
-            try:
-                experiment = await asyncio.wait_for(
-                    run_experiment(
-                        champion,
-                        challenger,
-                        held_out,
-                        _make_llm,
-                        _make_llm,
-                        seed=_RUN_HELD_OUT_SEED,
-                        runner=experiment_runner,
-                    ),
-                    timeout=run_timeout_s,
-                )
-            except asyncio.TimeoutError as exc:
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        f"experiment run timed out after {run_timeout_s:g}s — the A/B exceeded the "
-                        "budget; reduce N or retry"
-                    ),
-                ) from exc
-        finally:
-            run_semaphore.release()
 
-        decision = evaluate_promotion(experiment, is_extreme=challenger.is_extreme)
-        # FAIL-CLOSED on the unmeasured central risk: a clean non-extreme auto-promote with NO
-        # divergence measured here is downgraded to pending_approval (human queue) — never shipped.
-        if decision.status == "promoted":
-            decision = PromotionDecision(
-                status="pending_approval",
-                promote=False,
-                requires_human=True,
-                reasons=[
-                    "passed the bar but sim-to-real divergence was NOT measured on this inline run "
-                    "(R36) — routed to human approval instead of auto-promoting (fail-closed)"
-                ],
-            )
-        record = experiment_record_from(
-            experiment,
-            decision,
-            challenger=challenger,
-            n=n,
-            target=n,
-            population=f"Held-out · {n} personas",
-            name=req.name or challenger.diff_description,
+        # Persist a `running` record + return it immediately. The background task upserts this SAME id.
+        experiment_id = f"RUN-{challenger.challenger_version}"
+        population = f"Held-out · {n} personas"
+        if req.episode_id:  # CB-19: a run scaffolded from a reviewed call carries its origin.
+            population = f"{population} · seeded from a reviewed call"
+        name = req.name or challenger.diff_description
+        running = _running_record(
+            experiment_id, champion, challenger, n=n, population=population, name=name
         )
-        await store.save_experiment(record)
-        return {"experiment": experiment_to_dict(record), "decision": decision.status}
+        try:
+            await store.save_experiment(running)
+        except Exception:
+            run_semaphore.release()  # never leak the permit if the initial persist fails.
+            raise
+
+        task = asyncio.create_task(
+            _run_ab_background(
+                experiment_id=experiment_id,
+                champion=champion,
+                challenger=challenger,
+                n=n,
+                population=population,
+                name=name,
+            )
+        )
+        _run_tasks.add(task)
+        task.add_done_callback(_run_tasks.discard)
+
+        # 202 Accepted: the run is started, not finished. `decision` is "running" until the poll settles.
+        return JSONResponse(
+            status_code=202,
+            content={"experiment": experiment_to_dict(running), "decision": "running"},
+        )
+
+    @router.post("/api/experiments/scaffold")
+    async def scaffold_experiment_ep(req: ScaffoldExperimentRequest) -> dict[str, Any]:
+        """Scaffold a DRAFT experiment seeded from a reviewed call (CB-19) — WITHOUT running anything.
+
+        The review page's "Use in experiment" hands the episode it is inspecting; this builds a minimal
+        one-dimension challenger (a discovery-sequence reorder by default — the safe, non-extreme,
+        auto-promote-eligible dimension; an explicit dimension/value overrides), persists it as a
+        `draft` ExperimentRecord whose population carries the originating call, and returns it. The lab
+        opens a per-experiment REVIEW view (/improve/lab?experiment=<id>) pre-populated from this draft
+        so the operator confirms it before launching the (async, paid) run — not a blank lab landing.
+
+        The live champion config / version is UNCHANGED (no record_version) — a scaffold is a draft."""
+        champion = get_config()
+        dimension = req.dimension or "playbooks.discovery_sequence"
+        value = req.value
+        if value is None and dimension == "playbooks.discovery_sequence":
+            # Default minimal reorder so the scaffold always yields a real one-dimension diff.
+            value = _swap_first_two(list(champion.playbooks.get("discovery_sequence") or []))
+        try:
+            challenger = _challenger_for(champion, dimension, value, seed=_RUN_HELD_OUT_SEED)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        experiment_id = f"SCAFFOLD-{challenger.challenger_version}"
+        draft = ExperimentRecord(
+            experiment_id=experiment_id,
+            challenger_version=challenger.challenger_version,
+            parent_version=champion.version,
+            name=req.name or challenger.diff_description,
+            dimension=challenger.dimension,
+            declared_diff=sorted(declared_diff(champion, challenger.config)),
+            diff_description=challenger.diff_description,
+            population=f"Scaffolded from a reviewed call · {req.episode_id}",
+            n=0,
+            target=_DEFAULT_RUN_N,
+            kb_version=challenger.config.kb_version,
+            is_extreme=challenger.is_extreme,
+            state="draft",
+        )
+        await store.save_experiment(draft)
+        return {
+            "experiment": experiment_to_dict(draft),
+            "episode_id": req.episode_id,
+            "is_scaffold": True,
+        }
 
     # --- P7 Approval Queue -------------------------------------------------------------------
     @router.get("/api/approvals")
@@ -759,11 +1001,17 @@ def create_improve_router(
     @router.get("/api/versions")
     async def list_versions_ep(limit: int = 200) -> dict[str, Any]:
         """The lineage tree + current champion (P9). Newest-first; the champion is flagged so the UI
-        marks it and disables rollback to itself."""
+        marks it and disables rollback to itself.
+
+        CB-02: builds a dimension index from the experiment table so a promoted version whose lineage
+        row stored no change-dimension still renders its real change label (not "CHANGE —")."""
         nodes = await store.list_lineage(limit=limit)
         champ = await store.get_champion()
+        # CB-02 backfill: recover the change dimension for legacy lineage rows from the experiment table.
+        experiments = await store.list_experiments(limit=500)
+        dim_index = build_dimension_index(experiments)
         return {
-            "versions": [lineage_to_dict(n) for n in nodes],
+            "versions": [lineage_to_dict(n, dim_index) for n in nodes],
             "count": len(nodes),
             "champion_version": champ.version if champ else None,
         }
