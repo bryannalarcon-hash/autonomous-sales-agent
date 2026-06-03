@@ -70,19 +70,6 @@
 - **Refs:** `src/api/operate.py::live_snapshot` + `live_ep`; LiveKit Agents room/participant model + SIP dispatch (`scripts/setup_sip_dispatch.py`, rule `SDR_hKYQYAwz96uA`); the disabled take-over control (`web/app/operate/live/page.tsx`); R37 in `src/core/respond.py`.
 - **Take-over spec (user, 2026-06-02) — refines CB-01.c:** on "Take over", the AI must (1) be INTERRUPTED mid-conversation and (2) speak a DEFAULT TTS hand-off line (e.g. "Let me bring in a specialist to help — one moment. They may type some of their responses, so there might be a brief pause between answers."). Then the OPERATOR talks into their own device (browser mic / WebRTC into the call's LiveKit room) and is heard by the caller through the phone — operator audio is published as a room participant, NOT a dial-in (presume the operator is NOT calling from their own phone number, so no SIP bridge / caller-ID concerns). The agent stops auto-generating; the operator may ALSO TYPE responses that are TTS'd to the caller ("the agent might be typing their responses"). So take-over = interrupt + disclosure TTS + operator mic→room audio + optional operator-typed→TTS, with the AI yielded. Consent/recording state must carry over; respect R37 (don't fork the brain — the brain just stops).
 
-### CB-42 — [EXPERIMENTAL · separate worktree] Replace the two non-generative LLMs (DST + Policy) with distilled ML models; keep NLG as the sole streamed LLM
-- **Type / Surface / Size:** research/feature · `core` (`src/core` brain) · **EXPERIMENTAL** · XL
-- **Build mode:** develop in a SEPARATE git worktree off the mono branch (do NOT destabilize the live brain); merge only if it clears the eval gates below. Provider-agnostic `respond(... llm_client ...)` + the deterministic gates are the stable seams it plugs into.
-- **Prereqs:** the distillation dataset (logged episodes + the CB-06 true-driver trajectories) + the grading / sim2real / experiment eval harness (already exist).
-- **Current:** 3 sequential LLM calls/turn (~6 s): DST (`gpt-5-nano`, driver-deltas + intent — slots/trends/intent-fallback already deterministic), Policy (`gpt-5-mini`, proposes a bounded `Decision{act,tier}` that the deterministic `apply_gates` then decides), NLG (`claude-sonnet-4.5`, prose). DST + Policy are PERCEPTION/CONTROL (non-generative); only NLG generates words.
-- **Desired (target architecture):** `DST(ML) → [deterministic gates] ← Policy(ML) → NLG(the ONE streamed LLM)`:
-  - DST LLM → (a) **intent classifier** (bounded 5-class; the regex fallback already proves a non-LLM path) + (b) **driver-delta regressor** (sentence-embedding → small MLP → 6 deltas), DISTILLED from logged LLM deltas + grounded by the true-driver trajectories.
-  - Policy LLM → **act classifier** (belief feature-vector → bounded act/tier), with `apply_gates` (buy_gate / pushiness_cap / escalation_triggers / close_floor / skip_known) UNCHANGED on top — the safety layer must stay deterministic (the live transcript proved the LLM won't self-police).
-  - NLG stays the sole LLM, streamed (CB-41).
-  - Result: 1 LLM call/turn + two ms-scale local inferences → ~sub-2 s turns, far cheaper.
-- **Acceptance (promote ONLY if all hold vs the current LLM brain on held-out):** belief-trajectory divergence ≤ a set tolerance; policy act-agreement ≥ a set %; sim2real divergence no worse; outcome distribution preserved (no buy-gate regression); turn latency ~sub-2 s; a confidence-gated FALLBACK to the LLM when an ML model is uncertain (so novel inputs degrade gracefully). R37 + the honest buy-gate intact. Promotion goes through the experiment/grading pipeline, not a hand-merge.
-- **Refs:** `dst.py` (deltas+intent call + the `_extract_slots`/regex-intent-fallback seam), `policy.py` (`Decision` + bounded act vocab), `gates.py` (the deterministic layer to preserve), CB-06 (true-driver trajectories = training labels), the grading/sim2real loop; CB-41 (NLG streaming, a prereq for the latency payoff); the latency research deliverable.
-
 ---
 
 ## In Progress
@@ -134,6 +121,13 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-42 — [EXPERIMENT, contained on `cb42-ml-distill`] Distill DST + Policy LLMs to local ML — EVALUATED, NOT MERGED
+- **Completed (evaluated):** 2026-06-03 · on the isolated `cb42-ml-distill` worktree/branch (commits `78e5820`, `806f8ba`); **NOT merged to main** (did not clear the "better" gate).
+- **What was built/measured:** data export (5,919 DST samples, 1,876 CB-06-grounded; 900 teacher-distilled policy acts) → **DST→ML regressor** (MLP, held-out MAE 0.0033, ~92% over naive, 98.6% directional agreement, tracks CB-06 truth as well as the LLM DST, autoregressive trajectory MAE 0.0235) → **Policy→ML** (HistGB 0.931 agreement, confidence-gated hybrid: ~89% local on easy turns, 64% LLM-fallback on adversarial turns) → wired `respond_ml` (gates + buy-gate UNCHANGED, NLG the sole streamed LLM) → **blind-QA panel** (3 judges × 6 adversarial call scripts).
+- **Result:** cost/latency WIN — **3 → ~1.1 LLM calls/turn (≈45–63% fewer)**, DST replaceable cleanly. Behaviorally a **TIE**: blind panel 8–8 on better-overall; ML slightly cleaner on nonsensical (7 vs 10) but slightly worse on wrong-phase (9 vs 7) and prescriptiveness (9 vs 7) — the lenses the owner prioritized. Belief-only policy myopia drives the wrong-phase slips.
+- **Decision:** gate was "merge only if BETTER"; a tie doesn't clear it → kept contained. Promote-DST / keep-policy-hybrid is the recommendation; **next step before reconsidering merge: add recent-utterance features to the policy act-classifier**, then re-run blind-QA + a larger self-play A/B. Full writeup: `experiments/cb42/RESULTS.md` (on the branch).
+- **Bonus finding (for a future CB on the PRODUCTION brain):** the blind QA flagged residual issues in BOTH brains — invented "timing/busy-schedule" framing in objection handling + canned objection scripts that don't acknowledge a disclosure; and some who-for repetition. Worth a follow-up CB.
 
 ### CB-30 — Golden-set capture of real conversations (tag + enumerable/exportable set)
 - **Completed:** 2026-06-03
