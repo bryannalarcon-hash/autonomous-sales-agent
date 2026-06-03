@@ -5,12 +5,17 @@
 # turns commit (state.turns grows past turn=1), the belief advances, and persist_call_end finalizes
 # a terminal Episode. This is the regression harness for the live-call bug where SpeechHandle
 # done-callbacks never fired so 0 turns persisted and the committed belief never advanced.
-# CB-32 + CB-31 (test_voice_sim_connect_upsert_and_word_streaming): the harness also patches
-# persist_call_live to RECORD each in_progress upsert and wraps llm_node to record the chunks it
+# CB-32 + CB-31/CB-41 (test_voice_sim_connect_upsert_and_word_streaming): the harness also patches
+# persist_call_live to RECORD each in_progress upsert and wraps llm_node to record the tokens it
 # yields, then asserts (CB-32) a 0-turn in_progress upsert fires BEFORE the first committed turn — the
 # entrypoint's connect-time upsert, fired explicitly here since the sim doesn't run entrypoint — and
-# (CB-31) llm_node streams the reply as >1 chunk (rejoining to the EXACT reply, R37 parity), a
-# non-empty live_partial is written DURING a turn, and the turn still commits exactly once.
+# (CB-41) llm_node streams the GENUINE NLG token stream as >1 token (rejoining to the EXACT committed
+# reply, R37 parity), a non-empty live_partial is written DURING a turn (CB-38), and the turn still
+# commits exactly once.
+# CB-41 (d) (test_voice_sim_first_token_forwarded_before_full_reply): with an _OrderRecordingBrainLLM
+# whose NLG complete_stream logs each token's PRODUCTION + a checkpoint between tokens, and the
+# llm_node wrapper logging each token's FORWARDING to TTS, the harness proves the first token is
+# forwarded to TTS BEFORE the full reply is generated (streaming, not buffer-then-emit).
 #
 # HOW AUDIO IS INJECTED (the crux):
 #   A MockSTT subclasses livekit.agents.stt.STT and returns a MockSpeechStream from stream().
@@ -307,6 +312,47 @@ def _agent_mock(
     return MockLLMClient(serve)
 
 
+class _OrderRecordingBrainLLM(MockLLMClient):
+    """A brain LLM (sim) that records the ORDER of NLG-token PRODUCTION so a test can prove the worker
+    streams tokens to TTS as they GENERATE (not buffer-then-emit). DST/policy JSON calls resolve
+    normally (via complete); only the NLG complete_stream is instrumented: it yields the reply word by
+    word, appending ("produced", i) to a shared `events` log right before each yield, and awaits a tiny
+    asyncio checkpoint between tokens so the consuming llm_node interleaves its ("forwarded", i) events.
+    If the worker BUFFERED the whole reply before emitting, every "produced" would precede every
+    "forwarded"; with genuine streaming the first "forwarded" lands before the last "produced"."""
+
+    def __init__(self, *, reply: str, events: list[tuple[str, int]],
+                 act: str = "ask", target_slot: Optional[str] = "goal") -> None:
+        decision = {
+            "act": act, "target_slot": target_slot, "tier": None, "confidence": 0.8,
+            "rationale": "order-recording decision", "trust": 0.05, "need_intensity": 0.05,
+            "urgency": 0.0, "purchase_intent": 0.03, "bail_risk": -0.02,
+        }
+        self._decision_json = json.dumps(decision)
+        self._reply = reply
+        self._events = events
+        # MockLLMClient base needs SOME script; we override both complete + complete_stream so it's unused.
+        super().__init__(["unused"])
+
+    async def complete(self, messages: Sequence[Message], *, model: Any = None,
+                       response_format: Any = None, **opts: Any) -> str:
+        # DST + policy are blocking JSON calls; NLG never calls complete (it uses complete_stream).
+        if _is_json_call(opts):
+            return self._decision_json
+        return self._reply  # defensive: a non-stream NLG path would still get the reply
+
+    async def complete_stream(self, messages: Sequence[Message], *, model: Any = None,
+                              response_format: Any = None, **opts: Any):
+        # The NLG call: stream the reply word-by-word, logging production order + an await checkpoint
+        # between tokens so the consumer (llm_node) can forward earlier tokens to TTS mid-generation.
+        import re as _re
+        tokens = _re.findall(r"\S+\s*", self._reply) or [self._reply]
+        for i, tok in enumerate(tokens):
+            self._events.append(("produced", i))
+            yield tok
+            await asyncio.sleep(0.005)  # checkpoint: lets the consumer forward this token to TTS now
+
+
 def _make_retrieve_hook() -> Any:
     embedder = FakeEmbedder()
     kb = [
@@ -357,21 +403,29 @@ async def _run_sim(
     captured_episode: list[Any],
     captured_live: Optional[list[dict[str, Any]]] = None,
     captured_chunks: Optional[list[list[str]]] = None,
+    captured_events: Optional[list[tuple[str, int]]] = None,
 ) -> None:
     """Drive a full multi-turn simulated call through the REAL AgentSession pipeline.
 
     Returns when all caller lines have been fed and the shutdown path has persisted
     the final Episode into `captured_episode`.
 
-    CB-32/CB-31 instrumentation (optional):
+    CB-32/CB-31/CB-41 instrumentation (optional):
       - `captured_live`: every persist_call_live call is recorded as a dict
         {turn_count, live_partial, has_partial, before_first_commit} so the test can assert a 0-turn
         in_progress upsert fires BEFORE the first committed turn (CB-32) and that a live_partial is
-        written DURING a turn while it streams (CB-31). The connect-time upsert (the entrypoint's
+        written DURING a turn while it streams (CB-31/CB-38). The connect-time upsert (the entrypoint's
         post-disclosure _upsert_live_voice) is fired explicitly here, since the sim does not run the
         real entrypoint.
       - `captured_chunks`: the worker's llm_node is wrapped to record the list of chunks it yields per
-        turn, so the test can assert the reply streamed as >1 chunk (CB-31).
+        turn, so the test can assert the reply streamed as >1 chunk (CB-41 — now the GENUINE NLG token
+        stream, not a post-hoc chunking of a finished reply).
+      - `captured_events`: a SHARED ordering log; the recording llm_node wrapper appends
+        ("forwarded", i) as each token is forwarded to TTS, and an _OrderRecordingBrainLLM appends
+        ("produced", i) as each token is GENERATED. With genuine streaming the first ("forwarded", …)
+        lands BEFORE the last ("produced", …) — proving the first token reaches TTS before the full
+        reply is assembled (CB-41 (d)). If the worker buffered, every produced would precede every
+        forwarded.
     """
     from livekit.agents import AgentSession
     from livekit.agents.voice.turn import TurnHandlingOptions
@@ -481,17 +535,21 @@ async def _run_sim(
 
     persistence_mod.persist_call_live = _fake_persist_live  # type: ignore[assignment]
 
-    # CB-31: wrap the agent's llm_node so the chunks it yields per turn are recorded, proving the reply
-    # streams as >1 chunk (the real async-generator path runs unchanged underneath).
-    if captured_chunks is not None:
+    # CB-41: wrap the agent's llm_node so the tokens it yields per turn are recorded, proving the reply
+    # streams as >1 token (the real async-generator path — the GENUINE NLG token stream — runs unchanged
+    # underneath). Also log ("forwarded", i) into captured_events as each token reaches TTS, so a test
+    # can prove the first token is forwarded BEFORE the full reply is generated (CB-41 (d)).
+    if captured_chunks is not None or captured_events is not None:
         _orig_llm_node = agent.llm_node
 
         async def _recording_llm_node(chat_ctx: Any, tools: Any, model_settings: Any):
             this_turn: list[str] = []
             async for chunk in _orig_llm_node(chat_ctx, tools, model_settings):
+                if captured_events is not None:
+                    captured_events.append(("forwarded", len(this_turn)))
                 this_turn.append(chunk)
                 yield chunk
-            if this_turn:
+            if captured_chunks is not None and this_turn:
                 captured_chunks.append(this_turn)
 
         agent.llm_node = _recording_llm_node  # type: ignore[method-assign]
@@ -723,20 +781,21 @@ async def test_voice_sim_multi_turn_belief_advances_per_turn() -> None:
 
 @pytest.mark.asyncio
 async def test_voice_sim_connect_upsert_and_word_streaming() -> None:
-    """CB-32 + CB-31 through the REAL AgentSession pipeline.
+    """CB-32 + CB-41 (a/b/c) through the REAL AgentSession pipeline.
 
     CB-32 (call visible at connect): the entrypoint upserts a 0-turn in_progress episode the instant
     the room is up + the disclosure is spoken, BEFORE the first user turn / first committed brain turn.
     We assert the FIRST recorded persist_call_live had 0 committed agent turns (before_first_commit),
     so the call would show in the monitor's "Connecting…" state immediately.
 
-    CB-31 (real-voice word streaming): llm_node streams the (already-decided) reply to TTS in WORD
-    chunks (an AsyncIterator[str]) and upserts the growing PARTIAL text as it streams. We assert:
-      - the reply streamed as >1 chunk (it didn't return one whole string), and the chunks rejoin to
-        the EXACT committed reply (R37 parity — no word re-decided), and
-      - at least one persist_call_live carried a non-empty live_partial DURING a turn (the partial the
-        monitor renders filling in), and
-      - the turn still COMMITTED exactly once (state.turns grew; the never-committed bug stays fixed).
+    CB-41 (stream NLG GENERATION -> TTS): llm_node runs the brain STREAMING and yields the GENUINE NLG
+    token stream to TTS (an AsyncIterator[str]), upserting the growing PARTIAL text as it streams
+    (CB-38). We assert:
+      (a) PARITY: the streamed tokens rejoin BYTE-FOR-BYTE to the committed reply (>1 token; no word
+          re-decided — concat(tokens) == committed Turn.text), and
+      (b) CB-38: at least one persist_call_live carried a non-empty live_partial DURING a turn (the
+          partial the monitor renders filling in), a prefix of the streamed reply, and
+      (c) the turn still COMMITTED exactly once (state.turns grew; the never-committed bug stays fixed).
     """
     config = load_config("champion_v0")
     reply = "Sure, let me get a few details about what your child is working on."
@@ -765,45 +824,102 @@ async def test_voice_sim_connect_upsert_and_word_streaming() -> None:
         f"CB-32: the connect-time upsert must carry 0 turns, got {captured_live[0]['turn_count']}"
     )
 
-    # ---- CB-31: the reply streamed as >1 chunk and rejoins to the exact reply ----
-    assert captured_chunks, "llm_node never yielded any chunks — the reply did not stream"
-    first_turn_chunks = captured_chunks[0]
-    assert len(first_turn_chunks) > 1, (
-        f"CB-31: llm_node must STREAM the reply in multiple word chunks, got "
-        f"{len(first_turn_chunks)} chunk(s): {first_turn_chunks!r}"
+    # ---- CB-41 (a) PARITY: the NLG stream is >1 token and rejoins to the EXACT committed reply ----
+    assert captured_chunks, "llm_node never yielded any tokens — the NLG did not stream"
+    first_turn_tokens = captured_chunks[0]
+    assert len(first_turn_tokens) > 1, (
+        f"CB-41: llm_node must STREAM the NLG in multiple tokens, got "
+        f"{len(first_turn_tokens)} token(s): {first_turn_tokens!r}"
     )
-    # R37 parity: the streamed chunks rejoin to the EXACT reply the brain decided (no re-decision).
-    assert "".join(first_turn_chunks) == reply, (
-        f"CB-31 parity: chunks must rejoin to the exact reply. "
-        f"got {''.join(first_turn_chunks)!r} != {reply!r}"
-    )
-
-    # ---- CB-31: a non-empty live_partial was written DURING a turn (mid-stream) ----
-    partials = [r for r in captured_live if r["has_partial"]]
-    assert partials, (
-        f"CB-31: at least one persist_call_live must carry a non-empty live_partial (the in-progress "
-        f"reply the monitor renders filling in). Recorded upserts: {captured_live}"
-    )
-    # The partial is (a prefix of) the SAME reply being streamed — a substring of the final reply.
-    some_partial = partials[0]["live_partial"]
-    assert some_partial and reply.startswith(some_partial.rstrip()) or some_partial in reply, (
-        f"CB-31: the live_partial must be a prefix of the streamed reply, got {some_partial!r}"
-    )
-
-    # ---- CB-31: the turn STILL committed exactly once (never-committed bug stays fixed) ----
     assert captured_episode, "No episode captured — shutdown/commit did not fire"
     ep = captured_episode[0]
     agent_turns = [t for t in ep.turns if t.speaker == "agent"]
-    assert len(agent_turns) >= 1, "CB-31: streaming must not break the commit — no agent turn committed"
-    # The committed agent reply text equals the brain's reply (commit uses pending.reply_text, not the
-    # chunked stream — transcript fidelity is preserved regardless of chunking).
-    assert any(t.text == reply for t in agent_turns), (
-        f"CB-31: committed agent turn text must be the full reply (unchunked), got "
+    assert len(agent_turns) >= 1, "CB-41: streaming must not break the commit — no agent turn committed"
+    # PARITY (R37): the streamed tokens rejoin BYTE-FOR-BYTE to the committed Turn.text — the bytes
+    # spoken to TTS equal the reply the brain committed; no word is re-decided.
+    streamed = "".join(first_turn_tokens)
+    assert streamed == reply, (
+        f"CB-41 parity: tokens must rejoin to the exact reply. got {streamed!r} != {reply!r}"
+    )
+    assert any(t.text == streamed for t in agent_turns), (
+        f"CB-41 parity: a committed agent Turn.text must equal the streamed bytes, got "
         f"{[t.text for t in agent_turns]!r}"
     )
 
+    # ---- CB-38 (b): a non-empty live_partial was written DURING a turn (mid-stream), a prefix ----
+    partials = [r for r in captured_live if r["has_partial"]]
+    assert partials, (
+        f"CB-38: at least one persist_call_live must carry a non-empty live_partial (the in-progress "
+        f"reply the monitor renders filling in). Recorded upserts: {captured_live}"
+    )
+    # The partial is a PREFIX of the SAME reply being streamed (it grows toward the full reply).
+    some_partial = partials[0]["live_partial"]
+    assert some_partial and reply.startswith(some_partial), (
+        f"CB-38: the live_partial must be a prefix of the streamed reply, got {some_partial!r}"
+    )
+
+    # ---- CB-41 (c): each turn committed EXACTLY once — no duplicate from the redundant done-callback.
+    # Two caller lines were fed, so at most two agent turns; their turn_ids must be UNIQUE (a duplicate
+    # commit from the backstop done-callback would repeat a turn_id / append an extra Turn).
+    turn_ids = [t.turn_id for t in agent_turns]
+    assert len(turn_ids) == len(set(turn_ids)), (
+        f"CB-41: each agent turn must commit exactly once (unique turn_ids), got {turn_ids}"
+    )
+    assert len(agent_turns) <= 2, (
+        f"CB-41: at most 2 agent turns for 2 caller lines (no duplicate commits), got {len(agent_turns)}"
+    )
+
     logger.info(
-        "PASS CB-32/CB-31: first_upsert_before_commit=%s chunks=%d partials=%d committed_agent_turns=%d",
-        captured_live[0]["before_first_commit"], len(first_turn_chunks),
+        "PASS CB-32/CB-41: first_upsert_before_commit=%s tokens=%d partials=%d committed_agent_turns=%d",
+        captured_live[0]["before_first_commit"], len(first_turn_tokens),
         len(partials), len(agent_turns),
     )
+
+
+@pytest.mark.asyncio
+async def test_voice_sim_first_token_forwarded_before_full_reply() -> None:
+    """CB-41 (d): the first NLG token reaches TTS BEFORE the full reply is generated (streaming, not
+    buffer-then-emit) — through the REAL AgentSession pipeline.
+
+    An _OrderRecordingBrainLLM logs ("produced", i) as each NLG token is GENERATED (with an asyncio
+    checkpoint between tokens), and the recording llm_node wrapper logs ("forwarded", i) as each token
+    is forwarded to TTS. With genuine streaming the FIRST ("forwarded", …) lands BEFORE the LAST
+    ("produced", …): tokens interleave. If llm_node had buffered the whole reply before emitting (the
+    CB-31 shape), every "produced" would precede every "forwarded" — which this asserts does NOT hold.
+    """
+    config = load_config("champion_v0")
+    reply = "Absolutely, here is exactly how our tutors help your learner build real momentum."
+    events: list[tuple[str, int]] = []
+    brain_llm = _OrderRecordingBrainLLM(reply=reply, events=events, act="ask")
+    captured_episode: list[Any] = []
+    captured_chunks: list[list[str]] = []
+
+    await _run_sim(
+        caller_lines=["Hi, I'm looking for math tutoring for my daughter."],
+        config=config,
+        brain_llm=brain_llm,
+        captured_episode=captured_episode,
+        captured_chunks=captured_chunks,
+        captured_events=events,
+    )
+
+    # The brain streamed (>1 token forwarded) and the tokens rejoin to the exact reply.
+    assert captured_chunks, "llm_node yielded no tokens"
+    assert "".join(captured_chunks[0]) == reply
+
+    produced = [i for kind, i in events if kind == "produced"]
+    forwarded = [i for kind, i in events if kind == "forwarded"]
+    assert len(produced) > 1 and len(forwarded) > 1, (
+        f"expected multiple produced+forwarded events, got produced={produced} forwarded={forwarded}"
+    )
+
+    # The crux of CB-41 (d): the FIRST forwarded event happens before the LAST produced event — the
+    # first token reached TTS while later tokens were still being generated (true streaming).
+    first_forward_idx = next(k for k, (kind, _) in enumerate(events) if kind == "forwarded")
+    last_produce_idx = max(k for k, (kind, _) in enumerate(events) if kind == "produced")
+    assert first_forward_idx < last_produce_idx, (
+        "CB-41 (d): the first token must be FORWARDED to TTS before the LAST token is PRODUCED "
+        f"(streaming, not buffered). event order: {events}"
+    )
+    logger.info("PASS CB-41 (d): first forward @%d < last produce @%d; events=%s",
+                first_forward_idx, last_produce_idx, events)

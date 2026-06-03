@@ -5,6 +5,13 @@
 # policy.decide(...) [LLM proposes; deterministic gates already applied inside] -> nlg.realize(...).
 # Returns (Decision, reply_text, new_belief): the Decision for logging/decision-trace, the realized
 # reply, and the NEW BeliefState (the input is never mutated). NO LiveKit types cross this boundary.
+# CB-41 (stream NLG -> TTS): respond_stream() is the STREAMING entry point the voice worker consumes.
+# It runs DST -> gated Policy through the EXACT SAME _decide_turn() path respond() uses (so the gated
+# decision + new_belief are byte-for-byte what respond() would produce — the gate logic is NOT
+# duplicated), then STREAMS the NLG via nlg.realize_stream, yielding reply tokens as they generate.
+# It exposes the final (decision, full_reply, new_belief) on a StreamResult holder the caller reads
+# AFTER the stream ends (an async generator cannot both yield tokens and return a tuple), so the
+# worker commits the SAME reliable state (CB-22) the blocking path commits. concat(tokens) == reply.
 # TIMING: each of the three stages is wrapped in time.perf_counter() and the breakdown (dst/policy/nlg
 # + total) is attached to decision.meta["timings"] and logged once per turn on the "brain.timing"
 # logger — so per-turn AND per-model-call latency is measurable on both the text and voice paths.
@@ -18,13 +25,14 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Optional, Sequence
 
 from src.config.settings import AgentConfig
 from src.core import dst
 from src.core.belief_state import BeliefState
 from src.core.llm import LLMClient
-from src.core.nlg import realize
+from src.core.nlg import realize, realize_stream
 from src.core.policy import Decision, decide
 
 # One structured line per agent turn with the three model-call stage timings + total. Each stage is
@@ -70,31 +78,45 @@ def _last_agent_act(history: Optional[Sequence[Any]]) -> Optional[str]:
     return None
 
 
-async def respond(
+@dataclass
+class StreamResult:
+    """The final outcome of respond_stream(), filled in AFTER the token stream ends (CB-41).
+
+    An async generator cannot both yield tokens and return a tuple, so respond_stream yields the NLG
+    tokens and stamps the gated `decision`, the assembled `reply` (== concat of the yielded tokens),
+    and the `new_belief` here once the stream completes. The voice worker reads these to commit the
+    SAME reliable state (CB-22) the blocking respond() path commits, with R37 parity guaranteed by
+    reply == ''.join(tokens). `ready` flips True only after the stream finishes."""
+
+    decision: Optional[Decision] = None
+    reply: str = ""
+    new_belief: Optional[BeliefState] = None
+    ready: bool = False
+    tokens: list[str] = field(default_factory=list)
+
+
+async def _decide_turn(
     belief: BeliefState,
     history: Sequence[Any],
     user_utterance: str,
     llm_client: LLMClient,
     config: AgentConfig,
     *,
-    retrieved_facts: Optional[Sequence[Any]] = None,
-    last_user_act: Optional[str] = None,
-) -> tuple[Decision, str, BeliefState]:
-    """Run one full agent turn and return (decision, reply_text, new_belief).
+    retrieved_facts: Optional[Sequence[Any]],
+    last_user_act: Optional[str],
+) -> tuple[Decision, BeliefState, float, float, float]:
+    """Run DST -> gated Policy + the per-turn bookkeeping, the SHARED prelude of respond() and
+    respond_stream() (CB-41 — the gated decision must be IDENTICAL on both paths, so the gate logic
+    lives here exactly once and is never duplicated into the worker).
 
-    Steps (the per-turn flow both channels share):
-      1. DST update — fold the prospect's utterance into a NEW belief (slots + driver deltas +
-         derived trends + meta). The input `belief` is not mutated.
-      2. Policy decide — the LLM proposes a structured act; the deterministic gates filter/override
-         it (skip-known, must-clear-objection, trust-gated price, pushiness cap, escalation). The
-         returned Decision is the GATED one. Note gates may set new_belief.escalation_imminent.
-      3. NLG realize — phrase the gated decision into a persona-consistent, voice-shaped reply,
-         grounded in retrieved_facts when provided (U5).
-
-    retrieved_facts is the KB grounding the voice/text adapters retrieve concurrently (U5); it is
-    threaded straight to NLG. last_user_act, when the adapter has an NLU label, is recorded on the
-    new belief so the gates (e.g. price_gate's 'asked unprompted', escalation's human-request) see
-    it. NO LiveKit types appear in or cross this signature.
+    Returns (gated_decision, new_belief, t0, t_after_dst, t_after_policy): the gated Decision, the NEW
+    belief (input never mutated), and the three perf_counter marks the caller uses to finish the stage
+    timings once NLG completes. Steps 1-2 of the per-turn flow:
+      1. DST update — fold the utterance into a NEW belief (slots + driver deltas + trends + meta).
+      2. Policy decide — LLM proposes; deterministic gates filter/override (skip-known,
+         must-clear-objection, trust-gated price, pushiness cap, escalation). Returns the GATED act.
+    Also records decision confidence onto the belief, the CB-35 asked-slot bookkeeping, and the CB-28
+    tool-use retrieved-facts stamp — all BEFORE NLG, identical for both the blocking + streaming path.
     """
     t0 = time.perf_counter()
     new_belief = await dst.update(
@@ -133,14 +155,25 @@ async def respond(
         except TypeError:
             pass
 
-    reply_text = await realize(
-        decision, new_belief, config, llm_client, retrieved_facts=retrieved_facts
-    )
-    t3 = time.perf_counter()
+    return decision, new_belief, t0, t1, t2
 
-    # Stage timings == per-model-call latency (one LLM round-trip dominates each stage). Attach to the
-    # decision so callers persist the total onto Turn.latency_ms, and log one line per turn. `model` is
-    # best-effort (real OpenRouterClient exposes .model; the test MockLLMClient does not -> None).
+
+def _stamp_timings(
+    decision: Decision,
+    new_belief: BeliefState,
+    llm_client: LLMClient,
+    *,
+    t0: float,
+    t1: float,
+    t2: float,
+    t3: float,
+) -> None:
+    """Attach the three stage timings + total to decision.meta["timings"] and log one line per turn.
+
+    Shared by respond() (NLG = a blocking complete()) and respond_stream() (NLG = the full streamed
+    realize_stream, so nlg_ms here measures generation start -> last token, the real perceived NLG
+    latency). Each stage is dominated by one LLM round-trip so the stage time IS that call's latency.
+    `model` is best-effort (real OpenRouterClient exposes .model; the test MockLLMClient does not)."""
     dst_ms = round((t1 - t0) * 1000.0, 1)
     policy_ms = round((t2 - t1) * 1000.0, 1)
     nlg_ms = round((t3 - t2) * 1000.0, 1)
@@ -169,4 +202,92 @@ async def respond(
         decision.act,
     )
 
+
+async def respond(
+    belief: BeliefState,
+    history: Sequence[Any],
+    user_utterance: str,
+    llm_client: LLMClient,
+    config: AgentConfig,
+    *,
+    retrieved_facts: Optional[Sequence[Any]] = None,
+    last_user_act: Optional[str] = None,
+) -> tuple[Decision, str, BeliefState]:
+    """Run one full agent turn and return (decision, reply_text, new_belief).
+
+    Steps (the per-turn flow both channels share):
+      1. DST update — fold the prospect's utterance into a NEW belief (slots + driver deltas +
+         derived trends + meta). The input `belief` is not mutated.
+      2. Policy decide — the LLM proposes a structured act; the deterministic gates filter/override
+         it (skip-known, must-clear-objection, trust-gated price, pushiness cap, escalation). The
+         returned Decision is the GATED one. Note gates may set new_belief.escalation_imminent.
+      3. NLG realize — phrase the gated decision into a persona-consistent, voice-shaped reply,
+         grounded in retrieved_facts when provided (U5).
+
+    retrieved_facts is the KB grounding the voice/text adapters retrieve concurrently (U5); it is
+    threaded straight to NLG. last_user_act, when the adapter has an NLU label, is recorded on the
+    new belief so the gates (e.g. price_gate's 'asked unprompted', escalation's human-request) see
+    it. NO LiveKit types appear in or cross this signature.
+    """
+    decision, new_belief, t0, t1, t2 = await _decide_turn(
+        belief, history, user_utterance, llm_client, config,
+        retrieved_facts=retrieved_facts, last_user_act=last_user_act,
+    )
+
+    reply_text = await realize(
+        decision, new_belief, config, llm_client, retrieved_facts=retrieved_facts
+    )
+    t3 = time.perf_counter()
+
+    _stamp_timings(decision, new_belief, llm_client, t0=t0, t1=t1, t2=t2, t3=t3)
     return decision, reply_text, new_belief
+
+
+async def respond_stream(
+    belief: BeliefState,
+    history: Sequence[Any],
+    user_utterance: str,
+    llm_client: LLMClient,
+    config: AgentConfig,
+    *,
+    retrieved_facts: Optional[Sequence[Any]] = None,
+    last_user_act: Optional[str] = None,
+    result: Optional[StreamResult] = None,
+) -> AsyncIterator[str]:
+    """STREAM one full agent turn: run DST -> gated Policy, then yield the NLG reply token-by-token.
+
+    CB-41 — the streaming entry point the voice worker consumes so TTS speaks the first clause at NLG
+    first-token instead of after the whole reply. The DST + gated Policy + bookkeeping run through the
+    SHARED _decide_turn() prelude, so the gated decision and new_belief are IDENTICAL to what respond()
+    would produce (the gate logic is NOT re-implemented here). NLG is then streamed via
+    nlg.realize_stream and each token is yielded straight to the caller (the worker forwards it to TTS
+    and the live monitor).
+
+    The final (decision, reply, new_belief) is exposed on `result` (a StreamResult the caller passes
+    in) AFTER the stream completes — an async generator cannot return a tuple alongside yielding. The
+    worker reads result.decision/reply/new_belief to commit the SAME reliable state (CB-22) the
+    blocking path commits. R37 PARITY: result.reply == ''.join(every yielded token) — no word is
+    re-decided; the brain decided the content, streaming only changes WHEN each token surfaces.
+    """
+    holder = result if result is not None else StreamResult()
+    decision, new_belief, t0, t1, t2 = await _decide_turn(
+        belief, history, user_utterance, llm_client, config,
+        retrieved_facts=retrieved_facts, last_user_act=last_user_act,
+    )
+    holder.decision = decision
+    holder.new_belief = new_belief
+
+    parts: list[str] = []
+    async for token in realize_stream(
+        decision, new_belief, config, llm_client, retrieved_facts=retrieved_facts
+    ):
+        parts.append(token)
+        yield token
+    t3 = time.perf_counter()
+
+    # Assemble the final reply == concat of the yielded tokens (the parity invariant) and finalize the
+    # holder so the caller can commit. Then stamp the same stage timings respond() does.
+    holder.tokens = parts
+    holder.reply = "".join(parts)
+    holder.ready = True
+    _stamp_timings(decision, new_belief, llm_client, t0=t0, t1=t1, t2=t2, t3=t3)

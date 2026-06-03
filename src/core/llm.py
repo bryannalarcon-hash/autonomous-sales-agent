@@ -1,9 +1,13 @@
 # The single LLM seam every unit calls through (plan KTD2/KTD5). Defines the LLMClient protocol
-# (async complete() + a complete_json() helper that tolerates fenced ```json blocks), an
-# OpenRouterClient (OpenAI-compatible: base_url https://openrouter.ai/api/v1, bearer auth from
-# OPENROUTER_API_KEY, default model from AGENT_MODEL; async httpx, non-streaming, with a BOUNDED
-# deterministic retry-with-backoff on transient 429/5xx/transport errors — FINDING 2), and a
-# MockLLMClient (scripted list OR callable) for deterministic, network-free tests. Keeping every
+# (async complete() + a complete_json() helper that tolerates fenced ```json blocks + a STREAMING
+# complete_stream() that yields content deltas), an OpenRouterClient (OpenAI-compatible: base_url
+# https://openrouter.ai/api/v1, bearer auth from OPENROUTER_API_KEY, default model from AGENT_MODEL;
+# async httpx, with a BOUNDED deterministic retry-with-backoff on transient 429/5xx/transport errors
+# — FINDING 2), and a MockLLMClient (scripted list OR callable) for deterministic, network-free tests.
+# CB-41 (stream NLG -> TTS): complete_stream() POSTs with "stream": true and parses the SSE
+# `data:` lines from client.stream(), yielding each choices[].delta.content token as it arrives so the
+# voice worker can speak the first clause at NLG first-token instead of after the whole reply. The
+# blocking complete() is KEPT for the text/self-play path + the DST/policy JSON calls. Keeping every
 # call behind this protocol lets the agent brain (Claude) and the sim/judge (a different family)
 # swap by config without touching core logic, and lets tests inject scripted deltas.
 from __future__ import annotations
@@ -12,7 +16,17 @@ import asyncio
 import json
 import os
 import re
-from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence, Union, runtime_checkable
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Optional,
+    Protocol,
+    Sequence,
+    Union,
+    runtime_checkable,
+)
 
 import httpx
 from dotenv import load_dotenv
@@ -67,12 +81,49 @@ def _extract_json(text: str) -> Any:
     raise ValueError(f"no parseable JSON in LLM reply: {text!r}")
 
 
+def _sse_content_delta(data_line: str) -> Optional[str]:
+    """Parse ONE OpenAI/OpenRouter SSE `data:` payload into its content delta, or None.
+
+    A streaming chat-completion sends `data: {json}` lines; the JSON carries
+    choices[0].delta.content (the incremental token) or, at the end, choices[0].finish_reason. The
+    terminal sentinel is the literal `data: [DONE]`. Returns the content token string (possibly "")
+    when present, or None for a line that carries no content (DONE, role-only first delta, a keep-
+    alive comment, or unparseable JSON) so the caller can simply skip it. CB-41 — used by
+    OpenRouterClient.complete_stream to turn the raw SSE stream into a token iterator.
+    """
+    line = (data_line or "").strip()
+    if not line:
+        return None
+    # SSE comment / keep-alive (": OPENROUTER PROCESSING") — not a data event.
+    if line.startswith(":"):
+        return None
+    if line.startswith("data:"):
+        line = line[len("data:"):].strip()
+    if not line or line == "[DONE]":
+        return None
+    try:
+        obj = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    try:
+        choices = obj.get("choices") or []
+        if not choices:
+            return None
+        delta = choices[0].get("delta") or {}
+        content = delta.get("content")
+    except (AttributeError, IndexError, TypeError):
+        return None
+    return content if isinstance(content, str) else None
+
+
 @runtime_checkable
 class LLMClient(Protocol):
-    """The seam every LLM call goes through. Implementations must be async and non-streaming here.
+    """The seam every LLM call goes through. Implementations are async.
 
-    complete() returns the assistant text; complete_json() is a thin helper that parses that text
-    as JSON (used by the DST driver-delta update and, later, the policy proposal).
+    complete() returns the whole assistant text; complete_json() is a thin helper that parses that
+    text as JSON (used by the DST driver-delta update and the policy proposal). complete_stream()
+    (CB-41) yields the assistant text in incremental content tokens as they arrive — the voice NLG
+    path consumes it so TTS speaks the first clause at first-token instead of after the full reply.
     """
 
     async def complete(
@@ -91,6 +142,14 @@ class LLMClient(Protocol):
         model: Optional[str] = None,
         **opts: Any,
     ) -> Any: ...
+
+    def complete_stream(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: Optional[str] = None,
+        **opts: Any,
+    ) -> AsyncIterator[str]: ...
 
 
 class _JsonHelperMixin:
@@ -217,19 +276,102 @@ class OpenRouterClient(_JsonHelperMixin):
         # Defensive: the loop either returns or raises; this only runs if the range is empty.
         raise last_exc  # pragma: no cover
 
+    async def complete_stream(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: Optional[str] = None,
+        response_format: Optional[dict[str, Any]] = None,
+        **opts: Any,
+    ) -> AsyncIterator[str]:
+        """STREAM a chat completion: yield each content token (choices[0].delta.content) as it arrives.
+
+        CB-41 — the streaming twin of complete(). POSTs the SAME OpenAI-compatible body but with
+        "stream": true and consumes the SSE response via httpx's client.stream(...), parsing each
+        `data:` line with _sse_content_delta and yielding the non-empty content tokens in order. The
+        concatenation of every yielded token equals what complete() would have returned for the same
+        request (R37 parity is preserved by the caller asserting concat == reply). Bounded retry +
+        error handling mirror complete(): a transient 429/5xx (before any token is yielded) or a
+        transport error is retried with the SAME deterministic backoff; a non-retryable 4xx re-raises;
+        the budget exhausting re-raises so the NLG layer can degrade to its safe filler. Once tokens
+        have started flowing we do NOT retry (the partial output is already committed to the stream).
+        The API key lives only in the Authorization header — never logged.
+        """
+        body: dict[str, Any] = {
+            "model": model or self.model,
+            "messages": list(messages),
+            "stream": True,
+            **opts,
+        }
+        if response_format is not None:
+            body["response_format"] = response_format
+
+        last_exc: Exception
+        for attempt in range(self.max_retries + 1):
+            yielded_any = False
+            try:
+                async with httpx.AsyncClient(
+                    base_url=self.base_url, timeout=self.timeout
+                ) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{self.base_url}/chat/completions",
+                        json=body,
+                        headers=self._headers(),
+                    ) as resp:
+                        resp.raise_for_status()
+                        async for raw_line in resp.aiter_lines():
+                            token = _sse_content_delta(raw_line)
+                            if token:
+                                yielded_any = True
+                                yield token
+                return
+            except httpx.HTTPStatusError as exc:
+                # If a status surfaced we have not started yielding (raise_for_status runs before the
+                # first token), so retrying is safe. Honor the same retryable-status / budget rules.
+                status = exc.response.status_code
+                if status not in _RETRYABLE_STATUS or attempt >= self.max_retries:
+                    raise
+                last_exc = exc
+                retry_after = exc.response.headers.get("Retry-After")
+                await asyncio.sleep(self._backoff_seconds(attempt, retry_after))
+            except httpx.RequestError as exc:
+                # A transport error AFTER tokens started would truncate the reply mid-stream; do not
+                # retry then (the partial is already out). Only retry a connect/read error that hit
+                # before any token was yielded, until the budget is spent.
+                if yielded_any or attempt >= self.max_retries:
+                    raise
+                last_exc = exc
+                await asyncio.sleep(self._backoff_seconds(attempt, None))
+        raise last_exc  # pragma: no cover
+
 
 # A scripted entry is either a precomputed string reply or a callable(messages, **opts) -> str.
 ScriptItem = Union[str, Callable[..., Union[str, Awaitable[str]]]]
 Script = Union[Sequence[ScriptItem], Callable[..., Union[str, Awaitable[str]]]]
 
 
+# SSE-delta token splitter for the mock stream: chunk a resolved reply into word-ish tokens that
+# PRESERVE whitespace so ''.join(tokens) == reply (parity), giving tests a genuine multi-token stream
+# without a network. Mirrors how a real model emits sub-word/word deltas (the exact split is opaque to
+# callers — only the reassembled string is load-bearing).
+def _mock_stream_tokens(text: str) -> list[str]:
+    """Split `text` into ordered tokens whose concatenation is EXACTLY `text` (whitespace kept)."""
+    if not text:
+        return []
+    tokens = re.findall(r"\S+\s*", text)
+    return tokens or [text]
+
+
 class MockLLMClient(_JsonHelperMixin):
     """Deterministic, network-free LLM stand-in for tests (plan: MockLLMClient(scripted)).
 
-    `scripted` is either a list consumed one entry per complete() call (a str reply or a
-    callable(messages, **opts) -> str), or a single callable applied to every call. Each call's
+    `scripted` is either a list consumed one entry per complete()/complete_stream() call (a str reply
+    or a callable(messages, **opts) -> str), or a single callable applied to every call. Each call's
     messages are recorded on .calls so tests can assert what the DST/policy actually sent.
-    Exhausting a list raises IndexError (loud), never silently reuses the last reply.
+    Exhausting a list raises IndexError (loud), never silently reuses the last reply. complete_stream()
+    (CB-41) resolves the SAME scripted reply complete() would and yields it as whitespace-preserving
+    word tokens, so a streamed turn produces >1 chunk and the tokens rejoin to the exact reply.
     """
 
     def __init__(self, scripted: Script) -> None:
@@ -237,16 +379,18 @@ class MockLLMClient(_JsonHelperMixin):
         self._is_callable = callable(scripted)
         self._i = 0
         self.calls: list[list[Message]] = []
+        # CB-41: separate counters so a streamed call and a blocking call both advance a list script
+        # consistently (the streaming path calls _resolve, which bumps _i exactly like complete()).
+        self.stream_calls: list[list[Message]] = []
 
-    async def complete(
+    def _resolve(
         self,
         messages: Sequence[Message],
-        *,
-        model: Optional[str] = None,
-        response_format: Optional[dict[str, Any]] = None,
-        **opts: Any,
+        model: Optional[str],
+        response_format: Optional[dict[str, Any]],
+        opts: dict[str, Any],
     ) -> str:
-        self.calls.append(list(messages))
+        """Resolve the next scripted reply (str or callable) — shared by complete + complete_stream."""
         call_opts = dict(opts)
         if model is not None:
             call_opts["model"] = model
@@ -262,7 +406,40 @@ class MockLLMClient(_JsonHelperMixin):
 
         if callable(item):
             result = item(messages, **call_opts)
-            if hasattr(result, "__await__"):
-                result = await result  # type: ignore[assignment]
-            return str(result)
+            return result  # may be awaitable; the caller awaits it
         return str(item)
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: Optional[str] = None,
+        response_format: Optional[dict[str, Any]] = None,
+        **opts: Any,
+    ) -> str:
+        self.calls.append(list(messages))
+        result = self._resolve(messages, model, response_format, opts)
+        if hasattr(result, "__await__"):
+            result = await result  # type: ignore[assignment]
+        return str(result)
+
+    async def complete_stream(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: Optional[str] = None,
+        response_format: Optional[dict[str, Any]] = None,
+        **opts: Any,
+    ) -> AsyncIterator[str]:
+        """Yield the next scripted reply as whitespace-preserving word tokens (CB-41, no network).
+
+        Resolves the reply EXACTLY like complete() (advancing a list script by one), then chunks it so
+        the consumer sees a genuine multi-token stream whose concatenation is the verbatim reply.
+        """
+        self.calls.append(list(messages))
+        self.stream_calls.append(list(messages))
+        result = self._resolve(messages, model, response_format, opts)
+        if hasattr(result, "__await__"):
+            result = await result  # type: ignore[assignment]
+        for token in _mock_stream_tokens(str(result)):
+            yield token

@@ -70,24 +70,6 @@
 - **Refs:** `src/api/operate.py::live_snapshot` + `live_ep`; LiveKit Agents room/participant model + SIP dispatch (`scripts/setup_sip_dispatch.py`, rule `SDR_hKYQYAwz96uA`); the disabled take-over control (`web/app/operate/live/page.tsx`); R37 in `src/core/respond.py`.
 - **Take-over spec (user, 2026-06-02) — refines CB-01.c:** on "Take over", the AI must (1) be INTERRUPTED mid-conversation and (2) speak a DEFAULT TTS hand-off line (e.g. "Let me bring in a specialist to help — one moment. They may type some of their responses, so there might be a brief pause between answers."). Then the OPERATOR talks into their own device (browser mic / WebRTC into the call's LiveKit room) and is heard by the caller through the phone — operator audio is published as a room participant, NOT a dial-in (presume the operator is NOT calling from their own phone number, so no SIP bridge / caller-ID concerns). The agent stops auto-generating; the operator may ALSO TYPE responses that are TTS'd to the caller ("the agent might be typing their responses"). So take-over = interrupt + disclosure TTS + operator mic→room audio + optional operator-typed→TTS, with the AI yielded. Consent/recording state must carry over; respect R37 (don't fork the brain — the brain just stops).
 
-### CB-38 — CB-31 word-streaming did NOT show on the real call
-- **Type / Surface / Size:** bug · `voice-worker` · `/operate/live` · M
-- **Prereqs:** CB-31
-- **Important files (candidates):** `src/voice/worker.py` (the streaming `llm_node` + `_upsert_live_partial` throttle), `src/api/operate.py` (`live_snapshot` `live_partial`), `web/app/operate/live/page.tsx` (1s active poll + render).
-- **Current:** the user reports the agent's words did NOT stream into the monitor on the real call (CB-31 worked in the roomless sim test but not the live phone path). Likely the partial upsert / the 1s poll / the live_partial render didn't surface (or partials cleared too fast as each turn committed ~6s apart).
-- **Desired:** on a real voice call the active turn fills in word-by-word as the agent speaks (≤~1s lag), per CB-31's intent.
-- **Acceptance:** a real (or fuller-fidelity sim) call shows `live_partial` rendering progressively in the monitor; confirm the worker writes it + operate exposes it + the page renders it on the live path.
-- **Refs:** CB-31; `ep-2b8ad5bc` (no streaming observed).
-
-### CB-41 — Stream NLG generation → TTS (the biggest latency win, host-independent)
-- **Type / Surface / Size:** feature · `perf` · `voice-worker` · `core` · M
-- **Prereqs:** —
-- **Important files (candidates):** `src/core/nlg.py` (`complete()` → a streaming completion), `src/core/llm.py` (`OpenRouterClient` needs a streaming method), `src/voice/worker.py` (`llm_node` feeds the token stream straight to TTS), deploy region (co-locate inference near the LiveKit worker region).
-- **Current:** NLG is a BLOCKING `await llm_client.complete(messages)` — the worker waits for the WHOLE reply (~1.7–3.6 s) before TTS speaks, on top of DST+policy. CB-31 chunked the ALREADY-buffered reply (after the brain finished generating); this is about streaming GENERATION itself so TTS starts at first-token.
-- **Desired:** NLG uses a STREAMING completion; the worker speaks the first clause as tokens arrive (TTS overlaps generation), so first audible word lands at ~NLG first-token (~0.5–1.6 s) instead of after the full reply. Also co-locate inference in the LiveKit worker's region (kills ~50–150 ms RTT ×3 calls). Per the latency research, this is the single highest-leverage win and applies on EVERY hosting option — do it first.
-- **Acceptance:** on a real (or fuller-fidelity sim) call, audible speech begins at ~NLG first-token, not after full completion; felt turn latency ~2–3 s; the turn still commits once at end (CB-22 / dead-silence fix) and R37 holds (the brain still decides every word).
-- **Refs:** latency research (`researcher-latency`); `nlg.py` blocking `complete()`; CB-31 (chunked the buffered reply — distinct); CB-38 (real-call monitor streaming).
-
 ### CB-42 — [EXPERIMENTAL · separate worktree] Replace the two non-generative LLMs (DST + Policy) with distilled ML models; keep NLG as the sole streamed LLM
 - **Type / Surface / Size:** research/feature · `core` (`src/core` brain) · **EXPERIMENTAL** · XL
 - **Build mode:** develop in a SEPARATE git worktree off the mono branch (do NOT destabilize the live brain); merge only if it clears the eval gates below. Provider-agnostic `respond(... llm_client ...)` + the deterministic gates are the stable seams it plugs into.
@@ -160,6 +142,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-41/CB-38 — Wave 4: stream NLG generation → TTS, surfaced on the live monitor (R37-preserving)
+- **Completed:** 2026-06-02
+- **Verification:** voice suite (`/usr/bin/python3`) **61 passed** (was 60); non-voice (`.venv`) **399 passed / 5 skipped** (was 386/5, +13 streaming tests); `src/core` livekit-CLEAN; adversarial verifier `pass` + `parity_confirmed`. API+worker restarted by explicit PID (worker re-registered with LiveKit). Real-phone audio fidelity is the only unverifiable-in-CI piece (noted).
+- **What changed:** added `OpenRouterClient.complete_stream` (httpx SSE `stream:true`), `nlg.realize_stream`, `respond.respond_stream` + a `StreamResult` holder (DST→gated-Policy extracted into a shared `_decide_turn()` so the streamed gated decision is IDENTICAL to `respond()` — gates never forked), and `VoiceSession.handle_user_turn_stream`. The worker's `llm_node` now runs the WHOLE brain STREAMING and yields each NLG token to TTS at generation pace (CB-41), throttle-upserting the growing `live_partial` (CB-38) and committing once at the end (CB-22 preserved). `on_user_turn_completed` now only fail-fast-checks consent + stashes user text (the brain moved into `llm_node` because LiveKit awaits `on_user_turn_completed` fully before `llm_node`). Blocking `complete`/`realize`/`respond` kept for text self-play + DST/policy JSON.
+- **Parity (R37):** byte-for-byte `concat(streamed tokens) == committed Turn.text == respond() reply`, verified end-to-end through the real roomless AgentSession AND with an adversarial multibyte/emoji/leading+trailing-whitespace reply; `test_voice_sim_first_token_forwarded_before_full_reply` proves the first token reaches TTS before the last is produced (true streaming, not buffer-then-chunk).
+- **Files:** `src/core/llm.py`, `src/core/nlg.py`, `src/core/respond.py`, `src/voice/session.py`, `src/voice/worker.py`, `tests/unit/test_llm.py`, `tests/unit/test_respond_stream.py` (new), `tests/integration/test_voice_sim.py`, `tests/integration/test_worker.py`.
+- **Constraints checked:** R37 (no livekit in `src/core`; shared `_decide_turn`); buy-gate purity intact; consent fail-fast unchanged (a not-yet-`can_converse` turn raises `ConsentError`, nothing recorded); commit-once (idempotent); file-top headers updated.
+- **Follow-ups / known gaps:** `realize_stream` preserves trailing whitespace while `realize` strips it — a rare cosmetic voice-vs-text transcript divergence (NOT an R37 break; fixing it would risk the parity invariant). Co-locating inference in the LiveKit region (the other latency lever) is a deploy-time change, not code. Real-phone first-audible-word timing needs a live call to confirm.
 
 ### CB-33/34/35/36/37/39/40 — Wave 3 batch (4 parallel coders + 5 adversarial verifiers + orchestrator repairs)
 - **Completed:** 2026-06-02

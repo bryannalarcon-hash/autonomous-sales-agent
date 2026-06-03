@@ -5,13 +5,17 @@
 # 1.5.x lifecycle hooks against a FakeEmbedder + MockLLMClient + a local retrieve stub (same pattern
 # as tests/integration/test_voice_adapter). The LOAD-BEARING test is the COMPLIANCE gate (the blocking
 # finding): with a not-yet-can_converse ConsentGate a user turn is NOT run through the brain (raises
-# ConsentError, no transcript captured); with a ready gate it proceeds. Also covers: empty-text
-# short-circuit, llm_node STREAMING the buffered reply in word chunks (CB-31 — chunks rejoin to the
-# exact reply, >1 chunk, yields nothing on the None branches, still commits at end) + the pure
-# _word_chunks parity/grouping helper, the
-# _wire_commit_on_speech done-callback committing on uninterrupted playout vs discarding on barge-in,
-# the persist-forwarding capture (escalation EscalationLog buffered + close-tier tracked on commit),
-# and the pure room-metadata helpers (_room_jurisdiction / _room_raw_phone from metadata + SIP attrs).
+# ConsentError fail-fast in on_user_turn_completed, no transcript captured); with a ready gate it
+# proceeds. CB-41 (stream NLG -> TTS): the brain now runs STREAMING inside llm_node (NOT in
+# on_user_turn_completed, which only fail-fast-checks consent + stashes the user text), so NLG tokens
+# reach TTS at generation pace. Tests therefore drive a full turn via _run_turn (on_user_turn_completed
+# then drain llm_node). Also covers: empty-text short-circuit, llm_node STREAMING the GENUINE NLG
+# token stream (CB-41 — tokens rejoin to the exact committed reply, >1 token, yields nothing on the
+# None branches, still commits at end) + the pure _word_chunks parity/grouping helper (no longer on the
+# llm_node path but retained), the _wire_commit_on_speech done-callback committing on uninterrupted
+# playout (now a redundant backstop after llm_node already committed) vs discarding a still-pending
+# turn on barge-in, the persist-forwarding capture (escalation EscalationLog buffered + close-tier
+# tracked on commit), and the pure room-metadata helpers (_room_jurisdiction / _room_raw_phone).
 # ALSO covers the SIP spoken-consent sub-flow (the PSTN path that has no browser to click consent):
 # the deterministic _classify_consent_reply, _is_sip_call participant-kind detection, and the
 # WorkerVoiceAgent IVR loop — the first user turn is intercepted as the consent answer (NOT run
@@ -131,7 +135,12 @@ def _make_worker_agent(
         kb_chunks_or_retrieve_hook=_make_retrieve_hook(),
         consent_gate=consent_gate,
     )
-    return _worker().WorkerVoiceAgent(base)
+    agent = _worker().WorkerVoiceAgent(base)
+    # Mirror _build_brain: llm_node's commit -> _capture_post_commit (escalation/close-tier + the live
+    # in_progress + partial upserts) needs the live config. Without it those post-commit hooks are
+    # skipped (config-guarded), so the escalation/close-tier capture tests would see nothing.
+    agent._config = config
+    return agent
 
 
 _CONFIG = load_config("champion_v0")
@@ -140,13 +149,21 @@ _CONFIG = load_config("champion_v0")
 async def _drain_llm_node(agent: Any) -> str:
     """Run the worker's (now STREAMING) llm_node to completion and return the rejoined reply.
 
-    CB-31: llm_node is an async generator yielding word chunks of the SAME reply (and committing the
-    turn at the end). Tests that previously did `await agent.llm_node(...)` for the reply string now
-    drain the generator and re-join the chunks — which equals the original reply (R37 parity)."""
+    CB-41: llm_node runs the WHOLE brain STREAMING (handle_user_turn_stream) and yields each NLG token
+    (then commits the turn at the end). Tests drain the generator and re-join the tokens — which equals
+    the committed reply (R37 parity)."""
     chunks: list[str] = []
     async for chunk in agent.llm_node(None, None, None):
         chunks.append(chunk)
     return "".join(chunks)
+
+
+async def _run_turn(agent: Any, text: str) -> str:
+    """Drive ONE full agent turn the way livekit's pipeline does (CB-41): on_user_turn_completed (which
+    fail-fast-checks consent + stashes the user text) THEN drain llm_node (which runs the streaming
+    brain, yields the NLG tokens, and commits at the end). Returns the rejoined reply tokens."""
+    await agent.on_user_turn_completed(None, _StubMessage(text))
+    return await _drain_llm_node(agent)
 
 
 # --- Lightweight livekit-free stubs (the hooks only read these shapes) --------------------------
@@ -197,19 +214,26 @@ class _StubSession:
 # =============================== on_user_turn_completed =========================================
 
 
-async def test_on_user_turn_completed_buffers_pending_turn():
-    """A non-empty user turn runs the brain speculatively and buffers a PendingTurn under a fresh
-    speech_id (no commit yet) — the speech_id is remembered so llm_node can surface the reply."""
+async def test_on_user_turn_completed_stashes_then_llm_node_runs_brain():
+    """CB-41: on_user_turn_completed STASHES the user text under a fresh speech_id (the brain does NOT
+    run here — it runs streaming in llm_node so NLG tokens reach TTS at generation pace). After
+    on_user_turn_completed: a speech_id + pending text are set but NOTHING is buffered/committed yet.
+    Draining llm_node then runs the brain (buffers + commits the turn)."""
     agent = _make_worker_agent()
     await agent.on_user_turn_completed(None, _StubMessage("Hi, my daughter needs algebra help."))
 
     sid = agent._pending_speech_id
     assert sid is not None
-    assert sid in agent.voice_session.state.pending
-    assert agent.voice_session.state.pending[sid].committed is False
-    # Speculative only: NOTHING committed yet.
+    assert agent._pending_user_text == "Hi, my daughter needs algebra help."
+    # The brain has NOT run yet: nothing buffered, nothing committed.
+    assert agent.voice_session.state.pending == {}
     assert agent.voice_session.state.turns == []
     assert agent.voice_session.state.history == []
+
+    # Draining llm_node runs the streaming brain and commits the turn at the end.
+    await _drain_llm_node(agent)
+    assert agent.voice_session.turn_for_speech_id(sid) is not None  # captured agent Turn
+    assert len(agent.voice_session.state.history) == 2  # user + agent
 
 
 async def test_on_user_turn_completed_short_circuits_on_empty_text():
@@ -224,33 +248,36 @@ async def test_on_user_turn_completed_short_circuits_on_empty_text():
 # =============================== llm_node (surface, never re-decide) ============================
 
 
-async def test_llm_node_surfaces_buffered_reply():
-    """llm_node STREAMS the reply_text the brain ALREADY produced for the current speech_id in word
-    chunks (CB-31); rejoining the chunks yields the EXACT reply (parity: it surfaces, never
-    re-decides). It also streams >1 chunk for a multi-word reply."""
-    agent = _make_worker_agent()
+async def test_llm_node_streams_genuine_nlg_tokens_with_parity():
+    """CB-41: llm_node runs the brain STREAMING and yields the GENUINE NLG token stream for the current
+    speech_id; rejoining the tokens yields the EXACT committed reply (R37 parity — no word is
+    re-decided). It also yields >1 token for a multi-word reply (so TTS speaks progressively)."""
+    reply = "Sure, let me get a few details about what your child is working on."
+    agent = _make_worker_agent(llm=_agent_mock(reply=reply))
     await agent.on_user_turn_completed(None, _StubMessage("How much does it cost per month?"))
     sid = agent._pending_speech_id
-    expected = agent.voice_session.state.pending[sid].reply_text
-    # Drive the generator manually so we can also count chunks (CB-31: multi-word reply -> >1 chunk).
-    chunks: list[str] = []
-    async for chunk in agent.llm_node(None, None, None):
-        chunks.append(chunk)
-    assert "".join(chunks) == expected  # R37 parity: chunks rejoin to the exact reply
-    assert len(chunks) > 1  # CB-31: the reply streamed in word chunks, not one whole string
+    # Drive the generator manually so we can count tokens (CB-41: multi-word reply -> >1 token).
+    tokens: list[str] = []
+    async for token in agent.llm_node(None, None, None):
+        tokens.append(token)
+    assert len(tokens) > 1  # CB-41: the reply streamed in tokens, not one whole string
+    # R37 parity: the streamed tokens rejoin to the EXACT reply the brain committed.
+    committed = agent.voice_session.turn_for_speech_id(sid)
+    assert committed is not None
+    assert "".join(tokens) == committed.text  # streamed bytes == committed reply
+    assert "".join(tokens) == reply
 
 
 async def test_llm_node_yields_nothing_on_none_branches():
-    """llm_node yields NOTHING (the rejoined output is "") when there is no pending speech (no turn
-    yet) or the pending entry is missing (already committed/discarded) — the defensive None branches
-    return from the async generator before yielding."""
+    """CB-41: llm_node yields NOTHING (the rejoined output is "") when there is no pending speech (no
+    turn yet) or the stashed user text is gone (already consumed) — the defensive None branches return
+    from the async generator before running the brain."""
     agent = _make_worker_agent()
     # (a) no turn has happened: _pending_speech_id is None
     assert await _drain_llm_node(agent) == ""
-    # (b) a speech_id is set but its pending entry is gone (committed/discarded)
+    # (b) a speech_id is set but the stashed user text was already consumed (a prior drain)
     await agent.on_user_turn_completed(None, _StubMessage("Hi there."))
-    sid = agent._pending_speech_id
-    agent.voice_session.state.pending.pop(sid)
+    agent._pending_user_text = None  # simulate the text already consumed by an earlier llm_node run
     assert await _drain_llm_node(agent) == ""
 
 
@@ -258,12 +285,13 @@ async def test_llm_node_commits_the_turn_reliably():
     """Regression for the live-call bug: llm_node COMMITS the turn at the END of streaming (the
     reliable state write). The SpeechHandle done-callback did NOT fire on real calls, so turns/belief
     never persisted (every brain turn logged turn=1; a real call saved an empty in_progress shell that
-    never reached Calls or Live). After draining llm_node: pending drained, an agent Turn captured,
-    history grew — the streaming refactor (CB-31) must NOT reintroduce the never-committed bug."""
+    never reached Calls or Live). CB-41: the brain now runs streaming IN llm_node, which buffers the
+    PendingTurn then commits it — the streaming refactor must NOT reintroduce the never-committed bug."""
     agent = _make_worker_agent()
     await agent.on_user_turn_completed(None, _StubMessage("How much for SAT prep?"))
     sid = agent._pending_speech_id
-    assert sid in agent.voice_session.state.pending  # buffered by on_user_turn_completed, not committed
+    # Nothing buffered yet (the brain runs in llm_node, not on_user_turn_completed).
+    assert agent.voice_session.state.pending == {}
     await _drain_llm_node(agent)
     assert sid not in agent.voice_session.state.pending  # committed -> pending drained
     assert agent.voice_session.turn_for_speech_id(sid) is not None  # captured agent Turn
@@ -311,50 +339,55 @@ def test_word_chunks_groups_by_words_per_chunk():
 # =============================== commit-vs-discard done-callback ================================
 
 
-async def test_done_callback_commits_on_uninterrupted_playout():
-    """_wire_commit_on_speech: when the agent reply plays UNINTERRUPTED, the done-callback commits
-    the speculative turn (the only state write) — belief advances + the turn is captured."""
+async def test_done_callback_is_redundant_backstop_after_llm_node_commit():
+    """CB-41: the turn now commits at the END of llm_node's streaming (the reliable write). When the
+    agent reply plays UNINTERRUPTED, the done-callback fires AFTER llm_node already committed — it is a
+    harmless, idempotent no-op backstop (commit_turn pops the pending, so a second commit finds nothing
+    and the captured turn / history are unchanged). The turn must be committed exactly once."""
     agent = _make_worker_agent()
     session = _StubSession()
     _worker()._wire_commit_on_speech(session, agent, _CONFIG)
 
+    # A full turn: on_user_turn_completed stashes; llm_node runs the brain + commits.
     await agent.on_user_turn_completed(None, _StubMessage("Hi, my daughter needs algebra help."))
     sid = agent._pending_speech_id
-
-    handle = _StubSpeechHandle(interrupted=False)
-    session.emit("speech_created", _StubSpeechEvent(handle, user_initiated=False))
-    handle.fire_done()
-
-    # Committed: pending drained, a captured agent Turn exists, history grew (user + agent).
+    await _drain_llm_node(agent)
+    # Already committed by llm_node: pending drained, a captured agent Turn exists, history == 2.
     assert sid not in agent.voice_session.state.pending
     assert agent.voice_session.turn_for_speech_id(sid) is not None
     assert len(agent.voice_session.state.history) == 2
 
+    # The done-callback now fires (the redundant backstop): it must be a no-op (commit is idempotent).
+    handle = _StubSpeechHandle(interrupted=False)
+    session.emit("speech_created", _StubSpeechEvent(handle, user_initiated=False))
+    handle.fire_done()
+    assert len(agent.voice_session.state.history) == 2  # unchanged — committed exactly once
+
 
 async def test_done_callback_discards_on_barge_in_committed_state_intact():
-    """_wire_commit_on_speech: a barge-in (handle.interrupted) drops the speculative turn with NO
-    committed-state write — a prior committed turn is left intact (R5/R10 self-recover)."""
+    """_wire_commit_on_speech: a barge-in (handle.interrupted) on a turn whose llm_node stream was cut
+    short (so nothing was buffered/committed) drops the speculative turn with NO committed-state write —
+    a prior committed turn is left intact (R5/R10 self-recover). CB-41: a barge-in mid-NLG-stream
+    cancels llm_node before it buffers/commits, so on_barge_in just records the interruption."""
     agent = _make_worker_agent()
     session = _StubSession()
     _worker()._wire_commit_on_speech(session, agent, _CONFIG)
 
-    # Commit one real turn first so there IS committed state to protect.
-    await agent.on_user_turn_completed(None, _StubMessage("Hi, my daughter needs algebra help."))
-    h0 = _StubSpeechHandle(interrupted=False)
-    session.emit("speech_created", _StubSpeechEvent(h0, user_initiated=False))
-    h0.fire_done()
+    # Commit one real turn first (full turn through llm_node) so there IS committed state to protect.
+    await _run_turn(agent, "Hi, my daughter needs algebra help.")
     committed_belief = agent.voice_session.state.belief
     committed_hist_len = len(agent.voice_session.state.history)
 
-    # A second turn that gets barged in on.
+    # A second turn that gets barged in on BEFORE llm_node ran (the NLG stream was cut short): only
+    # on_user_turn_completed ran (text stashed), nothing buffered/committed.
     await agent.on_user_turn_completed(None, _StubMessage("How much does it cost per month?"))
     sid1 = agent._pending_speech_id
-    assert sid1 in agent.voice_session.state.pending
+    assert agent.voice_session.state.pending == {}  # nothing buffered yet (brain didn't run)
     h1 = _StubSpeechHandle(interrupted=True)
     session.emit("speech_created", _StubSpeechEvent(h1, user_initiated=False))
     h1.fire_done()
 
-    # Speculative turn dropped; committed state untouched; interruption recorded.
+    # No speculative turn to drop; committed state untouched; interruption recorded.
     assert sid1 not in agent.voice_session.state.pending
     assert agent.voice_session.state.belief is committed_belief
     assert len(agent.voice_session.state.history) == committed_hist_len
@@ -363,7 +396,7 @@ async def test_done_callback_discards_on_barge_in_committed_state_intact():
 
 async def test_done_callback_ignores_user_initiated_speech():
     """User-initiated speech carries no buffered brain turn — the done-callback path is skipped, so a
-    pending speculative turn is NEITHER committed nor discarded by it."""
+    stashed (not-yet-run) turn is NEITHER committed nor discarded by it."""
     agent = _make_worker_agent()
     session = _StubSession()
     _worker()._wire_commit_on_speech(session, agent, _CONFIG)
@@ -371,8 +404,9 @@ async def test_done_callback_ignores_user_initiated_speech():
     await agent.on_user_turn_completed(None, _StubMessage("Hi there."))
     sid = agent._pending_speech_id
     session.emit("speech_created", _StubSpeechEvent(_StubSpeechHandle(), user_initiated=True))
-    # Still pending: a user-initiated speech event must not touch the speculative buffer.
-    assert sid in agent.voice_session.state.pending
+    # The stash is untouched: a user-initiated speech event must not run/discard the brain turn.
+    assert agent._pending_speech_id == sid
+    assert agent._pending_user_text == "Hi there."
 
 
 # =============================== COMPLIANCE GATE (the blocking finding) =========================
@@ -399,7 +433,8 @@ async def test_consent_gate_blocks_brain_until_can_converse():
 
 async def test_consent_gate_allows_brain_once_ready():
     """Once recording consent is granted (gate -> ready / can_converse), the SAME worker turn path
-    proceeds: the brain runs, a pending turn is buffered, and the gate reports recording allowed."""
+    proceeds: on_user_turn_completed stashes the turn, llm_node runs the brain + commits it, and the
+    gate reports recording allowed."""
     gate = ConsentGate(jurisdiction="ca", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
     gate.grant_recording()
     assert gate.can_converse is True and gate.can_record is True
@@ -408,7 +443,8 @@ async def test_consent_gate_allows_brain_once_ready():
     await agent.on_user_turn_completed(None, _StubMessage("How much does it cost per month?"))
     sid = agent._pending_speech_id
     assert sid is not None
-    assert sid in agent.voice_session.state.pending
+    await _drain_llm_node(agent)  # llm_node runs the streaming brain + commits
+    assert agent.voice_session.turn_for_speech_id(sid) is not None  # brain ran, turn captured
     assert agent.voice_session.recorded is True
 
 
@@ -417,35 +453,29 @@ async def test_consent_gate_allows_brain_once_ready():
 
 async def test_commit_captures_close_tier_for_persistence():
     """On a committed attempt_close, the worker tracks the close tier (the schema Turn carries no
-    tier) so persist_call_end can map it to the right ladder rung — parity with the /api/chat path."""
+    tier) so persist_call_end can map it to the right ladder rung — parity with the /api/chat path.
+    CB-41: the commit (+ _capture_post_commit) now happens at the END of llm_node's streaming."""
     agent = _make_worker_agent(llm=_agent_mock(act="attempt_close", target_slot=None, tier="trial"))
-    session = _StubSession()
-    _worker()._wire_commit_on_speech(session, agent, _CONFIG)
 
-    await agent.on_user_turn_completed(None, _StubMessage("Alright, let's book a trial session."))
-    handle = _StubSpeechHandle(interrupted=False)
-    session.emit("speech_created", _StubSpeechEvent(handle, user_initiated=False))
-    handle.fire_done()
+    # A full turn: llm_node runs the brain, commits, and _capture_post_commit tracks the close tier.
+    await _run_turn(agent, "Alright, let's book a trial session.")
 
     assert agent.last_close_tier == "trial"
 
 
 async def test_commit_captures_escalation_log_for_persistence():
     """On a committed escalate, the worker BUFFERS an EscalationLog (re-pointed onto the episode at
-    persist) — parity with the /api/chat path. The async handler runs with a no-op store_hook (no
+    persist) — parity with the /api/chat path. CB-41: the commit (+ the scheduled escalation handler)
+    happens at the END of llm_node's streaming; the async handler runs with a no-op store_hook (no
     mid-call DB write); we await the scheduled task before asserting the buffer is populated."""
     import asyncio as _asyncio
 
     agent = _make_worker_agent(
         llm=_agent_mock(act="escalate", target_slot=None, reply="A specialist will follow up shortly.")
     )
-    session = _StubSession()
-    _worker()._wire_commit_on_speech(session, agent, _CONFIG)
 
-    await agent.on_user_turn_completed(None, _StubMessage("I want to talk to a human right now."))
-    handle = _StubSpeechHandle(interrupted=False)
-    session.emit("speech_created", _StubSpeechEvent(handle, user_initiated=False))
-    handle.fire_done()
+    # A full turn: llm_node runs the brain + commits; _capture_post_commit schedules the escalation.
+    await _run_turn(agent, "I want to talk to a human right now.")
 
     # The escalation handler was scheduled; drain it (it persists nothing — no-op store_hook).
     assert agent._escalation_tasks, "an escalation-handling task should have been scheduled"
@@ -650,8 +680,8 @@ def test_seed_gate_from_metadata_absent_keeps_fail_closed():
 
 async def test_seeded_gate_lets_worker_turn_proceed_and_records():
     """END-TO-END (worker side): a gate SEEDED from `recording granted` metadata lets a worker turn
-    PROCEED — on_user_turn_completed buffers a pending turn (no ConsentError) and recorded is True.
-    This is the deadlock fix surfaced through the real WorkerVoiceAgent turn path."""
+    PROCEED — on_user_turn_completed stashes the turn (no ConsentError), llm_node runs the brain +
+    commits, and recorded is True. This is the deadlock fix surfaced through the real turn path."""
     from src.voice import worker as w
 
     gate = ConsentGate(jurisdiction="ca", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
@@ -661,13 +691,14 @@ async def test_seeded_gate_lets_worker_turn_proceed_and_records():
     await agent.on_user_turn_completed(None, _StubMessage("How much does it cost per month?"))
     sid = agent._pending_speech_id
     assert sid is not None
-    assert sid in agent.voice_session.state.pending
+    await _drain_llm_node(agent)
+    assert agent.voice_session.turn_for_speech_id(sid) is not None  # brain ran, turn captured
     assert agent.voice_session.recorded is True
 
 
 async def test_seeded_unrecorded_gate_proceeds_but_not_recorded():
     """A gate SEEDED from `recording refused` (conversable) metadata lets a worker turn PROCEED but
-    keeps recording honest: a pending turn buffers, yet recorded is False (nothing is recorded)."""
+    keeps recording honest: the turn commits, yet recorded is False (nothing is recorded)."""
     from src.voice import worker as w
 
     gate = ConsentGate(jurisdiction="ca", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
@@ -677,14 +708,17 @@ async def test_seeded_unrecorded_gate_proceeds_but_not_recorded():
 
     await agent.on_user_turn_completed(None, _StubMessage("Tell me more about tutoring."))
     sid = agent._pending_speech_id
-    assert sid is not None and sid in agent.voice_session.state.pending
+    assert sid is not None
+    await _drain_llm_node(agent)
+    assert agent.voice_session.turn_for_speech_id(sid) is not None
     assert agent.voice_session.recorded is False
 
 
 async def test_unseeded_gate_keeps_worker_fail_closed():
     """FAIL-CLOSED preserved: with NO consent metadata the gate stays `pending`, so the worker turn
     raises ConsentError and the brain never runs / nothing is buffered (no regression of the safety
-    property for a future direct SIP call)."""
+    property for a future direct SIP call). CB-41: on_user_turn_completed itself fail-fast-checks the
+    gate (raising BEFORE stashing), so the brain in llm_node is never reached / nothing is recorded."""
     from src.voice import worker as w
 
     gate = ConsentGate(jurisdiction="ca", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
@@ -692,6 +726,12 @@ async def test_unseeded_gate_keeps_worker_fail_closed():
     assert w._seed_gate_from_metadata(gate, _StubCtx(_StubRoom(metadata=None))) is False
     agent = _make_worker_agent(consent_gate=gate)
 
+    # CB-41: the fail-fast happens in on_user_turn_completed (before any stash), so the brain in
+    # llm_node is never reached and no user text is stashed.
+    with pytest.raises(ConsentError):
+        await agent.on_user_turn_completed(None, _StubMessage("How much does it cost?"))
+    assert agent._pending_user_text is None
+    # Direct handle_user_turn still fail-closes too (the gate is the source of truth).
     with pytest.raises(ConsentError):
         await agent.voice_session.handle_user_turn("How much does it cost?", "pre-consent")
     assert agent.voice_session.state.pending == {}
@@ -859,11 +899,13 @@ async def test_sip_first_turn_intercepted_then_brain_runs():
     assert agent.voice_session.state.pending == {}
     assert agent._pending_speech_id is None  # no speculative brain turn for the consent answer
 
-    # Next turn flows to the brain: a pending turn is buffered (consent resolved).
+    # Next turn flows to the brain (consent resolved): on_user_turn_completed stashes, llm_node runs
+    # the brain + commits.
     await agent.on_user_turn_completed(None, _StubMessage("How much does it cost per month?"))
     sid = agent._pending_speech_id
     assert sid is not None
-    assert sid in agent.voice_session.state.pending
+    await _drain_llm_node(agent)
+    assert agent.voice_session.turn_for_speech_id(sid) is not None
 
 
 async def test_sip_consent_does_not_arm_for_web_path():
@@ -879,7 +921,9 @@ async def test_sip_consent_does_not_arm_for_web_path():
 
     await agent.on_user_turn_completed(None, _StubMessage("How much does it cost per month?"))
     sid = agent._pending_speech_id
-    assert sid is not None and sid in agent.voice_session.state.pending  # brain ran immediately
+    assert sid is not None  # stashed (no IVR detour); brain runs in llm_node
+    await _drain_llm_node(agent)
+    assert agent.voice_session.turn_for_speech_id(sid) is not None  # brain ran
     assert agent.voice_session.recorded is True
 
 

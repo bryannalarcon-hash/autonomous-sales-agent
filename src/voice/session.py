@@ -11,6 +11,12 @@
 # CONSENT/PII (U13): an optional ConsentGate gates handle_user_turn/commit_turn (no record/log
 # until consent allows); captured Turn.text is PII-scrubbed (scrub_pii) BEFORE it is stored; the
 # session carries the assigned sticky TTS voice (R3).
+# CB-41 (stream NLG -> TTS): handle_user_turn_stream() is the STREAMING twin of handle_user_turn — it
+# runs the consent gate + RAG retrieve + the SHARED DST/gated-Policy path via respond_stream (so the
+# gated decision is IDENTICAL to the blocking path), yields the NLG reply token-by-token (the worker
+# forwards each to TTS at generation pace), and once the stream ends buffers the SAME PendingTurn under
+# speech_id (reply_text == concat of the yielded tokens) so commit_turn() is unchanged. R37 parity is
+# preserved end-to-end: the brain decides every word; streaming only changes WHEN each token surfaces.
 # BELIEF PERSISTENCE (CB-23): every committed AGENT Turn carries its belief snapshot
 # (pending.new_belief.to_snapshot() — the SAME projection sim/text log per turn), so Call Review can
 # replay a voice call's trust/walk-away/stage trajectory. This is load-bearing: a turn committed with
@@ -18,6 +24,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
@@ -25,7 +32,7 @@ from src.config.settings import AgentConfig
 from src.core.belief_state import BeliefState
 from src.core.llm import LLMClient
 from src.core.policy import Decision
-from src.core.respond import respond
+from src.core.respond import StreamResult, respond, respond_stream
 from src.kb.embeddings import EmbeddingModel
 from src.memory.schema import Turn
 from src.voice.consent import ConsentGate, scrub_pii
@@ -242,6 +249,58 @@ class VoiceSession:
         # Buffer ONLY — commit_turn is the single writer of session state.
         self.state.pending[speech_id] = pending
         return pending
+
+    async def handle_user_turn_stream(
+        self,
+        user_text: str,
+        speech_id: str,
+        *,
+        last_user_act: Optional[str] = None,
+    ) -> AsyncIterator[str]:
+        """STREAM the agent's response to one user turn, yielding NLG tokens, then buffer the turn.
+
+        CB-41 — the streaming twin of handle_user_turn the worker's llm_node consumes. (1) consent gate
+        + intent-gated RAG retrieve BEFORE generation, (2) run the WHOLE brain via respond_stream (DST
+        -> gated Policy -> streamed NLG) — the gated decision is IDENTICAL to handle_user_turn's
+        because both go through the same brain code, (3) yield each NLG token as it generates so the
+        worker forwards it to TTS at generation pace, (4) once the stream ends, buffer the SAME
+        PendingTurn under speech_id with reply_text == ''.join(the yielded tokens) — NO state write
+        until commit_turn (the single writer). R37 PARITY: the buffered reply IS the concatenation of
+        the streamed tokens, so what TTS spoke equals what commits.
+
+        CONSENT GATE (U13): if a ConsentGate is attached and does not yet permit conversation, raise
+        ConsentError WITHOUT generating — the brain never runs and nothing is recorded.
+        """
+        self._require_consent()
+        facts = await self._maybe_retrieve(user_text)
+        result = StreamResult()
+        async for token in respond_stream(
+            self.state.belief,
+            self.state.history,
+            user_text,
+            self.llm_client,
+            self.config,
+            retrieved_facts=facts,
+            last_user_act=last_user_act,
+            result=result,
+        ):
+            yield token
+        # The stream finished: the holder now carries the gated decision, the assembled reply (==
+        # concat of the yielded tokens), and the new belief. Buffer the PendingTurn so commit_turn is
+        # unchanged. Defensive: respond_stream always finalizes the holder, but guard a None decision
+        # (a degenerate stream) so a bad turn can't poison commit.
+        if result.decision is None or result.new_belief is None:  # pragma: no cover - defensive
+            return
+        pending = PendingTurn(
+            speech_id=speech_id,
+            user_text=user_text,
+            decision=result.decision,
+            reply_text=result.reply,
+            new_belief=result.new_belief,
+            retrieved_facts=facts,
+            committed=False,
+        )
+        self.state.pending[speech_id] = pending
 
     def commit_turn(self, speech_id: str) -> Optional[PendingTurn]:
         """Promote pending[speech_id] into committed state — the ONLY path that writes state.

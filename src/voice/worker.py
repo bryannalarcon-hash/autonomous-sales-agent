@@ -44,11 +44,17 @@
 # turn (the old first upsert only fired from _capture_post_commit ← llm_node, after the brain
 # generated, so the call was invisible for several seconds). The stale-guard still drops it if the
 # caller never engages.
-# CB-31 (real-voice word streaming): llm_node STREAMS the (already-decided) reply to TTS in word
-# chunks (returns an AsyncIterator[str]; ''.join(chunks) == reply, so R37 parity holds — no word is
-# re-decided) and, as chunks stream, UPSERTS the growing partial text (throttled ~_LIVE_PARTIAL_
-# THROTTLE_S) via _upsert_live_partial -> persist_call_live(live_partial=...) so the monitor renders
-# the words filling in. The turn still COMMITS exactly once at the END of streaming.
+# CB-31 -> CB-41 (real-voice GENERATION streaming): llm_node now runs the WHOLE brain STREAMING via
+# voice_session.handle_user_turn_stream (RAG + DST + gated Policy + STREAMED NLG via realize_stream)
+# and YIELDS each NLG token to TTS as it generates (returns an AsyncIterator[str]; ''.join(tokens) ==
+# the committed reply, so R37 parity holds — no word is re-decided), so TTS speaks the first clause at
+# NLG first-token (~0.5-1.6s) instead of after the full reply (CB-31 only chunked an already-FINISHED
+# reply). on_user_turn_completed now only fail-fast-checks consent + stashes the user text; the brain
+# runs in llm_node so its tokens reach TTS at generation pace. As tokens stream, llm_node UPSERTS the
+# growing partial text (throttled ~_LIVE_PARTIAL_THROTTLE_S) via _upsert_live_partial ->
+# persist_call_live(live_partial=...) so the monitor renders the words filling in at generation pace
+# (CB-38). handle_user_turn_stream buffers the PendingTurn; the turn COMMITS exactly once at the END.
+# (_word_chunks remains a pure stdlib helper, no longer on the llm_node path — kept for its unit test.)
 #
 # HEAVY-IMPORT ISOLATION: the livekit-agents CORE imports are import-guarded (so this module imports
 # cleanly in the livekit-FREE test suite/CI, with Agent aliased to object and WorkerVoiceAgent still
@@ -212,8 +218,9 @@ def _word_chunks(reply: str, *, words_per_chunk: int = _STREAM_WORDS_PER_CHUNK) 
     in the livekit-free suite. An empty/whitespace reply yields [] (llm_node emits nothing then).
 
     The split keeps each word's trailing whitespace with the word, then groups `words_per_chunk` such
-    tokens per chunk, so ''.join(_word_chunks(s)) == s for any s. Used by llm_node to feed TTS natural
-    prosody units (one-word-at-a-time clips synthesis) while the live monitor fills in progressively."""
+    tokens per chunk, so ''.join(_word_chunks(s)) == s for any s. NOTE (CB-41): llm_node no longer
+    chunks a finished reply — it now streams the genuine NLG token stream — so this helper is no longer
+    on the speak path; it is retained as a pure, unit-tested whitespace-preserving splitter."""
     if not reply:
         return []
     # ("word", "  ") pairs: capture each non-space run with the whitespace that follows it.
@@ -366,16 +373,16 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
     delegation against the livekit-agents 1.5.x hook signatures (which differ from the older shape
     sketched in agent.py):
 
-      on_user_turn_completed(turn_ctx, new_message) -> pull the user text from new_message, run the
-        WHOLE respond() via voice_session.handle_user_turn (RAG + DST + decide + realize), buffer the
-        speculative PendingTurn under a fresh speech_id. We do NOT commit here. The consent gate fires
-        FIRST inside handle_user_turn: a not-yet-can_converse turn raises ConsentError (caught by the
-        worker and turned into a disclosure ask), so the brain never runs / nothing is recorded.
-      llm_node(...) -> STREAM the buffered reply_text for the pending speech_id to TTS in word chunks
-        (CB-31; an AsyncIterator[str] whose chunks rejoin to the EXACT reply — parity, never an LLM
-        call here), upsert the growing partial to the live monitor as it streams, then COMMIT the turn
-        at the END (the reliable state write). The brain ALREADY generated the reply; this node only
-        SURFACES + chunks it.
+      on_user_turn_completed(turn_ctx, new_message) -> pull the user text from new_message, FAIL-FAST
+        the consent gate (a not-yet-can_converse turn raises ConsentError so the brain never runs /
+        nothing is recorded), then STASH the user text under a fresh speech_id. We do NOT run the brain
+        or commit here — the brain runs in llm_node so its NLG tokens reach TTS at generation pace.
+      llm_node(...) -> CB-41: run the WHOLE brain STREAMING via voice_session.handle_user_turn_stream
+        (RAG + DST + gated Policy + STREAMED NLG) and YIELD each NLG token to TTS as it generates, so
+        TTS speaks the first clause at NLG first-token (~0.5-1.6s) instead of after the full reply
+        (CB-31 only chunked an already-finished reply). As tokens stream we UPSERT the growing partial
+        to the live monitor (throttled; CB-38). R37 parity: the buffered reply == concat of the yielded
+        tokens; no word is re-decided. COMMIT the turn at the END (the reliable state write).
       commit/discard -> commit happens at the END of llm_node's streaming (the reliable write); the
         worker's SpeechHandle.add_done_callback is kept as a redundant barge-in backstop (commit_turn
         is idempotent): a barge-in (.interrupted) drops a still-pending speculative turn with NO
@@ -394,6 +401,10 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
             super().__init__()
         self.voice_session: VoiceSession = base.voice_session
         self._pending_speech_id: Optional[str] = None
+        # CB-41: the user text for the pending speech_id, stashed by on_user_turn_completed and consumed
+        # by llm_node (where the brain now STREAMS so NLG tokens reach TTS at generation pace). Cleared
+        # once llm_node consumes it so a stale text can't replay onto a later speech_id.
+        self._pending_user_text: Optional[str] = None
         self._turn_counter = 0
         # SIP spoken-consent state (U13 phone path): when armed (arm_spoken_consent), the FIRST user
         # turn(s) are intercepted by handle_consent_turn — NOT run through the brain — until recording
@@ -475,13 +486,15 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
     async def on_user_turn_completed(
         self, turn_ctx: Any, new_message: Any
     ) -> None:
-        """User finished speaking (final STT): capture spoken consent (SIP path) or run the brain.
+        """User finished speaking (final STT): capture spoken consent (SIP path) or STASH the turn.
 
         While _awaiting_consent (SIP/phone path with no browser-captured consent), the turn is the
         consent answer: route it to handle_consent_turn and SPEAK the result — the brain NEVER runs on
-        it. Otherwise (consent already resolved, or the browser path), generate a fresh speech_id, run
-        respond() through the session (consent-gated + RAG-grounded), and remember the speech_id so
-        llm_node can surface the buffered reply. No committed-state write here."""
+        it. Otherwise (consent already resolved, or the browser path): FAIL-FAST the consent gate (a
+        not-yet-can_converse turn raises ConsentError, so the brain never runs / nothing is recorded),
+        then generate a fresh speech_id and STASH the user text for llm_node. CB-41: the brain now runs
+        STREAMING inside llm_node (not here) so its NLG tokens reach TTS at generation pace; this hook
+        only records the gate decision + the pending text. No committed-state write here."""
         user_text = (new_message.text_content or "").strip()
         if not user_text:
             return
@@ -491,10 +504,14 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
             if reply is not None:
                 await self._say_consent_line(reply)
             return
+        # FAIL-FAST consent BEFORE stashing/streaming: a not-yet-can_converse gate raises ConsentError
+        # here (no brain, no recording) exactly as handle_user_turn did before — the safety property is
+        # unchanged; only WHERE the brain runs moved (to llm_node, for streaming).
+        self.voice_session._require_consent()
         self._turn_counter += 1
         speech_id = f"t-{self._turn_counter}"
         self._pending_speech_id = speech_id
-        await self.voice_session.handle_user_turn(user_text, speech_id)
+        self._pending_user_text = user_text
 
     async def _say_consent_line(self, text: str) -> None:
         """SPEAK a consent prompt/hand-off line via the running AgentSession (livekit), if available.
@@ -519,40 +536,44 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
     async def llm_node(
         self, chat_ctx: Any, tools: Any, model_settings: Any
     ) -> "AsyncIterator[str]":
-        """STREAM the brain's pre-computed reply to TTS in WORD chunks (PARITY — never re-decide).
+        """Run the WHOLE brain STREAMING and YIELD each NLG token to TTS at generation pace (CB-41).
 
-        CB-31 (real-voice word streaming): livekit-agents 1.5.15 lets llm_node return an
-        AsyncIterable[str] — so instead of returning the whole buffered reply as ONE string (the old
-        shape, which only reached the live monitor AFTER commit on the next poll), we YIELD the SAME
-        reply in word chunks. The AgentSession forwards each chunk to TTS so it speaks progressively,
-        AND as the chunks stream we UPSERT the growing partial text of the active agent turn to the
-        live monitor (throttled ~_LIVE_PARTIAL_THROTTLE_S) so the words fill in near-real-time. R37
-        parity holds: the chunks are the SAME reply respond() produced (''.join(chunks) == reply);
-        no LLM runs here, no word is re-decided.
+        CB-41 (stream NLG GENERATION -> TTS): livekit-agents 1.5.15 lets llm_node return an
+        AsyncIterable[str]. The brain runs HERE (not in on_user_turn_completed) via
+        voice_session.handle_user_turn_stream(user_text, sid) — RAG + DST + gated Policy + STREAMED
+        NLG (realize_stream) — so each NLG token is yielded to TTS the instant it generates, and TTS
+        speaks the first clause at NLG first-token (~0.5-1.6s) instead of after the full reply (CB-31
+        only chunked an already-FINISHED reply). The gated decision is IDENTICAL to the blocking path
+        (handle_user_turn_stream goes through the same brain code via respond_stream — the gates are
+        not re-implemented). R37 parity: the committed reply == concat of the yielded tokens; no word
+        is re-decided.
 
-        COMMIT AT THE END: after the full reply is yielded, commit_turn(sid) — the RELIABLE state write
-        the live-call fix depends on (the SpeechHandle done-callback did NOT fire on real calls, so
-        committing here is what persists the turn + advances the committed belief). commit_turn is
+        CB-38 (visible in the monitor): as tokens stream we UPSERT the growing partial text of the
+        active agent turn to the live monitor (throttled ~_LIVE_PARTIAL_THROTTLE_S) so the words fill
+        in near-real-time — now fed by the GENUINE token stream (arriving at generation pace), not a
+        post-hoc chunking of a finished reply.
+
+        COMMIT AT THE END: after handle_user_turn_stream finishes (it buffered the PendingTurn keyed by
+        sid), commit_turn(sid) — the RELIABLE state write the live-call fix depends on. commit_turn is
         idempotent (pops the pending), so the redundant done-callback commit is a harmless no-op, and
-        the never-committed / dead-silence bug stays fixed (the turn ALWAYS commits once streaming ends).
-        Yields nothing on the defensive None branches (no pending speech / its buffer already drained)."""
+        the never-committed / dead-silence bug stays fixed (the turn ALWAYS commits once streaming
+        ends). Yields nothing on the defensive None branches (no pending speech / no stashed text)."""
         sid = self._pending_speech_id
-        if sid is None:
+        user_text = self._pending_user_text
+        if sid is None or user_text is None:
             return
-        pending = self.voice_session.state.pending.get(sid)
-        if pending is None:
-            return
-        reply = pending.reply_text
+        # Consume the stash so it cannot replay onto a later speech_id.
+        self._pending_user_text = None
 
-        # Stream the SAME reply in word chunks; upsert the growing partial (throttled) as we go so the
-        # live monitor's active turn fills in word-by-word. The loop clock drives the throttle (the
-        # generator always runs inside a running loop, so get_running_loop is safe).
+        # Stream the brain's NLG tokens straight to TTS; upsert the growing partial (throttled) as we
+        # go so the live monitor's active turn fills in word-by-word at GENERATION pace (CB-38). The
+        # loop clock drives the throttle (the generator always runs inside a running loop).
         loop = asyncio.get_running_loop()
         shown = ""
         last_partial_at = 0.0
-        for chunk in _word_chunks(reply):
-            shown += chunk
-            yield chunk  # -> TTS (and the AgentSession's transcription path)
+        async for token in self.voice_session.handle_user_turn_stream(user_text, sid):
+            shown += token
+            yield token  # -> TTS (and the AgentSession's transcription path) at generation pace
             now = loop.time()
             if self._config is not None and (now - last_partial_at) >= _LIVE_PARTIAL_THROTTLE_S:
                 last_partial_at = now
@@ -563,13 +584,13 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
         if self._config is not None and shown:
             asyncio.ensure_future(_upsert_live_partial(self, self._config, shown))
 
-        # COMMIT HERE — the RELIABLE state write (see docstring). Done AFTER the full reply is yielded
-        # so the turn commits exactly once at end, preserving the commit-in-llm_node behavior (CB-22 +
-        # the never-committed-bug fix). _capture_post_commit then fires the per-turn live upsert +
-        # escalation/close-tier capture exactly as before.
+        # COMMIT HERE — the RELIABLE state write (see docstring). handle_user_turn_stream buffered the
+        # PendingTurn (reply_text == concat of the streamed tokens) under sid; commit it exactly once at
+        # the end, preserving the commit-in-llm_node behavior (CB-22 + the never-committed-bug fix).
+        # _capture_post_commit then fires the per-turn live upsert + escalation/close-tier capture.
         committed = self.voice_session.commit_turn(sid)
         if committed is not None:
-            logger.info("turn %s committed (llm_node, streamed)", sid)
+            logger.info("turn %s committed (llm_node, streamed NLG)", sid)
             if self._config is not None:
                 _capture_post_commit(self, committed, sid, self._config)
 

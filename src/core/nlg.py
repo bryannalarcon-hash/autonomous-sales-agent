@@ -4,6 +4,12 @@
 # for one concise spoken-style turn. If retrieved_facts is given (KB grounding, wired in U5), the
 # reply is constrained to those facts (state no fact absent from them). Decouples strategy (policy)
 # from surface text (CraigslistBargain policy<->NLG split). Pure + async, NO LiveKit imports.
+# CB-41 (stream NLG -> TTS): realize_stream(...) is the STREAMING twin — it builds the SAME prompt
+# _build_messages() produces and yields the reply token-by-token from llm_client.complete_stream, so
+# the voice worker can speak the first clause at NLG first-token (~0.5-1.6s) instead of after the
+# whole reply. The blocking realize() is KEPT for the text/self-play path; both share _build_messages
+# so the prompt (and thus the decided content) is identical. On a streaming failure / blank stream,
+# realize_stream yields the SAME safe filler realize() falls back to (the turn is never empty).
 # CB-29/CB-34 (no hallucinated slots, no presumed learner): the system prompt ALWAYS carries a hard
 # grounding rule forbidding the agent from asserting any person/relationship/gender/grade/subject — or
 # even the EXISTENCE of a learner — the DST has not confirmed; with no confirmed learner it uses neutral
@@ -13,11 +19,15 @@
 # before any pitch. Both rules are appended LAST so an authored config prompt can't override them.
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+from typing import Any, AsyncIterator, Optional, Sequence
 
 from src.config.settings import AgentConfig
 from src.core.belief_state import BeliefState
 from src.core.llm import LLMClient, Message
+
+# The safe filler an empty/failed realization degrades to — shared by realize() (returned) and
+# realize_stream() (yielded) so both paths always produce a non-empty turn (FINDING 2).
+_SAFE_FILLER = "Let me make sure I'm helping you the right way here."
 
 # Per-act realization guidance: what the spoken turn should accomplish for each gated act. Keeps NLG
 # faithful to the policy's decision while leaving phrasing to the LLM (persona-consistent).
@@ -179,5 +189,53 @@ async def realize(
         text = ""
     reply = (text or "").strip()
     if not reply:
-        return "Let me make sure I'm helping you the right way here."
+        return _SAFE_FILLER
     return reply
+
+
+async def realize_stream(
+    decision: Any,
+    belief: BeliefState,
+    config: AgentConfig,
+    llm_client: LLMClient,
+    *,
+    retrieved_facts: Optional[Sequence[Any]] = None,
+) -> AsyncIterator[str]:
+    """STREAM a gated Decision into a persona-consistent reply, yielding tokens as they generate.
+
+    CB-41 — the streaming twin of realize(). It builds the EXACT SAME prompt _build_messages()
+    produces (so the decided content is identical to the blocking path) and yields each content token
+    from llm_client.complete_stream in order. The concatenation of every yielded token is the reply
+    (the voice worker accumulates them and the committed Turn.text is that assembly — R37 parity).
+
+    Robustness mirrors realize(): if the stream errors before ANY token is produced — or produces only
+    whitespace — we yield the SAME safe filler the blocking path falls back to, so the caller always
+    gets a non-empty turn. A failure AFTER tokens have flowed is swallowed (the partial reply already
+    streamed to TTS); we do not inject filler mid-reply. Leading whitespace on the very first token is
+    trimmed so the reply does not start with stray spaces (matching realize()'s .strip() on the head),
+    while interior/trailing whitespace is preserved so the assembled text reads naturally.
+    """
+    messages = _build_messages(decision, belief, config, retrieved_facts)
+    produced_any = False
+    seen_nonspace = False
+    try:
+        async for token in llm_client.complete_stream(messages):
+            if not token:
+                continue
+            chunk = token
+            if not seen_nonspace:
+                # Trim leading whitespace until the first non-space token (head .strip() parity).
+                chunk = chunk.lstrip()
+                if not chunk:
+                    continue
+                seen_nonspace = True
+            produced_any = True
+            yield chunk
+    except Exception:
+        # A failure BEFORE any token -> degrade to the safe filler (parity with realize()'s except).
+        # A failure AFTER tokens flowed -> swallow (the partial already streamed); do not add filler.
+        if produced_any:
+            return
+    if not produced_any:
+        # Blank/failed stream: emit the safe filler so the turn is never empty (FINDING 2 parity).
+        yield _SAFE_FILLER

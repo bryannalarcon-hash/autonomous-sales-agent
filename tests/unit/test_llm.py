@@ -3,6 +3,11 @@
 # reply (including fenced ```json blocks); and the OpenRouterClient constructs the correct
 # OpenAI-compatible request (base_url, bearer auth, model, messages, response_format) WITHOUT
 # hitting the network — httpx is monkeypatched so no real call is made.
+# CB-41 (stream NLG -> TTS): also covers OpenRouterClient.complete_stream SSE parsing — a stubbed
+# httpx client.stream() yields `data: {json}` lines and the client must yield each
+# choices[0].delta.content token in order (skipping role-only deltas, keep-alive comments, and the
+# terminal `data: [DONE]`), with the concatenation equal to the full reply (R37 parity at the seam);
+# plus the MockLLMClient.complete_stream word-token stream (>1 token, rejoins to the exact reply).
 from __future__ import annotations
 
 import json
@@ -362,3 +367,208 @@ async def test_openrouter_does_not_retry_on_4xx_client_error(monkeypatch):
     with pytest.raises(httpx.HTTPStatusError):
         await client.complete([{"role": "user", "content": "x"}])
     assert client_cls.state["attempts"] == 1  # 400 is a client error; do not retry
+
+
+# --- CB-41: complete_stream SSE parsing (stubbed httpx stream, NO network) --------------------
+
+
+def _sse_lines(reply_tokens: list[str], *, include_role_delta: bool = True) -> list[str]:
+    """Build the raw SSE `data:` lines an OpenRouter streamed chat-completion sends for `reply_tokens`.
+
+    Mirrors the real wire shape: an optional role-only first delta (no content), then one
+    content-delta line per token, a finish_reason line, and the terminal `data: [DONE]`. A keep-alive
+    SSE comment is interleaved to prove the parser skips it."""
+    lines: list[str] = []
+    if include_role_delta:
+        lines.append('data: {"choices":[{"delta":{"role":"assistant"},"index":0}]}')
+    lines.append(": OPENROUTER PROCESSING")  # keep-alive comment — must be skipped
+    for tok in reply_tokens:
+        lines.append('data: ' + json.dumps({"choices": [{"delta": {"content": tok}, "index": 0}]}))
+    lines.append('data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}')
+    lines.append("data: [DONE]")
+    return lines
+
+
+class _FakeStreamResponse:
+    """A stand-in for the httpx streaming Response context manager (client.stream(...) result).
+
+    Supports `async with`, raise_for_status(), and aiter_lines() yielding the scripted SSE lines."""
+
+    def __init__(self, lines: list[str], *, status_code: int = 200,
+                 headers: dict | None = None) -> None:
+        self._lines = lines
+        self.status_code = status_code
+        self.headers = headers or {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+            raise httpx.HTTPStatusError(
+                f"status {self.status_code}", request=request, response=self  # type: ignore[arg-type]
+            )
+        return None
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+
+class _StreamingFakeClient:
+    """A fake httpx.AsyncClient whose .stream(...) returns a scripted _FakeStreamResponse.
+
+    Records the POST body so a test can assert "stream": true was sent. Constructed per attempt."""
+
+    last_body: dict = {}
+    response_factory = None  # set per test to a callable() -> _FakeStreamResponse
+
+    def __init__(self, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def stream(self, method, url, *, json=None, headers=None):
+        _StreamingFakeClient.last_body = json or {}
+        assert _StreamingFakeClient.response_factory is not None
+        return _StreamingFakeClient.response_factory()
+
+
+async def test_complete_stream_yields_content_tokens_in_order(monkeypatch):
+    """complete_stream POSTs stream=true and yields each choices[0].delta.content token in order,
+    skipping the role-only first delta, the keep-alive comment, the finish_reason line, and [DONE].
+    The concatenation of the yielded tokens equals the full reply (R37 parity at the LLM seam)."""
+    import src.core.llm as llm_mod
+
+    tokens = ["Sure", ", let", " me", " help", " you", "."]
+    _StreamingFakeClient.response_factory = lambda: _FakeStreamResponse(_sse_lines(tokens))
+    monkeypatch.setattr(llm_mod.httpx, "AsyncClient", _StreamingFakeClient)
+
+    client = OpenRouterClient(api_key="sk-test-123", model="anthropic/claude-sonnet-4.5")
+    got = [t async for t in client.complete_stream([{"role": "user", "content": "hi"}])]
+
+    assert got == tokens  # only the content tokens, in order (role/comment/DONE skipped)
+    assert "".join(got) == "Sure, let me help you."  # parity: tokens rejoin to the full reply
+    # The request body carried stream=true (and the model + messages verbatim).
+    body = _StreamingFakeClient.last_body
+    assert body["stream"] is True
+    assert body["model"] == "anthropic/claude-sonnet-4.5"
+    assert body["messages"] == [{"role": "user", "content": "hi"}]
+
+
+async def test_complete_stream_handles_no_role_delta_and_empty_content(monkeypatch):
+    """A stream with NO role-only first delta and an interleaved empty-content delta still yields only
+    the real content tokens (the empty-content delta contributes nothing); parity holds."""
+    import src.core.llm as llm_mod
+
+    lines = [
+        'data: {"choices":[{"delta":{"content":"Hello"},"index":0}]}',
+        'data: {"choices":[{"delta":{"content":""},"index":0}]}',   # empty content -> skipped
+        'data: {"choices":[{"delta":{"content":" world"},"index":0}]}',
+        "data: [DONE]",
+    ]
+    _StreamingFakeClient.response_factory = lambda: _FakeStreamResponse(lines)
+    monkeypatch.setattr(llm_mod.httpx, "AsyncClient", _StreamingFakeClient)
+
+    client = OpenRouterClient(api_key="sk-test-123", model="m")
+    got = [t async for t in client.complete_stream([{"role": "user", "content": "x"}])]
+    assert got == ["Hello", " world"]
+    assert "".join(got) == "Hello world"
+
+
+async def test_complete_stream_retries_then_streams_on_transient_5xx(monkeypatch):
+    """A transient 5xx surfaced by raise_for_status (BEFORE any token) is retried with the bounded,
+    deterministic backoff; the retry then streams the tokens. Mirrors complete()'s retry policy."""
+    import src.core.llm as llm_mod
+
+    slept: list[float] = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(llm_mod.asyncio, "sleep", _fake_sleep)
+
+    tokens = ["ok", " then"]
+    responses = [
+        _FakeStreamResponse([], status_code=503),               # first attempt: transient 5xx
+        _FakeStreamResponse(_sse_lines(tokens, include_role_delta=False)),  # retry succeeds
+    ]
+    state = {"i": 0}
+
+    def _factory():
+        resp = responses[state["i"]]
+        state["i"] += 1
+        return resp
+
+    _StreamingFakeClient.response_factory = _factory
+    monkeypatch.setattr(llm_mod.httpx, "AsyncClient", _StreamingFakeClient)
+
+    client = OpenRouterClient(api_key="sk-test-123", model="m", retry_backoff_base=0.5)
+    got = [t async for t in client.complete_stream([{"role": "user", "content": "x"}])]
+    assert got == tokens
+    assert slept == [0.5]  # exactly one deterministic backoff before the single retry
+
+
+async def test_complete_stream_does_not_retry_on_4xx(monkeypatch):
+    """A non-retryable 4xx (surfaced by raise_for_status before any token) re-raises immediately —
+    the NLG layer's try/except then degrades to its safe filler. No retry, no hang."""
+    import src.core.llm as llm_mod
+
+    async def _fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(llm_mod.asyncio, "sleep", _fake_sleep)
+
+    _StreamingFakeClient.response_factory = lambda: _FakeStreamResponse([], status_code=400)
+    monkeypatch.setattr(llm_mod.httpx, "AsyncClient", _StreamingFakeClient)
+
+    client = OpenRouterClient(api_key="sk-test-123", model="m", retry_backoff_base=0.0)
+    with pytest.raises(httpx.HTTPStatusError):
+        async for _ in client.complete_stream([{"role": "user", "content": "x"}]):
+            pass
+
+
+# --- CB-41: MockLLMClient.complete_stream (deterministic word tokens, no network) -------------
+
+
+async def test_mock_complete_stream_yields_word_tokens_rejoining_to_reply():
+    """MockLLMClient.complete_stream yields the scripted reply as >1 whitespace-preserving token whose
+    concatenation is the EXACT reply (so a streamed turn produces a genuine multi-token stream)."""
+    reply = "Sure, let me get a few details about what your child is working on."
+    mock = MockLLMClient([reply])
+    tokens = [t async for t in mock.complete_stream([{"role": "user", "content": "x"}])]
+    assert len(tokens) > 1
+    assert "".join(tokens) == reply
+
+
+async def test_mock_complete_stream_advances_a_list_script_like_complete():
+    """complete_stream consumes one list entry (advancing the script), just like complete(), so mixing
+    the two in a test stays deterministic."""
+    mock = MockLLMClient(["first reply here", "second reply here"])
+    first = "".join([t async for t in mock.complete_stream([{"role": "user", "content": "a"}])])
+    second = await mock.complete([{"role": "user", "content": "b"}])
+    assert first == "first reply here"
+    assert second == "second reply here"
+
+
+def test_sse_content_delta_parses_and_skips():
+    """The pure _sse_content_delta helper: extracts content from a data line, returns None for the
+    role-only delta / [DONE] / a keep-alive comment / unparseable JSON (so the caller simply skips)."""
+    import src.core.llm as llm_mod
+
+    f = llm_mod._sse_content_delta
+    assert f('data: {"choices":[{"delta":{"content":"hi"}}]}') == "hi"
+    assert f('{"choices":[{"delta":{"content":" there"}}]}') == " there"  # no `data:` prefix tolerated
+    assert f('data: {"choices":[{"delta":{"role":"assistant"}}]}') is None  # role-only -> no content
+    assert f("data: [DONE]") is None
+    assert f(": OPENROUTER PROCESSING") is None  # keep-alive comment
+    assert f("data: not json") is None
+    assert f("") is None
