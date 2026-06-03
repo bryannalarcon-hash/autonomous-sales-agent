@@ -1,6 +1,7 @@
 // Typed fetch client for the Improve dashboard (U16). One thin wrapper per Improve endpoint
-// (experiments list, run an A/B [ASYNC — 202 + a running record, CB-15], scaffold a draft from a
-// reviewed call [CB-19], approvals list + approve/reject, KB/playbook read + draft-save, versions list
+// (experiments list, run an A/B [ASYNC — 202 + a running record, CB-15; multi-metric via `changes`,
+// CB-27], scaffold a draft from a reviewed call [CB-19], one experiment's detail + A/B mock calls
+// [CB-25], approvals list + approve/reject, KB/playbook read + draft-save, versions list
 // + rollback) returning the typed contract from lib/improve-types. Reuses the same ApiError + API_BASE
 // convention as lib/api.ts (never embeds secrets); GETs are no-store, mutations POST JSON. All
 // SEMANTIC labels arrive pre-translated from the backend, so nothing here re-derives a human label
@@ -10,6 +11,7 @@ import type {
   ApprovalListResponse,
   DecisionResponse,
   DraftResponse,
+  ExperimentDetailResponse,
   ExperimentListResponse,
   KbResponse,
   PlaybookResponse,
@@ -92,6 +94,13 @@ export function scaffoldExperiment(
   req: ScaffoldExperimentRequest,
 ): Promise<ScaffoldExperimentResponse> {
   return postJson<ScaffoldExperimentResponse>('/api/experiments/scaffold', req);
+}
+
+/** FETCH one experiment's detail + its A/B mock calls (CB-25): the experiment DTO plus the champion-arm
+ *  + challenger-arm self-play episodes the run produced, each openable in Review. Powers the
+ *  /improve/lab/[id] detail page reached via the drawer's "See experiment". */
+export function fetchExperimentDetail(id: string): Promise<ExperimentDetailResponse> {
+  return getJson<ExperimentDetailResponse>(`/api/experiments/${encodeURIComponent(id)}`);
 }
 
 // --- P7 Approval Queue ---------------------------------------------------------------------------

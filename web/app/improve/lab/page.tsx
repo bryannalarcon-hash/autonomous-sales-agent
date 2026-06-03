@@ -12,6 +12,15 @@
 // CB-19: arriving via /improve/lab?episode=<id> (from a call's "Use in experiment") auto-opens the
 // RunDrawer pre-seeded + showing the reviewed call's context, so the operator reviews + launches the
 // scaffolded experiment — never a blank lab landing.
+// CB-24: a rejected/blocked/failed experiment surfaces its guardrail_reason on the card + drawer (and
+// in the drawer a dedicated "why it ended" callout) — a failed run never reads as a silent "gone".
+// CB-25: the drawer has a "See experiment" button -> /improve/lab/[id], the detail page listing the
+// A/B's per-arm mock calls (each openable in Review).
+// CB-26: in the RunDrawer, each chosen metric gets a "?" that expands a value→behavior chart (the
+// belief→behavior explainer; human text only, no raw slug) from lib/improve-types metricExplainer.
+// CB-27: the RunDrawer's threshold picker is a CSV-like grid — each row a {metric, new value}, with
+// "+"/"−" to add/remove rows; >1 row sends a multi-metric `changes` request (single row stays the
+// single-dimension default), explicitly relaxing the R19 single-dimension invariant for manual runs.
 // Data from /api/experiments; the discovery-sequencing before/after is the headline demo artifact. All
 // semantic labels (state, dimension, version, population/cohort) are humanized before render — no raw
 // slug, `__…__` experiment suffix, or DRAFT-/exp- id renders. Cards/drawer show the human version +
@@ -26,7 +35,8 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchExperiments, fetchPlaybook, runExperiment } from '@/lib/improve-api';
-import type { Experiment, PlaybookResponse, RunExperimentRequest } from '@/lib/improve-types';
+import type { Experiment, MetricChange, PlaybookResponse, RunExperimentRequest } from '@/lib/improve-types';
+import { metricBandFor, metricExplainer } from '@/lib/improve-types';
 import { dimensionLabel, populationLabel, versionLabel } from '@/lib/labels';
 
 // Operator-facing "what changed" label for an experiment: prefer the backend's pre-translated
@@ -104,6 +114,10 @@ function Stat({ l, v, good, mono }: { l: string; v: string; good?: boolean | nul
 function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
   const router = useRouter();
   const tripped = e.guardrail === 'trip';
+  // CB-24: a rejected/blocked/failed experiment carries WHY in guardrail_reason — surface it
+  // prominently (not only in the guardrail strip) so a failed run never reads as a silent "gone".
+  const isFailed = e.state === 'rejected' || e.state === 'blocked';
+  const failureReason = (isFailed || tripped) ? e.guardrail_reason : null;
   return (
     <>
       <div className="scrim" onClick={onClose} />
@@ -146,12 +160,46 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
             </div>
           </div>
 
+          {/* CB-24: an explicit "why it ended this way" callout for a rejected/blocked/failed run — so
+              the operator is never left guessing why an experiment "failed without telling me why". */}
+          {failureReason ? (
+            <div
+              className="row"
+              style={{
+                gap: 9,
+                alignItems: 'flex-start',
+                padding: '11px 13px',
+                borderRadius: 10,
+                background: 'var(--danger-soft)',
+                border: '1px solid var(--danger-border)',
+              }}
+            >
+              <Icon name="alert" size={15} style={{ color: 'var(--danger)', marginTop: 1 }} />
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--danger)' }}>
+                  Why {e.state === 'blocked' ? 'it needs approval' : 'it ended'}
+                </div>
+                <div style={{ fontSize: 12.5, color: 'var(--danger)', marginTop: 3, lineHeight: 1.5 }}>
+                  {failureReason}
+                </div>
+              </div>
+            </div>
+          ) : null}
+
           <div className="card solid card-pad">
             <div className="faint" style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 7 }}>
               What changed · {e.dimension_label}
             </div>
             <div className="mono" style={{ fontSize: 13, lineHeight: 1.6 }}>{e.diff_description}</div>
           </div>
+
+          {/* CB-25: "See experiment" -> the detail page listing this A/B's mock calls (both arms),
+              each openable in Review. Always available so any experiment can be inspected. */}
+          <button className="btn btn-ghost" onClick={() => router.push(`/improve/lab/${encodeURIComponent(e.experiment_id)}`)}>
+            <Icon name="flask" size={16} />
+            See experiment
+            <Icon name="arrowR" size={15} />
+          </button>
 
           <div className="card solid card-pad">
             <div className="faint" style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 10 }}>
@@ -240,6 +288,151 @@ function moved<T>(arr: T[], from: number, to: number): T[] {
   return next;
 }
 
+// CB-26 — the metric→behavior explainer. A compact inline chart: the metric's value bands as a small
+// legend, each band's behavior in human words, with the band matching the CURRENT entered value
+// highlighted. Pure presentation off lib/improve-types (metricExplainer / metricBandFor); no raw slug.
+function MetricExplainer({ thrKey, value }: { thrKey: string; value: number | null }) {
+  const ex = metricExplainer(thrKey);
+  if (!ex) return null;
+  const active = value != null && !Number.isNaN(value) ? metricBandFor(thrKey, value) : null;
+  return (
+    <div
+      className="card solid card-pad"
+      style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}
+      role="note"
+    >
+      <div className="faint" style={{ fontSize: 11, fontWeight: 600 }}>
+        What this number means · {ex.measures}
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        {ex.bands.map((band, i) => {
+          const next = ex.bands[i + 1];
+          const isActive = active === band;
+          const range =
+            ex.unit === 'fraction'
+              ? `${band.from.toFixed(2)}${next ? `–${next.from.toFixed(2)}` : '+'}`
+              : `${band.from}${next ? `–${next.from - 1}` : '+'}`;
+          return (
+            <div
+              key={band.from}
+              className="row"
+              style={{
+                gap: 9,
+                alignItems: 'flex-start',
+                padding: '7px 9px',
+                borderRadius: 8,
+                background: isActive ? 'var(--accent-soft)' : 'transparent',
+                border: `1px solid ${isActive ? 'var(--accent-border)' : 'var(--border)'}`,
+              }}
+            >
+              <span
+                className="mono"
+                style={{
+                  fontSize: 11,
+                  fontWeight: 700,
+                  minWidth: 52,
+                  color: isActive ? 'var(--accent-strong)' : 'var(--text-3)',
+                }}
+              >
+                {range}
+              </span>
+              <span style={{ fontSize: 12, lineHeight: 1.45, color: isActive ? 'var(--accent-strong)' : 'var(--text-2)' }}>
+                {band.behavior}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      {active ? (
+        <div className="faint" style={{ fontSize: 11 }}>
+          At {ex.unit === 'fraction' ? value!.toFixed(2) : value}: {active.behavior}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// CB-27 — one editable {metric, new value} row of the multi-metric grid. The "?" toggles the CB-26
+// explainer for THIS row's metric/value. Remove is disabled when it is the only row.
+interface MetricRow {
+  key: string;
+  value: string;
+}
+function MetricRowEditor({
+  row,
+  options,
+  onChange,
+  onRemove,
+  canRemove,
+}: {
+  row: MetricRow;
+  options: ThresholdOption[];
+  onChange: (next: MetricRow) => void;
+  onRemove: () => void;
+  canRemove: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const num = row.value.trim() === '' ? null : Number(row.value);
+  const selected = options.find((t) => t.key === row.key);
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div className="row" style={{ gap: 8, alignItems: 'center' }}>
+        <select
+          className="field"
+          value={row.key}
+          onChange={(e) => onChange({ ...row, key: e.target.value })}
+          style={{ flex: 2, minWidth: 0 }}
+        >
+          {options.map((t) => (
+            <option key={t.key} value={t.key}>
+              {t.label}
+              {t.extreme ? ' (needs approval)' : ''}
+            </option>
+          ))}
+        </select>
+        <input
+          className="input"
+          style={{ flex: 1, minWidth: 0 }}
+          type="number"
+          step="0.05"
+          value={row.value}
+          onChange={(e) => onChange({ ...row, value: e.target.value })}
+          placeholder="value"
+          aria-label="New value"
+        />
+        <button
+          type="button"
+          className="gctl"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          aria-label="What this metric means"
+          title="What this number means"
+          style={{ width: 30, padding: 0, justifyContent: 'center', fontWeight: 700 }}
+        >
+          ?
+        </button>
+        <button
+          type="button"
+          className="gctl"
+          onClick={onRemove}
+          disabled={!canRemove}
+          aria-label="Remove this metric"
+          style={{ width: 30, padding: 0, justifyContent: 'center' }}
+        >
+          <Icon name="x" size={13} />
+        </button>
+      </div>
+      {selected?.extreme ? (
+        <div className="row" style={{ gap: 6, alignItems: 'center', fontSize: 11.5, color: 'var(--warn)' }}>
+          <Icon name="shield" size={13} />
+          A pricing change is extreme — this run will go to the approval queue, not auto-promote.
+        </div>
+      ) : null}
+      {open ? <MetricExplainer thrKey={row.key} value={num} /> : null}
+    </div>
+  );
+}
+
 // The Run-an-A/B drawer. Picks ONE dimension + value, shows the explicit cost note, and submits.
 // CB-19: an optional `episodeId` (when the drawer was opened by scaffolding from a reviewed call)
 // is shown as context AND threaded onto the run request, and `prefillKind` pre-selects the dimension
@@ -258,8 +451,8 @@ function RunDrawer({
   const [playbook, setPlaybook] = useState<PlaybookResponse | null>(null);
   const [kind, setKind] = useState<RunKind>(prefillKind ?? 'discovery');
   const [seq, setSeq] = useState<string[]>([]);
-  const [thrKey, setThrKey] = useState<string>(THRESHOLD_OPTIONS[0].key);
-  const [thrValue, setThrValue] = useState<string>('');
+  // CB-27: the threshold picker is a grid of {metric, value} rows (default ONE row = single-dimension).
+  const [rows, setRows] = useState<MetricRow[]>([{ key: THRESHOLD_OPTIONS[0].key, value: '' }]);
   const [n, setN] = useState<number>(12);
   const [name, setName] = useState<string>('');
   const [busy, setBusy] = useState(false);
@@ -273,7 +466,7 @@ function RunDrawer({
         setPlaybook(pb);
         setSeq(pb.discovery_sequence ?? []);
         const cur = pb.thresholds?.[THRESHOLD_OPTIONS[0].key];
-        if (typeof cur === 'number') setThrValue(String(cur));
+        setRows([{ key: THRESHOLD_OPTIONS[0].key, value: typeof cur === 'number' ? String(cur) : '' }]);
       })
       .catch((e) => !cancelled && setErr(e instanceof Error ? e.message : 'Could not load the champion config.'));
     return () => {
@@ -281,37 +474,70 @@ function RunDrawer({
     };
   }, []);
 
-  // Keep the threshold value field showing the current champion value when the key changes.
-  function selectThreshold(key: string) {
-    setThrKey(key);
-    const cur = playbook?.thresholds?.[key];
-    setThrValue(typeof cur === 'number' ? String(cur) : '');
+  // CB-27 — grid row ops. Adding a row defaults to the first metric NOT already in the grid (so two
+  // rows don't trivially target the same knob), prefilled with the champion's current value.
+  function updateRow(i: number, next: MetricRow) {
+    setRows((rs) =>
+      rs.map((r, idx) => {
+        if (idx !== i) return r;
+        // If the METRIC changed (not just the value), reset the value to that knob's champion value;
+        // a pure value edit (same key) keeps exactly what the user typed.
+        if (next.key !== r.key) {
+          const cur = playbook?.thresholds?.[next.key];
+          return { key: next.key, value: typeof cur === 'number' ? String(cur) : '' };
+        }
+        return next;
+      }),
+    );
+  }
+  function addRow() {
+    const used = new Set(rows.map((r) => r.key));
+    const nextKey = THRESHOLD_OPTIONS.find((t) => !used.has(t.key))?.key ?? THRESHOLD_OPTIONS[0].key;
+    const cur = playbook?.thresholds?.[nextKey];
+    setRows((rs) => [...rs, { key: nextKey, value: typeof cur === 'number' ? String(cur) : '' }]);
+  }
+  function removeRow(i: number) {
+    setRows((rs) => (rs.length <= 1 ? rs : rs.filter((_, idx) => idx !== i)));
   }
 
-  const selectedThr = THRESHOLD_OPTIONS.find((t) => t.key === thrKey);
-  const willBeExtreme = kind === 'threshold' && !!selectedThr?.extreme;
+  const willBeExtreme =
+    kind === 'threshold' && rows.some((r) => THRESHOLD_OPTIONS.find((t) => t.key === r.key)?.extreme);
   // A reorder that hasn't moved anything is a no-op the backend rejects — disable submit for it.
   const reorderUnchanged =
     kind === 'discovery' &&
     !!playbook &&
     JSON.stringify(seq) === JSON.stringify(playbook.discovery_sequence ?? []);
-  const thrUnchanged =
-    kind === 'threshold' &&
-    !!playbook &&
-    String(playbook.thresholds?.[thrKey]) === thrValue.trim();
+  // CB-27: at least one row must be filled AND differ from the champion's current value for that knob.
+  const changedRows =
+    kind === 'threshold' && !!playbook
+      ? rows.filter(
+          (r) => r.value.trim() !== '' && String(playbook.thresholds?.[r.key]) !== r.value.trim(),
+        )
+      : [];
   const canSubmit =
     !busy &&
     !!playbook &&
-    (kind === 'discovery' ? !reorderUnchanged && seq.length >= 2 : thrValue.trim() !== '' && !thrUnchanged);
+    (kind === 'discovery' ? !reorderUnchanged && seq.length >= 2 : changedRows.length >= 1);
 
   async function submit() {
     if (!canSubmit) return;
     setBusy(true);
     setErr(null);
-    const req: RunExperimentRequest =
-      kind === 'discovery'
-        ? { dimension: 'playbooks.discovery_sequence', value: seq, n, name: name || undefined, episode_id: episodeId }
-        : { dimension: `thresholds.${thrKey}`, value: Number(thrValue), n, name: name || undefined, episode_id: episodeId };
+    let req: RunExperimentRequest;
+    if (kind === 'discovery') {
+      req = { dimension: 'playbooks.discovery_sequence', value: seq, n, name: name || undefined, episode_id: episodeId };
+    } else if (changedRows.length === 1) {
+      // ONE changed row stays the single-dimension default (keeps the R19 invariant).
+      const r = changedRows[0];
+      req = { dimension: `thresholds.${r.key}`, value: Number(r.value), n, name: name || undefined, episode_id: episodeId };
+    } else {
+      // CB-27: multiple rows -> a multi-metric `changes` request (explicit invariant relaxation).
+      const changes: MetricChange[] = changedRows.map((r) => ({
+        dimension: `thresholds.${r.key}`,
+        value: Number(r.value),
+      }));
+      req = { changes, n, name: name || undefined, episode_id: episodeId };
+    }
     try {
       const res = await runExperiment(req);
       onStarted(res.experiment);
@@ -400,33 +626,50 @@ function RunDrawer({
               </div>
             </div>
           ) : (
-            <div className="card solid card-pad" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              <div>
-                <div className="faint" style={{ fontSize: 11, fontWeight: 600, marginBottom: 5 }}>Threshold</div>
-                <select className="field" value={thrKey} onChange={(e) => selectThreshold(e.target.value)} style={{ width: '100%' }}>
-                  {THRESHOLD_OPTIONS.map((t) => (
-                    <option key={t.key} value={t.key}>
-                      {t.label}
-                      {t.extreme ? ' (needs approval)' : ''}
-                    </option>
-                  ))}
-                  <Icon name="chevDown" size={14} />
-                </select>
-              </div>
-              <div>
-                <div className="faint" style={{ fontSize: 11, fontWeight: 600, marginBottom: 5 }}>
-                  New value{playbook?.thresholds?.[thrKey] !== undefined ? ` · currently ${playbook.thresholds[thrKey]}` : ''}
+            // CB-27: a CSV-like grid — each row a {metric, new value}; "+" adds a row, "−" removes.
+            // One row = the single-dimension default; more than one row sends a multi-metric run.
+            <div className="card solid card-pad" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+                <div className="faint" style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em' }}>
+                  Policy thresholds
                 </div>
-                <input
-                  className="input"
-                  style={{ width: '100%' }}
-                  type="number"
-                  step="0.05"
-                  value={thrValue}
-                  onChange={(e) => setThrValue(e.target.value)}
-                  placeholder="e.g. 0.5"
-                />
+                {rows.length > 1 ? (
+                  <span className="tag warn">
+                    <Icon name="bolt" size={12} />
+                    {rows.length} metrics together
+                  </span>
+                ) : null}
               </div>
+              <div className="row faint" style={{ gap: 8, fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.04em', paddingRight: 64 }}>
+                <span style={{ flex: 2 }}>Metric</span>
+                <span style={{ flex: 1 }}>New value</span>
+              </div>
+              {rows.map((row, i) => (
+                <MetricRowEditor
+                  key={i}
+                  row={row}
+                  options={THRESHOLD_OPTIONS}
+                  onChange={(next) => updateRow(i, next)}
+                  onRemove={() => removeRow(i)}
+                  canRemove={rows.length > 1}
+                />
+              ))}
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={addRow}
+                disabled={rows.length >= THRESHOLD_OPTIONS.length}
+                style={{ alignSelf: 'flex-start' }}
+              >
+                <Icon name="plus" size={15} />
+                Add another metric
+              </button>
+              {rows.length > 1 ? (
+                <div className="faint" style={{ fontSize: 11.5, lineHeight: 1.5 }}>
+                  This applies all rows to the challenger at once — a multi-metric experiment. Single-metric
+                  is the norm; combining metrics here is an explicit, manual choice.
+                </div>
+              ) : null}
               {willBeExtreme ? (
                 <div className="row" style={{ gap: 7, alignItems: 'center', padding: '8px 10px', borderRadius: 9, background: 'var(--warn-soft)', border: '1px solid var(--warn-border)' }}>
                   <Icon name="shield" size={14} style={{ color: 'var(--warn)' }} />
@@ -644,7 +887,9 @@ function LabPageInner() {
                     <Cell l="Ladder Δ" v={dec(e.delta)} good={e.delta > 0} />
                     <Cell l="Significance" v={`${Math.round(e.significance * 100)}%`} last />
                   </div>
-                  {e.state === 'blocked' ? (
+                  {/* CB-24: surface the failure/rejection reason on the CARD too (not just blocked) —
+                      a rejected/failed run shows WHY right on the card, never a blank "gone". */}
+                  {e.state === 'blocked' || e.state === 'rejected' ? (
                     <div
                       style={{
                         padding: '9px 16px',
@@ -658,7 +903,10 @@ function LabPageInner() {
                       }}
                     >
                       <Icon name="alert" size={13} />
-                      {e.guardrail_reason ?? 'Guardrail blocked — needs approval'}
+                      {e.guardrail_reason ??
+                        (e.state === 'blocked'
+                          ? 'Guardrail blocked — needs approval'
+                          : 'Did not pass the bar')}
                     </div>
                   ) : null}
                   <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)' }}>

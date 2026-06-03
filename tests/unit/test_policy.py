@@ -404,9 +404,15 @@ async def test_policy_ae8_hot_prospect_pivots_to_enrollment():
 
 
 async def test_policy_ae8_warm_prospect_pivots_to_trial_or_consult():
-    """AE8: warm-but-not-ready -> a lower commitment-ladder tier (trial/consultation), not enrollment."""
+    """AE8: warm-but-not-ready -> a lower commitment-ladder tier (trial/consultation), not enrollment.
+
+    CB-29: discovery has actually happened (grade + subject confirmed) so the close_floor blind-close
+    guard leaves this EARNED close alone; the test pins the TIER selection (warm -> lower than
+    enrollment), not premature closing (the blind-close block is covered by test_cb28_cb29)."""
     cfg = make_config(trust_gate_open_price=0.5, pushiness_cap=0.7, pushiness_pressure_count_cap=3)
     b = BeliefState.fresh()
+    fill_slot(b, "grade_level", "10", 0.95)  # discovery actually happened
+    fill_slot(b, "subject", "algebra", 0.95)
     b.drivers["trust"] = 0.6
     b.drivers["need_intensity"] = 0.55
     b.drivers["purchase_intent"] = 0.45
@@ -659,3 +665,45 @@ def test_advance_to_close_offers_free_callback_when_budget_constrained():
     assert gates.advance_to_close(Decision(act="answer_via_kb"), b, cfg).tier == "callback"
     b2 = BeliefState.fresh(); b2.turn_count = 6; b2.drivers["trust"] = 0.7; b2.meta["affordability_refusal_count"] = 2
     assert gates.advance_to_close(Decision(act="answer_via_kb"), b2, cfg).tier == "callback"
+
+
+# --- close_floor (CB-29: no blind premature/pushy paid close) ----------------------------------
+
+def test_close_floor_blocks_blind_paid_close():
+    """A paid close with NO discovery slots filled AND no readiness signal (purchase_intent at/below
+    the neutral prior) is the blind premature close the real call exhibited — backed off, not fired."""
+    cfg = make_config(discovery_slots_before_close=1)
+    b = BeliefState.fresh()
+    b.turn_count = 9  # the real call's pushy-close turn — turns alone don't make it legitimate
+    b.drivers["trust"] = 0.7
+    b.drivers["purchase_intent"] = 0.5  # neutral — no buying signal
+    out = gates.close_floor(Decision(act="attempt_close", tier="trial", rationale="push"), b, cfg)
+    assert out.act != "attempt_close"
+
+
+def test_close_floor_allows_close_when_discovery_happened():
+    """Once a real discovery slot is filled, the close is EARNED and the floor leaves it alone."""
+    cfg = make_config(discovery_slots_before_close=1)
+    b = BeliefState.fresh()
+    b.drivers["purchase_intent"] = 0.4  # not yet ready, but discovery has happened
+    fill_slot(b, "grade_level", "11", 0.95)
+    out = gates.close_floor(Decision(act="attempt_close", tier="consultation"), b, cfg)
+    assert out.act == "attempt_close" and out.tier == "consultation"
+
+
+def test_close_floor_allows_close_on_readiness_signal():
+    """A genuinely hot prospect (purchase_intent above the neutral prior) can close even before a slot
+    is recorded — the agent can read readiness directly; the floor only blocks BLIND closes."""
+    cfg = make_config(discovery_slots_before_close=1)
+    b = BeliefState.fresh()
+    b.drivers["purchase_intent"] = 0.82  # explicit buying signal
+    out = gates.close_floor(Decision(act="attempt_close", tier="enrollment"), b, cfg)
+    assert out.act == "attempt_close" and out.tier == "enrollment"
+
+
+def test_close_floor_exempts_free_callback_rung():
+    """The free callback rung is never pushy — the floor never blocks it (even closing blind)."""
+    cfg = make_config(discovery_slots_before_close=1)
+    b = BeliefState.fresh()  # no discovery, no readiness
+    out = gates.close_floor(Decision(act="attempt_close", tier="callback"), b, cfg)
+    assert out.act == "attempt_close" and out.tier == "callback"

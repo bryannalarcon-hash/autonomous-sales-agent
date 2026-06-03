@@ -48,6 +48,9 @@ export interface Turn {
   rationale: string | null;
   latency_ms: number | null;
   belief: BeliefSnapshot | null;
+  // CB-28: the KB facts ("[source] text") that grounded a tool-use answer; null on non-tool turns.
+  // When present, the Review page makes the turn clickable into a panel of what was pulled.
+  retrieved?: string[] | null;
 }
 
 /** A summary row for the Calls list (P3) / Live tile — no transcript body. */

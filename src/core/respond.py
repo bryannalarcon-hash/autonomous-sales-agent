@@ -8,6 +8,9 @@
 # TIMING: each of the three stages is wrapped in time.perf_counter() and the breakdown (dst/policy/nlg
 # + total) is attached to decision.meta["timings"] and logged once per turn on the "brain.timing"
 # logger — so per-turn AND per-model-call latency is measurable on both the text and voice paths.
+# CB-28: on a TOOL-USE act (answer_via_kb) grounded in retrieved_facts, the grounding facts are also
+# stamped on decision.meta["retrieved"] (JSON-able strings) so the runtime can persist them onto
+# Turn.retrieved and Call Review can show WHAT information was pulled for that answer.
 from __future__ import annotations
 
 import logging
@@ -25,6 +28,10 @@ from src.core.policy import Decision, decide
 # dominated by exactly ONE LLM round-trip (the slot/gate/trend work between calls is sub-millisecond),
 # so a stage's time IS that model call's latency. Filter/route via logging.getLogger("brain.timing").
 _timing_log = logging.getLogger("brain.timing")
+
+# CB-28: acts that GROUND their reply in retrieved KB facts (tool-use). Only these capture the
+# retrieved payload onto decision.meta["retrieved"] for Call Review's tool-use inspection panel.
+_TOOL_ACTS = frozenset({"answer_via_kb"})
 
 
 def _last_agent_act(history: Optional[Sequence[Any]]) -> Optional[str]:
@@ -81,6 +88,18 @@ async def respond(
     # escalation streak (escalation_imminent is set inside the gates when an EXTREME trigger fires).
     if decision.confidence is not None:
         new_belief.decision_confidence = float(decision.confidence)
+
+    # CB-28: when this turn is a TOOL-USE act (answer_via_kb) grounded in retrieved facts, capture
+    # the facts that grounded it on decision.meta["retrieved"] (JSON-able strings) so the runtime can
+    # persist them onto Turn.retrieved and Call Review can show WHAT was pulled. Stamped only for the
+    # grounded-answer act so non-tool turns stay clean; str()-ing the chunks keeps it transport- and
+    # DB-agnostic (a Chunk str()s to "[source] text"; a plain str passes through). Best-effort: a
+    # non-iterable / unstringifiable facts payload is dropped rather than crashing the turn.
+    if decision.act in _TOOL_ACTS and retrieved_facts:
+        try:
+            decision.meta["retrieved"] = [str(f) for f in retrieved_facts]
+        except TypeError:
+            pass
 
     reply_text = await realize(
         decision, new_belief, config, llm_client, retrieved_facts=retrieved_facts

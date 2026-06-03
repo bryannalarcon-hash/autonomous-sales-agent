@@ -24,6 +24,13 @@
 // transcript, and shows a "Back to live" control; the operator stays on the finished call until they
 // explicitly dismiss it. The ended episode's detail persists because /api/live?episode_id=<id>
 // returns {active:false, episode:<detail>} for a terminal call (transcript never vanishes).
+// CB-21 (generation spinner + word streaming): the SSE also carries a "generating" event (emitted
+// before the brain composes a turn) and the committed reply text on each "turn" event. ActiveAgentTurn
+// renders a clearly-LABELED "Generating…" spinner during the compose window (a — so the ~6 s gap is
+// never blank) and then REVEALS the reply word-by-word (b — useWordReveal) until the snapshot catches
+// up. The reveal text is the REAL committed reply, shown incrementally on the demo SSE path; real-voice
+// token streaming (core LLM + LiveKit TTS streaming) is DEFERRED. Both reuse the existing `.lv-speak`
+// dots + inline styles (no new cadence.css tokens).
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -85,6 +92,109 @@ function TranscriptTurn({ turn }: { turn: Turn }) {
         </div>
       ) : null}
       {isAgent && turn.rationale ? <div className="lv-rat">{`"${turn.rationale}"`}</div> : null}
+    </div>
+  );
+}
+
+/** CB-21(b): progressively reveal `text` word-by-word, restarting whenever `seq` changes (a new
+ *  agent reply arrived). Returns the substring revealed so far + whether it is still revealing. A
+ *  token-stream-like effect for the demo SSE path — the text is the REAL committed reply, just shown
+ *  incrementally; not fabricated. ~45 ms/word, capped so a long reply never reveals for too long. */
+function useWordReveal(text: string | null, seq: number): { shown: string; revealing: boolean } {
+  const [count, setCount] = useState(0);
+  const words = text ? text.split(/(\s+)/) : []; // keep whitespace tokens so spacing is preserved
+  const wordCount = text ? text.split(/\s+/).filter(Boolean).length : 0;
+
+  useEffect(() => {
+    if (!text) {
+      setCount(0);
+      return;
+    }
+    setCount(0);
+    let shownWords = 0;
+    const stepMs = Math.max(20, Math.min(60, 900 / Math.max(1, wordCount))); // total reveal ≤ ~0.9s
+    const id = setInterval(() => {
+      shownWords += 1;
+      setCount(shownWords);
+      if (shownWords >= wordCount) clearInterval(id);
+    }, stepMs);
+    return () => clearInterval(id);
+    // Restart only on a new reply (seq) — not on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seq, text]);
+
+  if (!text) return { shown: '', revealing: false };
+  // Rebuild the shown prefix from the word+whitespace token list up to `count` non-space words.
+  let seen = 0;
+  let out = '';
+  for (const tok of words) {
+    if (/\S/.test(tok)) {
+      if (seen >= count) break;
+      seen += 1;
+    }
+    out += tok;
+  }
+  return { shown: out, revealing: count < wordCount };
+}
+
+/** CB-21: the active agent turn at the bottom of a LIVE transcript. Shows a labeled "Generating…"
+ *  spinner while the brain composes, then reveals the just-arrived reply word-by-word, and falls back
+ *  to the bare pulsing dots when live without an explicit generation signal. Reuses the existing
+ *  `.lv-speak` dots (cadence.css) — label + reveal text are inline-styled, no new design tokens. */
+function ActiveAgentTurn({
+  generating,
+  streamReveal,
+  lastAgentText,
+}: {
+  generating: boolean;
+  streamReveal: { text: string; seq: number } | null;
+  // The text of the last committed agent turn in the snapshot — when it already equals the reveal
+  // text, the snapshot has caught up so we stop revealing (no duplicate bubble).
+  lastAgentText?: string | null;
+}) {
+  const { shown, revealing } = useWordReveal(streamReveal?.text ?? null, streamReveal?.seq ?? 0);
+  // Suppress the reveal once the snapshot's last agent turn already shows this exact reply (caught up).
+  const snapshotCaughtUp = !!streamReveal && lastAgentText === streamReveal.text;
+  // While a fresh reply is still revealing AND the snapshot hasn't caught up, show the typed words;
+  // otherwise the snapshot's full bubble already carries this turn, so we only need the spinner (when
+  // generating) or the idle dots.
+  const showReveal = !!streamReveal && revealing && shown.length > 0 && !snapshotCaughtUp;
+
+  return (
+    <div className="lv-turn a" data-testid="active-agent-turn">
+      <div className="lv-th">
+        Alex (agent)<span>·</span>
+        {generating ? 'generating…' : 'now'}
+      </div>
+      {showReveal ? (
+        // The reply text revealed so far (real committed text, shown incrementally) + a trailing caret.
+        <div className="lv-bub" data-testid="stream-reveal">
+          {shown}
+          <span aria-hidden style={{ opacity: 0.6 }}>▍</span>
+        </div>
+      ) : generating ? (
+        // Labeled generation indicator: the existing pulsing dots + an explicit "Generating…" caption
+        // so it can't be mistaken for an idle/stuck call (CB-21a priority).
+        <div
+          className="row gap8"
+          data-testid="generating-indicator"
+          style={{ alignItems: 'center', alignSelf: 'flex-end' }}
+        >
+          <span style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--text-3)' }}>Generating…</span>
+          <div className="lv-bub lv-speak" aria-label="Agent is generating a reply">
+            <i />
+            <i />
+            <i />
+          </div>
+        </div>
+      ) : (
+        // Idle live indicator (between turns / older backend with no "generating" event): bare dots.
+        <div className="lv-bub lv-speak">
+          <i />
+          <i />
+          <i />
+        </div>
+      )}
     </div>
   );
 }
@@ -259,11 +369,17 @@ function CallMonitor({
   onOpenReview,
   ended,
   onBackToLive,
+  generating,
+  streamReveal,
 }: {
   snap: LiveSnapshot;
   onOpenReview: (id: string) => void;
   ended?: boolean;
   onBackToLive?: () => void;
+  // CB-21(a): the agent is composing the next turn — render the labeled "Generating…" spinner.
+  generating?: boolean;
+  // CB-21(b): the latest committed reply text to reveal word-by-word on the active (demo) turn.
+  streamReveal?: { text: string; seq: number } | null;
 }) {
   const ep = snap.episode!;
   const lastBelief = [...ep.turns].reverse().find((t) => t.belief)?.belief ?? null;
@@ -370,17 +486,19 @@ function CallMonitor({
               {ep.turns.map((t) => (
                 <TranscriptTurn key={t.turn_id} turn={t} />
               ))}
+              {/* CB-21: the active-turn indicator on the agent side. While the brain is COMPOSING
+                  (generating), show a clearly-LABELED "Generating…" spinner so the ~6 s compose window
+                  is never a blank gap (a). Once a turn's text arrives, REVEAL it word-by-word (b) until
+                  the snapshot's full bubble takes over. Falls back to the bare pulsing dots when live
+                  but no explicit generation signal (older backend without the SSE "generating" event). */}
               {isLive ? (
-                <div className="lv-turn a">
-                  <div className="lv-th">
-                    Alex (agent)<span>·</span>now
-                  </div>
-                  <div className="lv-bub lv-speak">
-                    <i />
-                    <i />
-                    <i />
-                  </div>
-                </div>
+                <ActiveAgentTurn
+                  generating={!!generating}
+                  streamReveal={streamReveal ?? null}
+                  lastAgentText={
+                    [...ep.turns].reverse().find((t) => t.speaker === 'agent')?.text ?? null
+                  }
+                />
               ) : null}
               {/* CB-13: an unmistakable end-of-call marker at the BOTTOM of the transcript. Shown
                   only on the frozen ended view (never on a live/sample call). The outcome is the
@@ -508,6 +626,16 @@ export default function LivePage() {
   const [showSample, setShowSample] = useState(false);
   const [sampleSnap, setSampleSnap] = useState<LiveSnapshot | null>(null);
   const [sampleLoading, setSampleLoading] = useState(false);
+
+  // CB-21(a): the agent is COMPOSING the next turn — set by the SSE "generating" event (emitted
+  // before the ~6 s brain round-trip) and cleared by the matching "turn" event (or when the call
+  // ends / selection changes). Drives a clear "Generating…" spinner on the active turn so there is
+  // never a multi-second blank gap. Keyed nowhere — it always refers to the SELECTED call's stream.
+  const [generating, setGenerating] = useState(false);
+  // CB-21(b): the agent's freshly-committed reply text from the latest "turn" event, revealed
+  // word-by-word on the demo SSE path (a token-stream-like effect) before the snapshot's full bubble
+  // takes over. `seq` bumps each turn so the reveal animation restarts for each new reply.
+  const [streamReveal, setStreamReveal] = useState<{ text: string; seq: number } | null>(null);
 
   // "Run demo call" state — POSTs /api/demo/auto/start to launch a SERVER-SIDE demo call that runs
   // independent of the browser; the queue poll surfaces + auto-selects it. We only track the
@@ -715,11 +843,31 @@ export default function LivePage() {
 
     try {
       es = new EventSource(url);
-      // The backend emits a named "turn" event per committed turn and an "end" event at terminal.
-      es.addEventListener('turn', () => void refresh());
+      // CB-21(a): the agent started composing the next turn — show the "Generating…" spinner until
+      // the matching "turn" event lands (so the ~6 s brain compose window is never a blank gap).
+      es.addEventListener('generating', () => {
+        if (!cancelled) setGenerating(true);
+      });
+      // The backend emits a named "turn" event per committed turn (CB-12) carrying the just-composed
+      // reply text (CB-21b). Clear the spinner, kick a word-by-word reveal of that reply, then
+      // re-fetch the detail snapshot (the durable source of truth) which replaces the reveal.
+      es.addEventListener('turn', (ev) => {
+        if (cancelled) return;
+        setGenerating(false);
+        try {
+          const data = JSON.parse((ev as MessageEvent).data || '{}');
+          if (typeof data.text === 'string' && data.text) {
+            setStreamReveal((prev) => ({ text: data.text, seq: (prev?.seq ?? 0) + 1 }));
+          }
+        } catch {
+          /* malformed event data — the snapshot refresh below still renders the turn */
+        }
+        void refresh();
+      });
       es.addEventListener('end', () => {
         // Refresh once more so the final turn is on screen, then let the queue poll handle the
         // active->ended freeze (CB-13). Close the stream — nothing more will arrive.
+        if (!cancelled) setGenerating(false);
         void refresh();
         es?.close();
       });
@@ -734,6 +882,8 @@ export default function LivePage() {
 
     return () => {
       cancelled = true;
+      setGenerating(false);
+      setStreamReveal(null);
       es?.close();
     };
   }, [selectedEpisodeId, endedSnap]);
@@ -930,7 +1080,12 @@ export default function LivePage() {
           onSelect={setSelectedEpisodeId}
         />
       ) : null}
-      <CallMonitor snap={snap} onOpenReview={(id) => router.push(`/operate/review/${id}`)} />
+      <CallMonitor
+        snap={snap}
+        generating={generating}
+        streamReveal={streamReveal}
+        onOpenReview={(id) => router.push(`/operate/review/${id}`)}
+      />
     </div>
   );
 }

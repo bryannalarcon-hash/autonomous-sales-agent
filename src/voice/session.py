@@ -11,6 +11,10 @@
 # CONSENT/PII (U13): an optional ConsentGate gates handle_user_turn/commit_turn (no record/log
 # until consent allows); captured Turn.text is PII-scrubbed (scrub_pii) BEFORE it is stored; the
 # session carries the assigned sticky TTS voice (R3).
+# BELIEF PERSISTENCE (CB-23): every committed AGENT Turn carries its belief snapshot
+# (pending.new_belief.to_snapshot() — the SAME projection sim/text log per turn), so Call Review can
+# replay a voice call's trust/walk-away/stage trajectory. This is load-bearing: a turn committed with
+# an empty/None belief blanks the Review trajectory for voice calls, so commit_turn always attaches it.
 from __future__ import annotations
 
 import re
@@ -276,8 +280,14 @@ class VoiceSession:
             text=scrub_pii(pending.reply_text),  # scrub any echoed PII before storing (U13/R42)
             decision=pending.decision.act,
             rationale=pending.decision.rationale,
+            # CB-23: persist the per-turn belief snapshot (drivers + trends + stage) on every committed
+            # agent turn — the SAME to_snapshot() projection the sim/text path logs — so Call Review can
+            # replay the voice call's trust/walk-away trajectory (an empty belief here blanks Review).
             belief=pending.new_belief.to_snapshot(),
             kb_version=self.state.kb_version,
+            # CB-28: carry the KB facts that grounded a tool answer (answer_via_kb) so Call Review can
+            # show what was pulled; None on non-tool turns. Stamped on decision.meta by respond().
+            retrieved=(pending.decision.meta or {}).get("retrieved"),
             # Real measured turn latency from respond()'s stage timing (perf_counter) — feeds the live
             # monitor's per-turn latency, which was previously unpopulated for real calls.
             latency_ms=int(round(_timings["total_ms"])) if "total_ms" in _timings else None,

@@ -86,7 +86,8 @@ class Turn:
 
     Carries the transcript text, the agent's decision (next system act) + its one-line rationale
     (decision trace), the belief snapshot at that point, latency for the talk-listen / latency
-    panels, and a turn id so logs join transcript+decision+belief by turn (R26).
+    panels, the retrieved KB facts that grounded a tool-use answer (CB-28 tool-use inspection),
+    and a turn id so logs join transcript+decision+belief by turn (R26).
     """
 
     turn_id: int
@@ -101,6 +102,11 @@ class Turn:
     latency_ms: Optional[int] = None
     # Optional KB version actually queried this turn (U5 grounding pins it per-turn).
     kb_version: Optional[str] = None
+    # CB-28: the retrieved KB facts/chunks that GROUNDED this turn's answer (a tool-use act like
+    # answer_via_kb). Each entry is the str() of a Chunk ("[source] text") so Call Review can show
+    # WHAT was pulled when an operator clicks a tool turn. None on non-tool turns / when nothing was
+    # retrieved (so the Review panel only appears where information was actually pulled).
+    retrieved: Optional[list[str]] = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -111,6 +117,7 @@ class Turn:
     def from_dict(cls, data: dict[str, Any]) -> "Turn":
         data = dict(data or {})
         belief = data.get("belief")
+        retrieved = data.get("retrieved")
         return cls(
             turn_id=int(data["turn_id"]),
             speaker=str(data["speaker"]),
@@ -120,6 +127,7 @@ class Turn:
             belief=BeliefSnapshot.from_dict(belief) if belief else None,
             latency_ms=data.get("latency_ms"),
             kb_version=data.get("kb_version"),
+            retrieved=[str(f) for f in retrieved] if retrieved else None,
         )
 
 

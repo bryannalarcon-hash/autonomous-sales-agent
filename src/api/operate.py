@@ -14,6 +14,9 @@
 # CB-06: episode_detail adds "prospect_trajectory" — the prospect's TRUE hidden-driver arc per turn,
 # persisted by run_episode on sim/twin episodes; real (voice/text) episodes get [] so the frontend
 # panel can detect absence with a simple falsy check. Collaborators: src.sim.selfplay (writer).
+# CB-28: each serialized turn also carries "retrieved" — the KB facts/chunks that grounded a tool-use
+# answer (answer_via_kb), or None on non-tool turns — so Call Review can make a tool turn clickable
+# into a panel showing what information was pulled. Persisted on Turn.retrieved by the runtime.
 from __future__ import annotations
 
 import os
@@ -168,7 +171,9 @@ def _belief_to_dict(belief: Optional[BeliefSnapshot]) -> Optional[dict[str, Any]
 
 
 def _turn_to_dict(turn: Turn) -> dict[str, Any]:
-    """Serialize one turn: transcript text, labeled act (agent turns), rationale, belief."""
+    """Serialize one turn: transcript text, labeled act (agent turns), rationale, belief, and the
+    CB-28 retrieved facts that grounded a tool-use answer (None on non-tool turns so the Review page
+    only makes a turn clickable into the tool-use panel where information was actually pulled)."""
     return {
         "turn_id": turn.turn_id,
         "speaker": turn.speaker,
@@ -177,6 +182,8 @@ def _turn_to_dict(turn: Turn) -> dict[str, Any]:
         "rationale": turn.rationale,
         "latency_ms": turn.latency_ms,
         "belief": _belief_to_dict(turn.belief),
+        # CB-28: the KB facts/chunks ("[source] text") that grounded this turn's answer, or None.
+        "retrieved": list(turn.retrieved) if turn.retrieved else None,
     }
 
 

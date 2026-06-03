@@ -15,7 +15,10 @@
 # populates without a phone AND the demo survives the operator navigating away (it is not browser-bound);
 # GET /api/demo/auto/stream?episode_id=<id> (CB-12) is an SSE stream that emits a per-turn `turn` event
 # (and a terminal `end` event) so the live page appends turns in near-real-time instead of waiting on
-# its 5 s poll (which stays a fallback); /api/livekit/token (503 without creds) mints a
+# its 5 s poll (which stays a fallback); CB-21 adds a `generating` event emitted BEFORE each brain turn
+# (so the monitor shows a "Generating…" spinner during the ~6 s compose window) and rides the committed
+# reply text on the `turn` event so the monitor can REVEAL it word-by-word (a token-stream-like effect
+# on the demo path; real-voice token streaming is deferred); /api/livekit/token (503 without creds) mints a
 # token via the injected builder AND stamps the already-captured consent onto the room metadata
 # (consent_state/recording_granted/jurisdiction/phone_hash/conversable — no secrets) so the live
 # voice worker SEEDS its ConsentGate from it instead of deadlocking on a pending gate waiting for
@@ -483,6 +486,11 @@ def create_demo_router(
                 #    prospect turn + the agent's closing/confirming reply). The brain is REAL (no mock).
                 sess._speech_counter += 1
                 speech_id = f"s-{sess._speech_counter}"
+                # CB-21(a): signal that the agent is now COMPOSING this turn, BEFORE the ~6 s brain
+                # round-trip. The monitor shows a "Generating…" spinner on the active turn for the whole
+                # compose window (cleared by the matching "turn" event below) so there is never a
+                # multi-second blank gap that reads as the agent being stuck.
+                _publish_demo_event(ep_id, {"event": "generating", "turn": sess._speech_counter})
                 try:
                     pending = await vs.handle_user_turn(prospect_text, speech_id)
                 except ConsentError:
@@ -491,9 +499,16 @@ def create_demo_router(
                 decided = committed if committed is not None else pending
 
                 # Surface the call in the Live monitor (heartbeat upsert) + nudge SSE subscribers so
-                # the prospect+agent bubbles appear in near-real-time, not on the 5 s poll.
+                # the prospect+agent bubbles appear in near-real-time, not on the 5 s poll. CB-21(b):
+                # the agent's just-composed reply rides on the "turn" event so the monitor can REVEAL it
+                # word-by-word (a token-stream-like effect on the demo SSE path) instead of one batch.
+                # This is the REAL committed reply text (no fabrication); real-voice token streaming is
+                # deferred (it needs core LLM + LiveKit TTS streaming, outside this path).
                 await _live_upsert(sess)
-                _publish_demo_event(ep_id, {"event": "turn", "turn": sess._speech_counter})
+                _publish_demo_event(
+                    ep_id,
+                    {"event": "turn", "turn": sess._speech_counter, "text": decided.reply_text},
+                )
 
                 # 3. The prospect COMMITTED (the deterministic buy_gate fired in response to the agent's
                 #    close) or WALKED -> terminal. The agent's close already set last_close_tier (commit)

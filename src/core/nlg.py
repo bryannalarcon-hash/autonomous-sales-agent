@@ -4,6 +4,9 @@
 # for one concise spoken-style turn. If retrieved_facts is given (KB grounding, wired in U5), the
 # reply is constrained to those facts (state no fact absent from them). Decouples strategy (policy)
 # from surface text (CraigslistBargain policy<->NLG split). Pure + async, NO LiveKit imports.
+# CB-29 (no hallucinated slots): the system prompt ALWAYS carries a hard grounding rule forbidding the
+# agent from asserting any person/relationship/gender/grade/subject the DST has not confirmed; with no
+# confirmed student slot it must use neutral phrasing ("you"/"the learner"), never "your daughter".
 from __future__ import annotations
 
 from typing import Any, Optional, Sequence
@@ -38,9 +41,28 @@ _PERSONA_FALLBACK = (
     "educational, and concise. You speak in short, natural spoken sentences (this may be read aloud)."
 )
 
+# CB-29 (hallucinated slots): a HARD grounding rule that always applies. The agent invented a
+# "daughter"/"student" the caller never mentioned (and presumed a gender/grade/subject). It must
+# speak ONLY from the CONFIRMED belief slots (KNOWN_SO_FAR) + retrieved facts — never asserting a
+# person, relationship, gender, grade, subject, or any other detail the DST has not actually filled.
+# When there is no confirmed learner/student slot, use neutral phrasing ("you" / "the learner"),
+# never "your daughter"/"your son"/"your child"/"your student".
+_NO_HALLUCINATED_SLOTS = (
+    "GROUNDING RULE (do not break): speak ONLY from KNOWN_SO_FAR (the confirmed facts) and any "
+    "retrieved facts below. Do NOT invent or presume ANY detail the prospect has not stated — never "
+    "assert a child, son, daughter, student, their gender, their grade, their subject, or any "
+    "relationship that is not in KNOWN_SO_FAR. If no student/learner is named in KNOWN_SO_FAR, say "
+    "\"you\" or \"the learner\", never \"your daughter\"/\"your son\"/\"your child\"/\"your student\". "
+    "Ask, don't assume."
+)
+
 
 def _persona_system(config: AgentConfig) -> str:
-    """The persona system prompt: prefer the authored NLG prompt + persona, else a safe fallback."""
+    """The persona system prompt: prefer the authored NLG prompt + persona, else a safe fallback.
+
+    Always appends the CB-29 no-hallucinated-slots grounding rule LAST so it can't be overridden by
+    an authored prompt — the agent must never assert a person/relationship/grade the DST hasn't filled.
+    """
     persona = config.persona
     persona_line = (
         f"Your name is {persona.name}, a {persona.role}. Style: {persona.style}."
@@ -48,7 +70,9 @@ def _persona_system(config: AgentConfig) -> str:
         else ""
     )
     authored = config.prompts.get("nlg") or ""
-    base = "\n".join(p for p in (_PERSONA_FALLBACK, persona_line, authored) if p).strip()
+    base = "\n".join(
+        p for p in (_PERSONA_FALLBACK, persona_line, authored, _NO_HALLUCINATED_SLOTS) if p
+    ).strip()
     return base
 
 

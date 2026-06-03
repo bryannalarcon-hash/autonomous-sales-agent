@@ -70,34 +70,13 @@
 - **Refs:** `src/api/operate.py::live_snapshot` + `live_ep`; LiveKit Agents room/participant model + SIP dispatch (`scripts/setup_sip_dispatch.py`, rule `SDR_hKYQYAwz96uA`); the disabled take-over control (`web/app/operate/live/page.tsx`); R37 in `src/core/respond.py`.
 - **Take-over spec (user, 2026-06-02) — refines CB-01.c:** on "Take over", the AI must (1) be INTERRUPTED mid-conversation and (2) speak a DEFAULT TTS hand-off line (e.g. "Let me bring in a specialist to help — one moment. They may type some of their responses, so there might be a brief pause between answers."). Then the OPERATOR talks into their own device (browser mic / WebRTC into the call's LiveKit room) and is heard by the caller through the phone — operator audio is published as a room participant, NOT a dial-in (presume the operator is NOT calling from their own phone number, so no SIP bridge / caller-ID concerns). The agent stops auto-generating; the operator may ALSO TYPE responses that are TTS'd to the caller ("the agent might be typing their responses"). So take-over = interrupt + disclosure TTS + operator mic→room audio + optional operator-typed→TTS, with the AI yielded. Consent/recording state must carry over; respect R37 (don't fork the brain — the brain just stops).
 
-### CB-10 — Incoherent seed/sim episodes (terminal outcome ≠ transcript)
-- **Type / Surface / Size:** bug · `data` (seed/sim episodes) · `/operate/calls` · `/operate/review` · M
-- **Prereqs:** —
-- **Important files (candidates):** the seeded sim batch + `scripts/seed_demo.py` (escalation-coherence precedent), `src/sim/selfplay.py::run_episode` (produces coherent arcs), `src/memory/store.py` (query/purge).
-- **Current:** legacy 3-turn sim seed episodes carry a generic discovery transcript (greeting → "My son needs help with SAT math." → "What score is he aiming for?") but a MISMATCHED terminal outcome. Confirmed on `ep-98b95465e9ec456d9dab1ffa80eff9c5` (channel=sim, cohort `coh-cda860a7`, **outcome=enrolled, 3 turns, no close in the transcript**). The user: "says it hit enrollment but the transcript shows nothing." New live/demo calls (CB-08) are already coherent — this is only the old seeded stubs.
-- **Desired:** every episode shown in Calls/Review has transcript↔outcome coherence (a terminal outcome's transcript actually reaches that close). Either REGENERATE the demo dataset via real self-play (`run_episode`, which now reliably closes — CB-03) and replace the 3-turn stubs, or PURGE the incoherent stubs. (DB DELETE/regenerate needs explicit user authorization.)
-- **Acceptance:** no episode in the Calls list shows a terminal outcome (enrolled/consult_booked/…) whose transcript never reaches a close; spot-check ≥10 seeded episodes.
-- **Refs:** `ep-98b95465…` (the reported case); `scripts/seed_demo.py`; `src/sim/selfplay.run_episode`; CB-03 (self-play now reaches realistic closes).
-
-### CB-18 — Empty escalations keep reappearing (23 orphan `ep-esc-` rows, no moment)
-- **Type / Surface / Size:** bug · `data` (escalations) · `/operate/escalations` · M
-- **Prereqs:** —
-- **STATUS (2026-06-02):** CODE DONE — `handle_escalation` now backfills a blank `moment` (→ deferral line/reason) so no future contentless row can be created, + regression test (`test_escalation.py`, 7 pass). Confirmed lifecycle review ALREADY persists (`store.update_escalation_lifecycle` + `POST /api/escalations/{id}/lifecycle`), so "reappearing" = the legacy orphans, not a persist bug. **PENDING:** one-time purge of 30 `ep-esc-`/empty rows (dry-run confirmed: 30 deleted, 48 real remain) — awaiting explicit DB-delete authorization.
-- **Important files (candidates):** `src/voice/escalation.py::handle_escalation` (builds the log; stores whatever `episode_id`/`moment` it's handed), `scripts/seed_demo.py` (PURGES + reseeds 48 COHERENT escalations — its purge clearly isn't catching these), `src/memory/store.py` (escalation list/purge), the escalation review/lifecycle persistence path.
-- **Current:** the review queue has **23 escalations** (incl. the user's `esc-b4cf1626056a46eb9497874d06226a6c`) that all share: `episode_id="ep-esc-<uuid>"` (a synthetic episode that is NOT a real call), reason "explicit human request; deferring to a specialist", and an **empty `moment`** (no trigger quote) → they render as empty/contentless rows. 22 are `unreviewed`, 1 `resolved`. **No current source code (src/ or scripts/) generates `ep-esc-` ids or empty-moment escalations** — they are LEGACY/ORPHAN DB rows from a removed path; they coexist with seed_demo's 48 coherent ones (48 + 23 = 71). "Keep reappearing" → likely the escalation review/lifecycle change isn't persisted (reverts to unreviewed on refresh, same class of bug as CB-17) OR a re-seed re-adds them.
-- **Desired:** (1) find why they reappear — confirm whether marking an escalation reviewed/resolved PERSISTS to the DB (if not, fix it); (2) PURGE the 23 orphan empty-moment / `ep-esc-` escalations (DB delete — needs explicit user authorization); (3) ensure nothing recreates contentless escalations — `handle_escalation` should never persist an empty `moment` (skip or backfill the trigger turn), and `seed_demo`'s purge should cover ALL escalations.
-- **Acceptance:** zero escalations with an empty `moment` or an `ep-esc-` (non-call) episode id in the queue; reviewing/resolving one sticks across a refresh; a fresh seed run leaves only coherent escalations.
-- **Refs:** `esc-b4cf1626…` + 22 siblings (reason "explicit human request; deferring to a specialist", empty moment, `ep-esc-` episode ids); `src/voice/escalation.py`; `scripts/seed_demo.py` purge; CB-17 (same revalidation/persistence theme).
-
-### CB-20 — Remove stuck/mock experiments (drafts stuck "running" forever)
-- **Type / Surface / Size:** bug · `data` (experiments) · `/improve/lab` · S/M
-- **Prereqs:** related to CB-15 (root cause of the stuck state)
-- **STATUS (2026-06-02):** CODE DONE (via CB-15) — a run can no longer linger `running`: the background task settles every run to a terminal state (`_settle_failed_run` → `rejected` on timeout/crash), verified (`verify-async` settled to `rejected`). **PENDING:** one-time purge of the 2 zombie `DRAFT-*` running rows (`…playbooks_discovery_sequence__0` + `…playbooks_rebuttals__0`) — awaiting explicit DB-delete authorization.
-- **Important files (candidates):** `src/api/improve.py` (run/persist + state transitions; the `DRAFT-champion_v0_*` records), `src/memory/store.py` (experiment list/delete), `web/app/improve/lab/page.tsx` (state chips + the "running" card).
-- **Current:** the lab shows experiments stuck in `running` that never settle — confirmed: of 4 experiment records, TWO are `running` drafts that never completed: "KB edit · Competitor comparisons" (created **2026-06-01**, "running all day") and a bare "draft" (2026-06-02 21:32); the rebuttal/KB-edit dimension renders as **"Objection rebuttals"** (the user's report). They look like mock/zombie runs because a synchronous run (CB-15) started, never finished, and left a `running` `DRAFT-*` row with no terminal state.
-- **Desired:** remove the stuck/mock experiment records (DB delete needs explicit user authorization), and ensure a run can NEVER linger in `running` forever — on completion/timeout/crash it must settle to a terminal state (passed/blocked/rejected/failed) or be cancellable (depends on CB-15 backgrounding). No perpetual "running" chips.
-- **Acceptance:** no experiment sits in `running` longer than a real run takes; the two zombie `DRAFT-*` rows are gone; a failed/timed-out run shows a clear terminal/failed state, not an eternal spinner.
-- **Refs:** the 2 stuck `DRAFT-champion_v0_*` running records (Jun 1 + Jun 2); `src/api/improve.py` run state transitions; CB-15 (sync run freeze — same root); `src/api/labels.py:121` (`playbooks.rebuttals` → "Objection rebuttals").
+### CB-30 — (future) Golden-set capture of real conversations
+- **Type / Surface / Size:** feature · `data` · M
+- **Prereqs:** CB-22 + CB-23 (call logging + belief persistence must work first)
+- **Current:** the user wants to record a few real conversations as a GOLDEN SET to calibrate/work from — but only once call logging (CB-22) + per-turn belief (CB-23) are verified, so the captured calls are complete + coherent.
+- **Desired:** a way to mark/flag a real call as "golden" and export the set (transcript + belief trajectory + outcome) for use as a calibration reference / replay seed.
+- **Acceptance:** an operator can tag a real call as golden; the golden set is exportable + replayable.
+- **Refs:** user "record a couple of conversations down the line as a golden set"; depends on CB-22/CB-23; the replay/twin harness (CB-06 era).
 
 ---
 
@@ -219,3 +198,37 @@
 - **Verification:** tsc exit 0; re-ran `tests/e2e/verify_cb05_cb06_screens.py` on a sim episode — review-page `leaked_slugs=[]` (was `['bail_risk']`), panel present (sim) / absent (voice), 0 JS errors; agent's deterministic humanizer check over all 8 gate rationales + both diff shapes leaked nothing.
 - **Constraints checked:** render-boundary only (logs keep raw); Cadence tokens; no layout change; longest-first regex so `bail_risk_velocity` beats `bail_risk`.
 - **Follow-ups:** none.
+
+### CB-18 — Empty escalations purged + guard (no more contentless rows)
+- **Completed:** 2026-06-02
+- **Code (committed 8e98da5):** `handle_escalation` backfills a blank `moment` (deferral line → reason) so no contentless escalation can be persisted again; regression test in `tests/integration/test_escalation.py` (7 pass). Lifecycle review already persisted (`store.update_escalation_lifecycle`).
+- **Data (purged, authorized 2026-06-02):** `DELETE FROM escalation_log WHERE episode_id LIKE 'ep-esc-%' OR moment IS NULL OR btrim(moment)=''` → **30 deleted**; **48 real escalations remain**, **0 empty/orphan left**.
+- **Verification:** dry-run before delete (30 matched, 48 real untouched); post-delete recount = 0 orphans. seed_demo's `DELETE FROM escalation_log` already covers all on re-seed.
+
+### CB-20 — Stuck experiments purged + terminal-state guard
+- **Completed:** 2026-06-02
+- **Code (committed 8e98da5, via CB-15):** a run can no longer linger `running` — the background task settles every run to terminal (`_settle_failed_run` → `rejected` on timeout/crash). Verified `verify-async` → `rejected`.
+- **Data (purged, authorized 2026-06-02):** `DELETE FROM experiment WHERE experiment_id LIKE 'DRAFT-%' AND state='running'` → **2 deleted** (the Jun-1 "KB edit · Competitor comparisons" + Jun-2 rebuttals draft). **0 running experiments left** (3 total: rejected/promoted/the settled verify-async).
+
+### CB-10 — Incoherent seed/sim episodes — purged short mock stubs (option A)
+- **Completed:** 2026-06-02
+- **Decision:** full regeneration (~3,098 paid self-play episodes) DECLINED by user; chose option A — purge the short mock-LLM stubs (no LLM spend).
+- **Root cause (for the record):** ~2,625 of 3,206 sim episodes were ≤4-turn MOCK-LLM self-play stubs (e.g. greeting → "My son needs help with SAT math." → "What score…", outcome `enrolled`; or greeting → "I'm done here — I've got to go.", outcome `walked` on a qualified persona). The transcript came from a mock LLM (degenerate), but the OUTCOME fired honestly from the deterministic buy-gate on the persona's true drivers → outcome ≠ transcript. Aggregate KPIs stayed honest (computed from outcomes); only individual short-call review was incoherent.
+- **Data (purged, authorized 2026-06-02):** `DELETE FROM episode WHERE channel='sim' AND jsonb_array_length(turns)<=4` → **2,625 deleted** (FK `escalation_log → episode ON DELETE CASCADE`; 0 of the 48 real escalations referenced them, so the queue is untouched). Episodes 4,334 → **1,709** (656 voice · 581 sim · 472 text); 0 incoherent ≤4-turn sims remain.
+- **Verification:** post-delete recount confirms 0 sim episodes with ≤4 turns; escalations intact (48); remaining sims are the coherent ≥5-turn (mostly 6–19) real/post-CB-03 runs.
+- **Follow-ups:** new sims (CB-03/CB-12 real-brain self-play) are coherent by construction, so this won't recur. If the KPI sample feels thin later, a SMALL coherent regen (option C) is the no-mass-spend path.
+
+### CB-21/22/23/24/25/26/27/28/29 — Wave 2 batch (3 parallel coders + orchestrator)
+- **Completed:** 2026-06-03
+- **Verification (shared):** `.venv` suite **474 passed / 5 skipped** (≈36 new tests); `web` tsc exit 0; API + worker restarted; integration screenshots (`tests/e2e/verify_wave2.py`, `/tmp/cb_wave2/*`) all PASS, 0 JS errors; a fresh real-LLM sim + a fresh experiment exercised the new paths.
+- **CB-22** (voice call not logged) — `worker.py`: `_terminal_outcome_on_disconnect` rewritten + `_agent_acts()` scans EVERY committed act; a disconnect now always settles terminal (escalated→`escalated`, else `released`/`abandoned`; a real close keeps its booking) — never in_progress. Tests: `test_disconnect_outcome.py` (14 cases) + `test_worker.py` (escalate-then-continue). *(Legacy row `ep-eba52675` left in_progress — classifier blocked the one-off repair; all future calls log.)*
+- **CB-23** (voice belief) — found ALREADY correct (voice turns persist belief; the call was just unreachable while in_progress — CB-22 restores it); hardened `session.py` + 3 round-trip tests.
+- **CB-21** (spinner + streaming) — live monitor shows a "Generating…" spinner during compose + word-by-word reveal; demo SSE emits a `generating` event. Real-voice token streaming DEFERRED (needs a streaming `respond()` in R37-locked `src/core` + LiveKit TTS chunking).
+- **CB-24** (failure reason) — `improve.py` background run captures a specific reason (timeout vs exception class); lab card + drawer surface `guardrail_reason`. Verified: `w2-detail` → `rejected` "no significant lift…" shown.
+- **CB-25** (experiment detail) — new `GET /api/experiments/{id}` persists per-arm episodes (`{id}::{arm}::{i}`); new `/improve/lab/[id]` page with a "See experiment" button shows both arms' calls (verified 5 champion + 5 challenger), each deep-linking to Review.
+- **CB-26** (metric explainer) — a "?" beside each metric expands a value→behavior band chart (human text, no slug).
+- **CB-27** (multi-metric) — RunDrawer CSV-like grid (+/− rows); `generator.build_multi_challenger`; `improve.py` `changes` list; R19 single-dimension relaxed for MANUAL experiments only (default preserved).
+- **CB-28** (tool-use inspection) — `Turn.retrieved` (schema) populated in `respond()` on `answer_via_kb`, wired through `selfplay.py` + `session.py` Turn construction, exposed in `episode_detail`, rendered as a clickable "N sources" panel in Review (verified `retrieved` key present on all serialized turns, null on non-tool).
+- **CB-29** (agent quality) — `nlg.py` hard no-hallucinated-slots rule (never invents a daughter/student/grade not in confirmed slots); `gates.py` `close_floor` backs off a blind/pushy `attempt_close` (paid tier, no discovery, intent at prior); `address_direct_input` for the ignored-question case. Tests incl. an `ep-eba52675`-shaped replay (no "daughter", question acknowledged, no early close). Buy-gate + R37 intact. Verified: fresh sim showed NO invented child.
+- **Files:** `worker.py`, `session.py`, `demo_routes.py`, `operate/live/page.tsx`, `improve.py`, `improve/lab/page.tsx` + new `improve/lab/[id]/page.tsx`, `improve-api.ts`, `improve-types.ts`, `generator.py`, `schema.py`, `respond.py`, `gates.py`, `nlg.py`, `operate.py`, `operate/review/[id]/page.tsx`, `operate-types.ts`, `selfplay.py` + tests.
+- **Follow-ups:** CB-21(b) real-voice token streaming; legacy `ep-eba52675` row repair (optional); `experiment_record_from` collapses a settled multi-metric `declared_diff` to `["multi"]` (cosmetic; `diff_description` still lists all).

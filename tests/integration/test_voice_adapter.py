@@ -293,6 +293,91 @@ async def test_per_turn_capture_keyed_by_speech_id_with_version_stamp():
     assert session.speech_id_for_turn(captured) == sid
 
 
+# =============================== PER-TURN BELIEF PERSISTENCE (CB-23) =============================
+# CB-23: every committed voice agent Turn must carry its belief snapshot (drivers + trends + stage),
+# the SAME way the sim/text path does (selfplay logs belief.to_snapshot() per agent turn) — so Call
+# Review can replay the trust/walk-away trajectory of a voice call. These lock that parity in the
+# .venv suite (no livekit needed): a snapshot that silently went empty would make Review show a blank
+# belief trajectory for voice calls (the reported symptom), which these would catch.
+
+from src.api.operate import _belief_to_dict  # noqa: E402  (deferred so the helpers above are defined)
+from src.core.belief_state import DRIVERS  # noqa: E402
+from src.memory.schema import Turn  # noqa: E402
+
+
+async def test_committed_voice_turn_carries_nonempty_belief():
+    """A committed voice AGENT turn carries a NON-EMPTY belief snapshot: all six latent drivers, the
+    derived velocity trends, and a stage — never the empty/None belief that would blank the Review
+    trajectory. This is the CB-23 guarantee for a fresh (voice-ish) committed turn."""
+    session = _make_session()
+    sid = "belief-1"
+    await session.handle_user_turn("How much does the tutoring cost per month?", sid)
+    committed = session.commit_turn(sid)
+    assert committed is not None
+
+    agent_turn = session.turn_for_speech_id(sid)
+    assert agent_turn is not None and agent_turn.speaker == "agent"
+    snap = agent_turn.belief
+    # The crux: the snapshot exists AND its drivers are populated (NOT None / empty).
+    assert snap is not None, "committed voice agent turn has no belief snapshot (CB-23 regression)"
+    assert snap.drivers, "belief.drivers is empty — Review would show no trust/walk-away (CB-23)"
+    # All six canonical drivers are present (parity with the sim path's to_snapshot()).
+    for d in DRIVERS:
+        assert d in snap.drivers, f"driver {d!r} missing from the committed voice turn's belief"
+    # The prioritized live-monitor signals (trust + walk-away/bail_risk) are real numbers in [0,1].
+    assert 0.0 <= float(snap.drivers["trust"]) <= 1.0
+    assert 0.0 <= float(snap.drivers["bail_risk"]) <= 1.0
+    # Derived velocity trends + a dialogue stage travel too (the full Review/live shape).
+    assert snap.trends, "belief.trends is empty — the velocity badges would be blank"
+    assert snap.stage
+
+
+async def test_voice_turn_belief_round_trips_and_maps_to_review_drivers():
+    """The committed voice turn's belief survives the persistence serialization (Turn.to_dict ->
+    Turn.from_dict, the exact round-trip store.save_episode/get_episode performs) AND maps to a
+    NON-EMPTY primary_drivers list via the operate review serializer — so the Call Review page shows
+    per-turn trust/walk-away for a voice call (CB-23 acceptance)."""
+    session = _make_session()
+    sid = "belief-2"
+    await session.handle_user_turn("What results do other families see?", sid)
+    session.commit_turn(sid)
+    agent_turn = session.turn_for_speech_id(sid)
+    assert agent_turn is not None
+
+    # Round-trip through the schema serialization the store uses to persist/read episodes.
+    rehydrated = Turn.from_dict(agent_turn.to_dict())
+    assert rehydrated.belief is not None
+    assert rehydrated.belief.drivers, "belief.drivers empty after to_dict/from_dict round-trip (CB-23)"
+
+    # The operate review serializer turns it into the primary_drivers list the page renders. It must be
+    # non-empty AND include trust + bail_risk (the two prioritized signals the Review/live show).
+    bd = _belief_to_dict(rehydrated.belief)
+    assert bd is not None
+    keys = {d["key"] for d in bd["primary_drivers"]}
+    assert "trust" in keys and "bail_risk" in keys, (
+        "Review primary_drivers missing trust/bail_risk for a voice turn (CB-23)"
+    )
+
+
+async def test_voice_belief_persistence_matches_sim_path():
+    """PARITY: a voice committed turn's belief snapshot and the sim path's belief snapshot are produced
+    by the SAME projection (BeliefState.to_snapshot), so a voice turn is no less populated than a sim
+    turn. We assert the voice snapshot carries the full driver set the sim selfplay logs per turn."""
+    session = _make_session()
+    sid = "belief-3"
+    pending = await session.handle_user_turn("Hi, my daughter needs help with algebra.", sid)
+    session.commit_turn(sid)
+    agent_turn = session.turn_for_speech_id(sid)
+    assert agent_turn is not None and agent_turn.belief is not None
+
+    # The committed Turn's belief is EXACTLY pending.new_belief.to_snapshot() (the same call the sim
+    # path makes via selfplay._belief_snapshot). Same keys, same values -> same Review fidelity.
+    expected = pending.new_belief.to_snapshot()
+    assert agent_turn.belief.drivers == expected.drivers
+    assert agent_turn.belief.trends == expected.trends
+    assert agent_turn.belief.stage == expected.stage
+
+
 # =============================== INTENT-GATED RAG ================================================
 
 

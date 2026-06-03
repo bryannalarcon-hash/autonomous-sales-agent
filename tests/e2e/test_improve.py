@@ -42,6 +42,9 @@ class FakeImproveStore:
         # each entry is {"source": "<section>#<id>", "text": ...}. Lets /api/kb return real grouped
         # sections DB-free (the default fakes pass None -> the empty-corpus path).
         self._kb_chunks = kb_chunks or []
+        # CB-25: the per-arm A/B "mock call" episodes a run persists (so the detail page + Review can
+        # read them), keyed by episode_id — mirrors the Postgres episode table DB-free.
+        self._episodes: dict[str, Any] = {}
 
     async def list_experiments(
         self, *, state: Optional[str] = None, limit: int = 200
@@ -84,6 +87,14 @@ class FakeImproveStore:
             ({"source": c["source"], "text": c["text"]} for c in rows),
             key=lambda c: c["source"],
         )
+
+    async def save_episode(self, episode: Any) -> str:
+        # CB-25: persist a per-arm A/B episode (mirrors store.save_episode, DB-free).
+        self._episodes[episode.episode_id] = episode
+        return episode.episode_id
+
+    async def get_episode(self, episode_id: str) -> Optional[Any]:
+        return self._episodes.get(episode_id)
 
 
 def _exp(
@@ -470,6 +481,188 @@ async def test_run_experiment_n_floor_is_raised_above_one():
         await _settle(ac, exp["experiment_id"])
 
 
+# =============================== CB-24 — SPECIFIC FAILURE REASON =================================
+# A rejected/failed run must explain WHY in a SPECIFIC way (the user's "failed without telling me why"):
+# a timeout names the elapsed budget; a crash names the exception class — never the generic
+# "timed out or failed". (The timeout case is covered above; this covers the exception class.)
+
+
+def _crashing_runner():
+    """A runner that raises a distinctively-named exception, so the settled record's reason names that
+    class (CB-24) instead of the generic failure string."""
+
+    class ArmRunnerBoom(RuntimeError):
+        pass
+
+    async def runner(personas, agent_llm_factory, prospect_llm_factory, config, **kw):
+        raise ArmRunnerBoom("simulated self-play crash")
+
+    return runner
+
+
+async def test_run_experiment_crash_settles_with_exception_class_reason():
+    """CB-24: a background run that raises settles `rejected` with a reason naming the EXCEPTION CLASS
+    (so the lab shows what went wrong), not the generic 'timed out or failed'."""
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+    app, _ = _run_app(runner=_crashing_runner(), run_timeout_s=5.0)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6},
+        )
+        assert r.status_code == 202, r.text
+        settled = await _settle(ac, r.json()["experiment"]["experiment_id"])
+    assert settled["state"] == "rejected"
+    reason = (settled["guardrail_reason"] or "").lower()
+    assert "failed with an error" in reason
+    assert "armrunnerboom" in reason  # the distinct exception class name, not a generic phrase
+
+
+# =============================== CB-25 — EXPERIMENT DETAIL + A/B MOCK CALLS ======================
+# Clicking "See experiment" opens a detail page listing the champion-arm + challenger-arm self-play
+# episodes (the mock calls), each openable in Review. GET /api/experiments/{id} returns the experiment
+# DTO + the per-arm episode summaries (deterministic experiment-scoped ids the run persisted).
+
+
+async def test_experiment_detail_lists_per_arm_ab_mock_calls():
+    """CB-25: after a run settles, GET /api/experiments/{id} returns BOTH arms' mock calls — the
+    champion-arm + challenger-arm episodes the A/B ran — each with an episode_id Review can open. The
+    arm ids are deterministic + experiment-scoped, and each persisted episode is fetchable in Review
+    via the existing /api/episodes/{id} route."""
+    app, store = _run_app()  # the dominating runner -> tier-0 champion, tier-4 challenger
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 6},
+        )
+        exp_id = r.json()["experiment"]["experiment_id"]
+        await _settle(ac, exp_id)
+        detail = (await ac.get(f"/api/experiments/{exp_id}")).json()
+    # the experiment DTO is present, plus both arms' calls.
+    assert detail["experiment"]["experiment_id"] == exp_id
+    assert detail["has_calls"] is True
+    assert len(detail["champion_calls"]) == 6
+    assert len(detail["challenger_calls"]) == 6
+    # the arm ids are experiment-scoped + deterministic (so Review can deep-link them).
+    assert all(exp_id in c["episode_id"] for c in detail["champion_calls"])
+    assert all("champion" in c["episode_id"] for c in detail["champion_calls"])
+    assert all("challenger" in c["episode_id"] for c in detail["challenger_calls"])
+    # the per-arm outcome differs (dominating runner): champion walked tier-0, challenger enrolled tier-4.
+    assert detail["champion_calls"][0]["ladder_tier"] == 0
+    assert detail["challenger_calls"][0]["ladder_tier"] == 4
+    # the arm episodes are PERSISTED to the store (so the existing /api/episodes/{id} route — which
+    # Review reads via the SAME store in the full app — can open each in Review).
+    one = detail["challenger_calls"][0]["episode_id"]
+    assert one in store._episodes
+    assert store._episodes[one].cohort == "experiment_challenger"
+
+
+def test_experiment_detail_unknown_id_404():
+    """CB-25: an unknown experiment id is a 404, not a crash or an empty 200."""
+    client = _seeded_client()
+    r = client.get("/api/experiments/NOPE")
+    assert r.status_code == 404, r.text
+
+
+def test_experiment_detail_seeded_experiment_has_no_persisted_calls():
+    """CB-25: a seeded/legacy experiment whose run never persisted arm episodes returns empty arm lists
+    (has_calls False) rather than failing — the detail page shows the outcome/KPIs + reason, no calls."""
+    client = _seeded_client()
+    detail = client.get("/api/experiments/EXP-31").json()
+    assert detail["experiment"]["experiment_id"] == "EXP-31"
+    assert detail["champion_calls"] == []
+    assert detail["challenger_calls"] == []
+    assert detail["has_calls"] is False
+
+
+# =============================== CB-27 — MULTI-METRIC EXPERIMENTS ================================
+# An experiment may change MORE THAN ONE knob at once (explicit opt-in via `changes`). This relaxes the
+# single-dimension R19 invariant for MANUAL experiments; the challenger applies ALL rows, and the lab
+# shows the multi-change diff labeled "Multiple changes" (never a raw "multi" sentinel).
+
+
+async def test_run_multi_metric_experiment_applies_all_changes():
+    """CB-27: a `changes` list applies several knob edits to the challenger at once. The settled record
+    shows it ran (a real before/after) and labels the diff "Multiple changes" — no raw sentinel."""
+    app, store = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={
+                "changes": [
+                    {"dimension": "thresholds.pushiness_cap", "value": 0.5},  # champion 0.7
+                    {"dimension": "thresholds.discovery_slots_required", "value": 4},
+                ],
+                "n": 6,
+            },
+        )
+        assert r.status_code == 202, r.text
+        exp = r.json()["experiment"]
+        # the diff label is human, never the raw "multi" sentinel or a snake_case slug.
+        assert exp["dimension_label"] == "Multiple changes"
+        assert "_" not in exp["dimension_label"]
+        # the description names every changed knob's new value.
+        assert "0.5" in exp["diff_description"]
+        assert "4" in exp["diff_description"]
+        await _settle(ac, exp["experiment_id"])
+
+
+async def test_run_multi_metric_with_pricing_row_is_extreme():
+    """CB-27: a multi-metric change that touches an EXTREME pricing knob is is_extreme True — even a
+    clean pass routes to the approval queue, not auto-promote (the human gate is not bypassed)."""
+    app, _ = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={
+                "changes": [
+                    {"dimension": "thresholds.pushiness_cap", "value": 0.5},
+                    {"dimension": "thresholds.max_concession_band", "value": 0.4},  # extreme
+                ],
+                "n": 6,
+            },
+        )
+        assert r.status_code == 202, r.text
+        exp_id = r.json()["experiment"]["experiment_id"]
+        assert r.json()["experiment"]["is_extreme"] is True
+        settled = await _settle(ac, exp_id)
+        assert settled["state"] == "blocked"
+
+
+async def test_run_multi_metric_all_no_op_rejected():
+    """CB-27: a `changes` set where every row matches the champion is a no-op -> 400 BEFORE any paid
+    run, nothing persisted (same boundary guard as the single-dimension path)."""
+    app, store = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"changes": [{"dimension": "thresholds.pushiness_cap", "value": 0.7}]},  # already 0.7
+        )
+        assert r.status_code == 400, r.text
+        assert store._experiments == {}
+
+
+async def test_run_single_metric_unchanged_default():
+    """CB-27: omitting `changes` keeps the single-dimension default path working unchanged — a one-knob
+    run still labels its real one-dimension change (not "Multiple changes")."""
+    app, _ = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "thresholds.pushiness_cap", "value": 0.5},
+        )
+        assert r.status_code == 202, r.text
+        exp = r.json()["experiment"]
+        assert exp["dimension"] == "thresholds.pushiness_cap"
+        assert exp["dimension_label"] != "Multiple changes"
+        await _settle(ac, exp["experiment_id"])
+
+
 # =============================== P6 — RUN IS ASYNC + BOUNDED + CONCURRENCY-GUARDED ===============
 # /api/experiments/run runs a full real self-play A/B in a BACKGROUND task (minutes, paid in prod). It
 # must (CB-15) return 202 immediately, (CB-20) never linger `running` — a timeout/crash settles the
@@ -518,7 +711,11 @@ async def test_run_experiment_returns_202_then_settles_terminal_on_timeout():
     assert settled["state"] in ("rejected", "blocked", "passed", "promoted")
     # a timed-out run settles failed-terminal with a clear reason (not a fabricated positive).
     assert settled["state"] == "rejected"
-    assert "did not complete" in (settled["guardrail_reason"] or "").lower()
+    # CB-24: the reason is SPECIFIC — a timeout names how long it ran before the budget tripped,
+    # not the generic "timed out or failed".
+    reason = (settled["guardrail_reason"] or "").lower()
+    assert "timed out after" in reason
+    assert "0.05s" in reason
 
 
 async def test_run_experiment_concurrent_run_returns_503():

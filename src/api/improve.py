@@ -5,7 +5,9 @@
 # the (paid, minutes-long) A/B in a BACKGROUND task that settles the SAME record to its terminal state
 # on completion/timeout/crash (CB-15/CB-20: the button never hangs and a run never lingers `running`
 # forever); POST /api/experiments/scaffold builds a draft experiment seeded from a reviewed call so the
-# review page can open a per-experiment review before running, CB-19), P7 Approval Queue (GET /api/approvals = experiments in
+# review page can open a per-experiment review before running, CB-19; GET /api/experiments/{id} returns
+# ONE experiment's detail + its A/B "mock calls" — the champion-arm + challenger-arm self-play episodes
+# the run persisted, each openable in Review, plus the failure reason, CB-24/CB-25), P7 Approval Queue (GET /api/approvals = experiments in
 # `blocked` state, plus POST .../approve -> promote the challenger to champion, POST .../reject), P8
 # KB/Playbook Editor (GET /api/kb returns the REAL grounded corpus from the kb_chunk table grouped by
 # section — the facts/objection-rebuttals the agent grounds answers on, NOT placeholder strings; GET
@@ -38,11 +40,14 @@ from src.config.settings import AgentConfig, load_config
 from src.core.llm import LLMClient
 from src.loop.experiment import experiment_record_from, frozen_held_out, run_experiment
 from src.loop.generator import (
+    apply_dimension_changes,
     build_challenger,
+    build_multi_challenger,
     declared_diff,
     mutate_threshold,
     reorder_discovery,
 )
+from src.memory.schema import Episode
 from src.loop.promotion import QUAL_TOLERANCE, PromotionDecision, evaluate_promotion
 from src.memory.schema import ExperimentRecord, VersionLineage
 
@@ -79,6 +84,15 @@ class ImproveStore(Protocol):
     # store does not implement it (e.g. a fake seeded only with experiments). The Postgres default
     # impl queries the kb_chunk table.
     async def list_kb_chunks(self, *, kb_version: str) -> list[dict[str, Any]]: ...
+
+    # CB-25: the A/B "mock calls" the experiment detail page lists are the per-arm self-play episodes
+    # the background run produced — persisted here so /operate/review/<id> can open each in Review.
+    # Both are OPTIONAL (the router guards with getattr): a fake store seeded only with experiments may
+    # omit them, in which case the run simply doesn't persist arm episodes and the detail page shows
+    # none. The Postgres default forwards to src.memory.store.save_episode / get_episode.
+    async def save_episode(self, episode: Episode) -> str: ...
+
+    async def get_episode(self, episode_id: str) -> Optional[Episode]: ...
 
 
 class _StoreBackedImproveStore:
@@ -127,6 +141,13 @@ class _StoreBackedImproveStore:
         )
         return [{"source": r["source"], "text": r["text"]} for r in rows]
 
+    async def save_episode(self, episode: Episode) -> str:
+        # CB-25: persist a per-arm A/B episode so the experiment detail page + Review can read it.
+        return await self._store.save_episode(episode)
+
+    async def get_episode(self, episode_id: str) -> Optional[Episode]:
+        return await self._store.get_episode(episode_id)
+
 
 async def _collect_lineage(
     store: "ImproveStore", start_version: str, *, limit: int = 200
@@ -173,9 +194,14 @@ def experiment_to_dict(exp: ExperimentRecord) -> dict[str, Any]:
         "guardrail_reason": exp.guardrail_reason,
         "champion_qual_acc": round(exp.champion_qual_acc, 4),
         "challenger_qual_acc": round(exp.challenger_qual_acc, 4),
-        # the declared one-dimension diff (R17), translated to a readable name + the raw description.
+        # the declared diff (R17 single-dimension; CB-27 multi for a manual multi-metric experiment),
+        # translated to a readable name + the raw description.
         "dimension": exp.dimension,  # internal slug — for client logic only, never rendered
-        "dimension_label": labels.dimension_label(exp.dimension),
+        # CB-27: the "multi" sentinel (a manual multi-metric experiment) labels as "Multiple changes"
+        # so no bare sentinel renders; every other dimension goes through the shared label map.
+        "dimension_label": (
+            "Multiple changes" if exp.dimension == "multi" else labels.dimension_label(exp.dimension)
+        ),
         "declared_diff": exp.declared_diff,
         "diff_description": exp.diff_description,
         "is_extreme": exp.is_extreme,
@@ -187,6 +213,59 @@ def experiment_to_dict(exp: ExperimentRecord) -> dict[str, Any]:
         "state": exp.state,
         "state_label": labels.experiment_state_label(exp.state),
         "created_at": exp.created_at.isoformat() if exp.created_at else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CB-25 — per-arm A/B "mock call" episodes (deterministic, experiment-scoped ids)
+# ---------------------------------------------------------------------------
+
+# The detail page lists the champion-arm + challenger-arm self-play episodes a run produced. We do NOT
+# add an episode-id column to the experiment record (the durable schema/columns are fixed); instead the
+# run re-stamps each arm episode with a DETERMINISTIC, experiment-scoped id so the same ids are
+# RE-DERIVABLE from the experiment_id + arm + index alone — no new persisted field needed. The detail
+# endpoint reconstructs the id list from the record's `n` and fetches each via the store.
+_ARM_ID_SEP = "::"
+
+
+def arm_episode_id(experiment_id: str, arm: str, index: int) -> str:
+    """A deterministic, experiment-scoped id for one A/B arm episode (CB-25). `arm` is "champion" or
+    "challenger". Re-derivable from (experiment_id, arm, index) so the detail page can list arm calls
+    without persisting their ids on the record."""
+    return f"{experiment_id}{_ARM_ID_SEP}{arm}{_ARM_ID_SEP}{index}"
+
+
+def arm_episode_ids(experiment_id: str, arm: str, n: int) -> list[str]:
+    """The full ordered id list for one arm of an `n`-persona run (CB-25)."""
+    return [arm_episode_id(experiment_id, arm, i) for i in range(max(0, n))]
+
+
+def _stamp_arm_episodes(
+    experiment_id: str, arm: str, episodes: list[Episode]
+) -> list[Episode]:
+    """Re-key a run's arm episodes with deterministic experiment-scoped ids + an arm cohort so the
+    detail page can list them and Review (/operate/review/<id>) can open each (CB-25). The episodes
+    otherwise keep everything the run produced (turns, outcome, belief)."""
+    out: list[Episode] = []
+    for i, ep in enumerate(episodes):
+        ep.episode_id = arm_episode_id(experiment_id, arm, i)
+        ep.cohort = f"experiment_{arm}"  # raw arm slug — for grouping/logic, labeled before render
+        out.append(ep)
+    return out
+
+
+def arm_episode_summary(ep: Episode) -> dict[str, Any]:
+    """A compact per-arm episode summary for the detail page (CB-25): enough to show the call's
+    outcome + ladder + turn count and a link target for Review, without re-sending the full turn log.
+    `outcome` is a raw outcome slug the client maps to a human label (never the raw slug as bold text).
+    """
+    return {
+        "episode_id": ep.episode_id,
+        "outcome": ep.outcome,
+        "ladder_tier": int(ep.ladder_tier),
+        "qualified": bool(ep.qualified),
+        "turn_count": len(ep.turns),
+        "version": ep.version,
     }
 
 
@@ -470,6 +549,30 @@ def _challenger_for(champion: AgentConfig, dimension: str, value: Any, *, seed: 
     )
 
 
+def _multi_challenger_for(
+    champion: AgentConfig, changes: list[tuple[str, Any]], *, seed: int
+):
+    """Build a MULTI-dimension Challenger for a manual experiment (CB-27).
+
+    RELAXES the single-dimension R19 invariant DELIBERATELY: the operator chose to A/B several knobs at
+    once. Applies every (dimension, value) row onto one deep copy via apply_dimension_changes (the
+    champion is never touched), then wraps it with build_multi_challenger (is_extreme True if ANY row
+    touches an extreme pricing/persona knob). A 1-row change reduces to a normal single-dimension diff.
+    Raises ValueError (validated at the boundary BEFORE any paid run) for an unsupported dimension, a
+    value of the wrong shape, or a change set that nets to no diff (every row matched the champion)."""
+    if not changes:
+        raise ValueError("a multi-metric experiment needs at least one metric row")
+    chal_config = apply_dimension_changes(champion, changes)
+    diff = declared_diff(champion, chal_config)
+    if not diff:
+        raise ValueError(
+            "the metric rows all match the current champion — nothing to A/B test"
+        )
+    parts = [f"{dim.split('.')[-1]} -> {val}" for dim, val in changes]
+    desc = "; ".join(parts)
+    return build_multi_challenger(champion, chal_config, seed=seed, diff_description=desc)
+
+
 def _running_record(
     experiment_id: str,
     champion: AgentConfig,
@@ -537,18 +640,36 @@ _DEFAULT_RUN_TIMEOUT_S = 180.0
 _DEFAULT_RUN_CONCURRENCY = 1
 
 
+class MetricChange(BaseModel):
+    """One {metric, new value} row of a multi-metric experiment (CB-27). `dimension` is the same
+    mutation-surface label the single-dimension run path supports ("playbooks.discovery_sequence" or
+    "thresholds.<key>"); `value` is the reordered slot list or the new number for that knob."""
+
+    dimension: str
+    value: Any
+
+
 class RunExperimentRequest(BaseModel):
-    """A "run an A/B between two values" request (POST /api/experiments/run). `dimension` is a
-    mutation-surface label the loop supports: "playbooks.discovery_sequence" (with `value` = a
-    reordered slot list) or "thresholds.<key>" (with `value` = the new number). `n` is the held-out
-    sample size PER ARM — modest by default because each call spends real model credit in prod.
+    """A "run an A/B between values" request (POST /api/experiments/run). `n` is the held-out sample
+    size PER ARM — modest by default because each call spends real model credit in prod.
+
+    SINGLE-DIMENSION (default): `dimension` is a mutation-surface label the loop supports
+    ("playbooks.discovery_sequence" with `value` = a reordered slot list, or "thresholds.<key>" with
+    `value` = the new number). This keeps the R19 single-dimension invariant.
+
+    MULTI-METRIC (CB-27, explicit opt-in): supply `changes` — a list of {dimension, value} rows — to
+    A/B more than one knob at once. This DELIBERATELY RELAXES the single-dimension R19 invariant for a
+    MANUAL operator experiment (the operator chose to combine knobs); the challenger applies ALL rows
+    and routes to human approval if any row touches an extreme pricing/persona knob. When `changes` is
+    present it WINS over `dimension`/`value`; a one-row `changes` reduces to the single-dimension path.
 
     `episode_id` (optional, CB-19): the reviewed call this run was scaffolded from. It is carried onto
     the persisted record's population label so the lab/review surface can show "seeded from this call";
     it never changes the A/B itself (the held-out set is frozen by seed)."""
 
-    dimension: str
-    value: Any
+    dimension: Optional[str] = None
+    value: Any = None
+    changes: Optional[list[MetricChange]] = None
     n: int = _DEFAULT_RUN_N
     name: str = ""
     episode_id: Optional[str] = None
@@ -659,8 +780,17 @@ def create_improve_router(
         FAIL-CLOSED (R36): this run does NOT measure sim-to-real divergence, so an otherwise auto-
         promote-eligible (clean, non-extreme) result is downgraded to pending_approval (blocked) —
         the central-risk divergence gate is never bypassed by this path.
+
+        CB-24: a timeout settles with a SPECIFIC reason ("timed out after Ns"); a crash settles with
+        the exception class name — not the generic "timed out or failed".
+
+        CB-25: the SAME run's per-arm episodes are persisted with deterministic experiment-scoped ids
+        (when the store can save episodes) so the detail page lists them + Review can open each.
         """
         settled = False
+        # CB-24: a specific failure reason captured here is threaded to _settle_failed_run so the lab
+        # explains a timeout vs an exception class rather than the generic "timed out or failed".
+        failure_reason: Optional[str] = None
         try:
             held_out = frozen_held_out(seed=_RUN_HELD_OUT_SEED, n=n, rotation_index=0)
             experiment = await asyncio.wait_for(
@@ -675,6 +805,10 @@ def create_improve_router(
                 ),
                 timeout=run_timeout_s,
             )
+            # CB-25: persist the A/B "mock calls" (both arms) with deterministic ids before settling, so
+            # the detail page can list them and Review can open each. Best-effort — a persist hiccup
+            # must not flip an otherwise-good run to failed (it only costs the arm-call drill-down).
+            await _persist_arm_episodes(experiment_id, experiment)
             decision = evaluate_promotion(experiment, is_extreme=challenger.is_extreme)
             if decision.status == "promoted":
                 decision = PromotionDecision(
@@ -699,8 +833,16 @@ def create_improve_router(
             await store.save_experiment(record)
             settled = True
         except asyncio.TimeoutError:
+            # CB-24: distinguish a timeout — show how long it ran before the budget tripped.
+            failure_reason = (
+                f"the run timed out after {run_timeout_s:g}s — no result recorded"
+            )
             logger.warning("experiment run %s timed out after %ss", experiment_id, run_timeout_s)
-        except Exception:
+        except Exception as exc:
+            # CB-24: name the failure (the exception class) instead of the generic "failed".
+            failure_reason = (
+                f"the run failed with an error ({type(exc).__name__}) — no result recorded"
+            )
             logger.warning("experiment run %s crashed", experiment_id, exc_info=True)
         finally:
             # CB-20 guard: if the run never produced a terminal record (timeout/crash), settle the
@@ -708,10 +850,33 @@ def create_improve_router(
             # hiccup here doesn't leak the task — the run is already off the request path.
             if not settled:
                 try:
-                    await _settle_failed_run(experiment_id, champion, challenger, n, population, name)
+                    await _settle_failed_run(
+                        experiment_id, champion, challenger, n, population, name,
+                        reason=failure_reason,
+                    )
                 except Exception:
                     logger.warning("failed to settle stuck run %s to terminal", experiment_id)
             run_semaphore.release()
+
+    async def _persist_arm_episodes(experiment_id: str, experiment: Any) -> None:
+        """CB-25: persist the run's champion-arm + challenger-arm episodes with deterministic,
+        experiment-scoped ids so the detail page lists them and Review (/operate/review/<id>) opens
+        each. Best-effort: if the injected store can't save episodes (no save_episode), or a save
+        hiccups, skip silently — the arm-call drill-down is a nice-to-have, never a reason to fail an
+        otherwise-good run."""
+        save = getattr(store, "save_episode", None)
+        if save is None:
+            return
+        try:
+            arms = (
+                ("champion", list(getattr(experiment, "champion_eps", []) or [])),
+                ("challenger", list(getattr(experiment, "challenger_eps", []) or [])),
+            )
+            for arm, episodes in arms:
+                for ep in _stamp_arm_episodes(experiment_id, arm, episodes):
+                    await save(ep)
+        except Exception:
+            logger.warning("failed to persist A/B arm episodes for run %s", experiment_id)
 
     async def _settle_failed_run(
         experiment_id: str,
@@ -720,16 +885,24 @@ def create_improve_router(
         n: int,
         population: str,
         name: str,
+        *,
+        reason: Optional[str] = None,
     ) -> None:
         """Re-save a timed-out/crashed run's record in a TERMINAL `rejected` state (CB-20) — never
         `running`. Keeps the before/after fields at their neutral defaults (the A/B never produced a
-        comparison) and carries a clear guardrail_reason so the lab card explains the failure."""
+        comparison) and carries a clear guardrail_reason so the lab card explains the failure.
+
+        CB-24: `reason` is the SPECIFIC failure detail captured by the background task (a timeout's
+        elapsed budget, or the exception class) — falls back to a generic message only when the caller
+        couldn't classify the failure."""
         record = _running_record(
             experiment_id, champion, challenger, n=n, population=population, name=name
         )
         record.state = "rejected"
         record.guardrail = "trip"
-        record.guardrail_reason = "the run did not complete (timed out or failed) — no result recorded"
+        record.guardrail_reason = reason or (
+            "the run did not complete (timed out or failed) — no result recorded"
+        )
         await store.save_experiment(record)
 
     @router.post("/api/experiments/run", status_code=202)
@@ -757,7 +930,20 @@ def create_improve_router(
         n = max(_MIN_RUN_N, min(int(req.n), _MAX_RUN_N))
         champion = get_config()
         try:
-            challenger = _challenger_for(champion, req.dimension, req.value, seed=_RUN_HELD_OUT_SEED)
+            if req.changes:
+                # CB-27: a multi-metric experiment (explicit opt-in) — relaxes the single-dimension
+                # invariant for this MANUAL run. `changes` wins over the single `dimension`/`value`.
+                challenger = _multi_challenger_for(
+                    champion,
+                    [(c.dimension, c.value) for c in req.changes],
+                    seed=_RUN_HELD_OUT_SEED,
+                )
+            elif req.dimension is not None:
+                challenger = _challenger_for(
+                    champion, req.dimension, req.value, seed=_RUN_HELD_OUT_SEED
+                )
+            else:
+                raise ValueError("a run needs a `dimension`+`value` or a `changes` list")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -848,6 +1034,42 @@ def create_improve_router(
             "experiment": experiment_to_dict(draft),
             "episode_id": req.episode_id,
             "is_scaffold": True,
+        }
+
+    @router.get("/api/experiments/{experiment_id}")
+    async def experiment_detail_ep(experiment_id: str) -> dict[str, Any]:
+        """ONE experiment's detail + its A/B "mock calls" (CB-25): the same flat experiment DTO the lab
+        cards use, PLUS the per-arm self-play episodes the run produced — the champion-arm + challenger-
+        arm calls, each with a compact summary (outcome/ladder/turns) and an `episode_id` the UI links
+        to Review (/operate/review/<id>). The arm episode ids are DETERMINISTIC (experiment-scoped), so
+        they're reconstructed from the record's `n` and fetched from the store — no episode-id column on
+        the record. Arms come back empty when the store can't read episodes or the run didn't persist
+        them (e.g. a draft, or a timed-out/crashed run). `guardrail_reason` (CB-24) is on the experiment
+        DTO so the page can explain a rejection/block. 404 for an unknown id."""
+        exp = await store.get_experiment(experiment_id)
+        if exp is None:
+            raise HTTPException(status_code=404, detail=f"unknown experiment {experiment_id!r}")
+
+        get_ep = getattr(store, "get_episode", None)
+
+        async def _arm(arm: str) -> list[dict[str, Any]]:
+            if get_ep is None or exp.n <= 0:
+                return []
+            calls: list[dict[str, Any]] = []
+            for eid in arm_episode_ids(experiment_id, arm, exp.n):
+                ep = await get_ep(eid)
+                if ep is not None:
+                    calls.append(arm_episode_summary(ep))
+            return calls
+
+        champion_calls = await _arm("champion")
+        challenger_calls = await _arm("challenger")
+        return {
+            "experiment": experiment_to_dict(exp),
+            "champion_calls": champion_calls,
+            "challenger_calls": challenger_calls,
+            # convenience flag for the UI empty-state: did this run persist any arm calls?
+            "has_calls": bool(champion_calls or challenger_calls),
         }
 
     # --- P7 Approval Queue -------------------------------------------------------------------

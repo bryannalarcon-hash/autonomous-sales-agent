@@ -16,6 +16,9 @@
 #   advance_to_close    — once the belief is closeable (no objection, warmed trust, enough turns),
 #                         convert a reactive act into attempt_close so the agent ASKS for the sale
 #                         instead of answering questions forever (the can't-close fix).
+#   close_floor         — CB-29: forbid a PAID close (consultation/trial/enrollment) until real
+#                         discovery (min turns + enough filled discovery slots), applied to a directly
+#                         LLM-PROPOSED close too — kills the premature/pushy close. callback is exempt.
 #   pushiness_cap       — forbid further pressure when a pushiness signal (bail_risk) or repeated-
 #                         pressure count exceeds the configured cap.
 #   escalation_triggers — EXTREME only: pricing concession beyond band, explicit human request,
@@ -61,6 +64,12 @@ _DEFAULTS: dict[str, float] = {
     # A budget-constrained prospect (price_sensitivity at/above this, OR firm budget refusals) gets the
     # FREE callback rung from advance_to_close instead of a paid consultation they'd reject.
     "callback_price_sensitivity": 0.75,
+    # CB-29 (premature/pushy close): the MINIMUM number of non-budget discovery slots that must be
+    # filled before ANY paid close (consultation/trial/enrollment) may fire — applies to a directly
+    # LLM-PROPOSED close too, not just a gate-advanced one (the real call fired attempt_close at turns
+    # 9 & 11 with ZERO discovery). The free 'callback' rung is exempt (a no-cost follow-up is never
+    # pushy). Default 1: the agent must have learned at least one concrete thing about the learner.
+    "discovery_slots_before_close": 1,
 }
 
 
@@ -284,6 +293,68 @@ def advance_to_close(
         f"advance_to_close: tier='{tier}' (trust={trust:.2f}, purchase_intent={intent:.2f}, "
         f"breakthrough={breakthrough}, budget_constrained={budget_constrained}), "
         f"{belief.turn_count} turns in — taking initiative instead of staying reactive"
+    )
+    return out
+
+
+# --- close_floor (CB-29: no premature/pushy close before real discovery) -----------------------
+
+# Paid commitment-ladder rungs that REQUIRE earned discovery before they may fire. The free
+# 'callback' rung is intentionally absent: offering a no-cost future follow-up is never pushy, even
+# early (and offer_low_commitment_on_budget legitimately steers a budget-refuser straight to it).
+_PAID_CLOSE_TIERS = frozenset({"consultation", "trial", "enrollment"})
+
+
+# The neutral driver prior — purchase_intent at/below this means the prospect has NOT signaled any
+# buying readiness yet, so a paid close with zero discovery is the agent closing BLIND (the defect).
+_NEUTRAL_PRIOR = 0.5
+
+
+def close_floor(
+    decision: Any,
+    belief: BeliefState,
+    config: AgentConfig,
+    *,
+    history: Optional[Sequence[Any]] = None,
+) -> Any:
+    """Forbid the BLIND premature/pushy paid close the real call exhibited (CB-29 fix).
+
+    In ep-eba52675… the agent fired attempt_close at turns 9 & 11 with ZERO discovery against a
+    HOSTILE/disengaged caller who had signaled no readiness — a pushy, premature close. advance_to_close
+    already respects min_turns_before_close, but a close the LLM proposes DIRECTLY bypassed every
+    discovery check. This gate closes that hole with a TIGHT, honest trigger that only fires on the
+    actual defect shape: a PAID attempt_close (consultation/trial/enrollment) is backed off to a
+    non-pressure act ONLY when the agent is closing BLIND —
+      • NO non-budget discovery slot is filled (it has learned nothing concrete about the learner), AND
+      • purchase_intent has NOT risen above the neutral prior (the prospect has signaled no readiness).
+    When EITHER holds — some discovery happened, OR the prospect is signaling buying readiness — the
+    close stands (a genuinely hot prospect, or one who has done real discovery, can still close; this
+    is why the warmed/qualified close paths and the buy-gate are untouched). The free 'callback' rung is
+    always exempt (a no-cost follow-up is never pushy). On a trip it backs off to answering the
+    prospect's open question if any, else a value pitch — keep building, don't push. Runs AFTER
+    advance_to_close (so a gate-advanced close is also checked) and BEFORE pushiness_cap. R37 intact.
+    """
+    if decision.act != "attempt_close":
+        return decision
+    if decision.tier == "callback":
+        return decision  # the free rung is exempt — never pushy
+
+    required = _required_discovery_slots(config)
+    filled = sum(1 for s in required if belief.slot_confidence(s) >= _LOCK_CONFIDENCE)
+    has_discovery = filled >= int(_threshold(config, "discovery_slots_before_close"))
+    signals_readiness = float(belief.drivers.get("purchase_intent", 0.0)) > _NEUTRAL_PRIOR
+    # The close stands unless the agent is closing BLIND: no discovery AND no readiness signal.
+    if has_discovery or signals_readiness:
+        return decision
+
+    out = decision.copy()
+    # Back off to value-building / answering, never silence: keep advancing discovery instead.
+    out.act = "answer_via_kb" if belief.open_question else "pitch"
+    out.tier = None
+    out.target_slot = None
+    out.rationale = (
+        f"close_floor: closing blind ({filled} discovery slot(s), no readiness signal); "
+        f"holding off a {decision.tier or 'paid'} close — building value instead of pushing"
     )
     return out
 
@@ -531,6 +602,9 @@ def apply_gates(
     # Take initiative to close when the belief is closeable (escape the reactive answer-loop); placed
     # before pushiness_cap so an over-aggressive close can still be backed off on a high bail signal.
     d = advance_to_close(d, belief, config, history=history)
+    # CB-29: hold off ANY paid close (LLM-proposed OR gate-advanced) until real discovery has happened
+    # (min turns + enough filled discovery slots) — kills the premature/pushy close at turns 9 & 11.
+    d = close_floor(d, belief, config, history=history)
     d = pushiness_cap(d, belief, config, history=history)
     # LAST override: a budget-constrained prospect gets the free callback rung (help + future meeting),
     # not a loop or a release — placed here so must_clear_objection/pushiness don't undo the offer.

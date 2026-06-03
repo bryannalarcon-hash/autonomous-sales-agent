@@ -4,10 +4,13 @@
 # numeric dimensions (perturb ONE threshold deterministically by seed) and LLM-propose for text dims
 # (mockable; if llm is None only the network-free parametric/reorder path runs). The MUTATION SURFACE
 # is prompts + playbooks + thresholds + persona ONLY (R21) — never code. EXTREME diffs (a pricing
-# concession threshold or the persona, R19) are flagged for human approval. EVERY returned challenger
-# satisfies is_minimal_diff (exactly one changed dimension) and carries a deterministic
-# challenger_version. Pure stdlib + the src.core.llm seam; NO LiveKit / numpy / scipy / pandas; all
-# randomness flows through a SEEDED random.Random (never the global random module).
+# concession threshold or the persona, R19) are flagged for human approval. AUTONOMOUS challengers
+# satisfy is_minimal_diff (exactly one changed dimension) and carry a deterministic challenger_version.
+# CB-27: apply_dimension_changes + build_multi_challenger add an EXPLICITLY MULTI-dimension path for
+# MANUAL operator experiments — this relaxes the single-dimension R17/R19 invariant ON PURPOSE (the
+# operator chose to A/B several knobs at once); single-dimension stays the default everywhere else.
+# Pure stdlib + the src.core.llm seam; NO LiveKit / numpy / scipy / pandas; all randomness flows
+# through a SEEDED random.Random (never the global random module).
 from __future__ import annotations
 
 import copy
@@ -139,6 +142,48 @@ def reorder_discovery(config: AgentConfig, new_sequence: Sequence[str]) -> Agent
     return _clone(config, playbooks=playbooks)
 
 
+def apply_dimension_changes(
+    config: AgentConfig, changes: Sequence[tuple[str, Any]]
+) -> AgentConfig:
+    """Return a NEW config with MORE THAN ONE dimension changed at once (deep-copy; input untouched).
+
+    CB-27 (multi-metric experiments): this RELAXES the R17/R19 single-dimension containment that the
+    autonomous loop enforces — it is for MANUAL operator experiments only, where the operator
+    explicitly chose to A/B several knobs together. Each `(dimension, value)` is one of the same
+    surfaces the single-dimension run path supports:
+      - "playbooks.discovery_sequence" -> value is a reordered slot-name list
+      - "thresholds.<key>"             -> value is the new numeric threshold
+    Changes are applied in order onto ONE accumulating deep copy, so N threshold edits + a reorder
+    coexist on the same challenger config. The champion is never mutated (every step deep-copies).
+    Raises ValueError for an unsupported dimension or a value of the wrong shape — validated here so a
+    bad row is rejected at the boundary before any paid run. Callers that want the single-dimension
+    invariant should keep using reorder_discovery / mutate_threshold + build_challenger.
+    """
+    out = _clone(config)  # one deep copy we accumulate every change onto
+    for dimension, value in changes:
+        if dimension == "playbooks.discovery_sequence":
+            if not isinstance(value, (list, tuple)) or not all(isinstance(s, str) for s in value):
+                raise ValueError("discovery_sequence value must be a list of slot-name strings")
+            out = reorder_discovery(out, list(value))
+        elif dimension.startswith("thresholds."):
+            key = dimension.split(".", 1)[1]
+            if key not in out.thresholds:
+                raise ValueError(f"unknown threshold {key!r}")
+            try:
+                num = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"threshold value must be a number, got {value!r}"
+                ) from exc
+            out = mutate_threshold(out, key, num)
+        else:
+            raise ValueError(
+                f"unsupported run dimension {dimension!r}: only 'playbooks.discovery_sequence' or "
+                "'thresholds.<key>' can be A/B-tested"
+            )
+    return out
+
+
 # === Challenger assembly =======================================================================
 
 
@@ -215,6 +260,51 @@ def build_challenger(
         dimension_hint=dimension_hint,
         seed=seed,
         diff_description=diff_description,
+    )
+
+
+def build_multi_challenger(
+    champion: AgentConfig,
+    challenger_config: AgentConfig,
+    *,
+    seed: int,
+    diff_description: str = "",
+) -> Challenger:
+    """Wrap a MULTI-dimension mutated config as a Challenger (CB-27 — MANUAL experiments only).
+
+    Unlike build_challenger, this does NOT enforce the R17/R19 single-dimension containment: the
+    operator deliberately A/B-ed several knobs at once (e.g. two thresholds + a discovery reorder), so
+    the declared diff legitimately carries >1 dimension. is_extreme is True if ANY changed dimension is
+    extreme (a pricing-concession threshold or the persona, R19) — a multi-change that touches an
+    extreme knob still routes to human approval. `dimension` is set to "multi" (a sentinel the API
+    labels as "Multiple changes" — never rendered raw) and the full declared diff is recoverable via
+    declared_diff(champion, config). Raises if the configs are identical (nothing to test). A
+    single-element change set is still allowed and reduces to a normal one-dimension diff.
+    """
+    diff = declared_diff(champion, challenger_config)
+    if not diff:
+        raise ValueError("multi-dimension challenger has no changed dimension — nothing to A/B test")
+    is_extreme = any(_is_extreme_dimension(d) for d in diff)
+    # A stable dimension token for >1 change; a single change keeps its real one-dimension label so a
+    # one-row "multi" request behaves exactly like the single-dimension path.
+    dimension = next(iter(diff)) if len(diff) == 1 else "multi"
+    version = _challenger_version(champion.version, dimension, seed)
+    versioned_config = AgentConfig(
+        version=version,
+        kb_version=challenger_config.kb_version,
+        persona=challenger_config.persona,
+        prompts=challenger_config.prompts,
+        playbooks=challenger_config.playbooks,
+        thresholds=challenger_config.thresholds,
+    )
+    desc = diff_description or f"changed {', '.join(sorted(diff))}"
+    return Challenger(
+        config=versioned_config,
+        dimension=dimension,
+        diff_description=desc,
+        parent_version=champion.version,
+        challenger_version=version,
+        is_extreme=is_extreme,
     )
 
 

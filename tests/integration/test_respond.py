@@ -195,9 +195,15 @@ async def test_respond_ae8_hot_prospect_closes_at_enrollment():
 
 
 async def test_respond_ae8_warm_prospect_offers_lower_ladder_tier():
-    """AE8: a warm-but-not-ready prospect is offered a lower commitment-ladder tier, not enrollment."""
+    """AE8: a warm-but-not-ready prospect is offered a lower commitment-ladder tier, not enrollment.
+
+    CB-29: the close must be EARNED — real discovery has happened (grade + subject confirmed) so the
+    close_floor's blind-close guard does not back it off; this test pins the TIER selection (warm ->
+    lower than enrollment), not premature closing (covered by test_cb28_cb29)."""
     cfg = make_config(pushiness_pressure_count_cap=3)
     b = BeliefState.fresh()
+    b.set_slot("grade_level", "10", 0.95)  # discovery actually happened
+    b.set_slot("subject", "algebra", 0.95)
     b.drivers["trust"] = 0.6
     b.drivers["need_intensity"] = 0.5
     b.drivers["purchase_intent"] = 0.4

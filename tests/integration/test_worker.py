@@ -397,6 +397,73 @@ async def test_commit_captures_escalation_log_for_persistence():
     assert log.lifecycle == "unreviewed"
 
 
+# =============================== CB-22: escalated-then-continued disconnect settles escalated ====
+
+
+async def test_escalated_then_continued_disconnect_settles_escalated():
+    """CB-22 (the ep-eba52675… case): the agent ESCALATES, then KEEPS TALKING (the last committed turn
+    is a non-terminal handle_objection). On disconnect the worker must settle "escalated", not leave
+    the call in_progress (which the Calls list filters out, so the call vanishes).
+
+    This drives two real committed turns through the worker (escalate, then a non-terminal turn) and
+    then runs the EXACT settle computation _register_persistence._on_shutdown does — _agent_acts scan
+    + _terminal_outcome_on_disconnect — asserting it lands "escalated". DB-free: no persist_call_end /
+    store needed to prove the mapping integration (the pure mapping is unit-tested separately)."""
+    w = _worker()
+    agent = _make_worker_agent(
+        llm=_agent_mock(act="escalate", target_slot=None, reply="Let me bring in a specialist.")
+    )
+    # Turn 1: the agent escalates (committed via llm_node, the reliable state write).
+    await agent.on_user_turn_completed(None, _StubMessage("I want to speak to a human."))
+    await agent.llm_node(None, None, None)
+
+    # Turn 2: the agent keeps talking with a NON-terminal act (handle_objection) — the brain did not
+    # stop after escalating, exactly the reported failure. Swap the agent mock's served decision.
+    agent.voice_session.llm_client = _agent_mock(
+        act="handle_objection", target_slot=None, reply="I understand — while we connect you…"
+    )
+    await agent.on_user_turn_completed(None, _StubMessage("But how much does it cost?"))
+    await agent.llm_node(None, None, None)
+
+    turns = agent.voice_session.state.turns
+    acts = w._agent_acts(turns)
+    assert "escalate" in acts and "handle_objection" in acts
+    # The last committed agent act is the NON-terminal one (the bug trigger).
+    assert w._last_committed_act(turns) == "handle_objection"
+
+    # The settle computation _on_shutdown runs (escalated derived from acts, not just the buffered
+    # escalation flag nor the last turn) must land "escalated" — never None/in_progress.
+    escalated_any = bool(agent.escalations) or "escalate" in acts
+    terminal = w._terminal_outcome_on_disconnect(
+        turn_count=len(turns),
+        escalated=escalated_any,
+        committed_tier=agent.last_close_tier,
+        last_act=w._last_committed_act(turns),
+        disqualified="disqualify" in acts,
+    )
+    assert terminal == "escalated", f"escalated-then-continued disconnect must settle escalated, got {terminal!r}"
+
+
+async def test_no_close_disconnect_settles_released_not_in_progress():
+    """A substantive call with NO close/escalate/disqualify that disconnects settles "released" (not
+    in_progress) — the CB-22 guarantee that EVERY disconnected call lands terminal, generalized."""
+    w = _worker()
+    agent = _make_worker_agent(llm=_agent_mock(act="ask", target_slot="goal"))
+    await agent.on_user_turn_completed(None, _StubMessage("Hi, tell me about tutoring."))
+    await agent.llm_node(None, None, None)
+
+    turns = agent.voice_session.state.turns
+    acts = w._agent_acts(turns)
+    terminal = w._terminal_outcome_on_disconnect(
+        turn_count=len(turns),
+        escalated=bool(agent.escalations) or "escalate" in acts,
+        committed_tier=agent.last_close_tier,
+        last_act=w._last_committed_act(turns),
+        disqualified="disqualify" in acts,
+    )
+    assert terminal == "released"
+
+
 # =============================== ROOM METADATA PARSING (jurisdiction / phone) ====================
 
 

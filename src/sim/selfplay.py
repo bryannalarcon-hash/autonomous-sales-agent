@@ -331,6 +331,9 @@ async def run_episode(
                 decision=decision.act,
                 rationale=decision.rationale,
                 belief=_belief_snapshot(belief),
+                # CB-28: the KB facts that grounded a tool answer (answer_via_kb), None otherwise —
+                # stamped on decision.meta by respond(); lets Call Review show what the tool pulled.
+                retrieved=(decision.meta or {}).get("retrieved"),
                 # Real measured turn latency (respond() stage timing) — was previously unset.
                 latency_ms=int(round(_timings["total_ms"])) if "total_ms" in _timings else None,
             )

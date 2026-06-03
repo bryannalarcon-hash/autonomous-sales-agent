@@ -12,6 +12,9 @@
 // the agent's read vs the prospect's true hidden state for the overlapping keys (trust, urgency,
 // purchase_intent) plus prospect-only context drivers (need, budget, patience). Drives entirely off
 // the recorded per-turn belief log (/api/episodes/{id}).
+// CB-28: a tool-use turn (one carrying Turn.retrieved — the KB facts that grounded its answer) shows
+// a clickable "N sources" affordance; clicking it opens the PulledInfoPanel on the right, listing the
+// retrieved snippets with a muted source attribution (raw citation slug softened, never shown bare).
 'use client';
 
 import { useMemo, useState } from 'react';
@@ -116,6 +119,77 @@ function gapColor(gap: number): string {
   if (abs <= 0.1) return 'var(--ok)';
   if (abs <= 0.25) return 'var(--warn)';
   return 'var(--danger)';
+}
+
+// CB-28: split a retrieved KB fact ("[source] text") into a citation source + the snippet body.
+// The source is a content citation pointer (file#section), shown as a muted attribution chip with
+// the raw "#"/"_" separators softened to spaces — never a bare internal index in the reading flow.
+function splitRetrieved(fact: string): { source: string | null; body: string } {
+  const m = /^\s*\[([^\]]+)\]\s*(.*)$/s.exec(fact);
+  if (!m) return { source: null, body: fact.trim() };
+  const source = m[1].replace(/[#_\-/]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return { source: source || null, body: m[2].trim() || fact.trim() };
+}
+
+// CB-28: the panel that shows WHAT the agent pulled for a tool-use turn — the KB facts/chunks that
+// grounded that answer, each as a readable snippet with a muted source attribution. Rendered only
+// when a tool turn is selected for inspection.
+function PulledInfoPanel({ facts, turnNum, onClose }: { facts: string[]; turnNum: number; onClose: () => void }) {
+  return (
+    <div className="card card-pad" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+        <h3 style={{ fontSize: 13, fontWeight: 650, display: 'flex', alignItems: 'center', gap: 6 }}>
+          <Icon name="book" size={14} />
+          Information pulled · turn {turnNum}
+        </h3>
+        <button
+          className="btn btn-ghost btn-sm"
+          onClick={onClose}
+          title="Close the pulled-information panel"
+          style={{ padding: '2px 8px' }}
+        >
+          Close
+        </button>
+      </div>
+      <p className="faint" style={{ fontSize: 11, lineHeight: 1.4 }}>
+        {'The knowledge-base facts the agent retrieved to ground this answer — what it actually looked at before replying.'}
+      </p>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {facts.map((fact, i) => {
+          const { source, body } = splitRetrieved(fact);
+          return (
+            <div
+              key={i}
+              style={{
+                background: 'var(--surface-2)',
+                border: '1px solid var(--border)',
+                borderRadius: 9,
+                padding: '8px 10px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 4,
+              }}
+            >
+              {source ? (
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.05em',
+                    color: 'var(--text-faint)',
+                  }}
+                >
+                  {source}
+                </span>
+              ) : null}
+              <span style={{ fontSize: 12.5, lineHeight: 1.45, color: 'var(--text-2)' }}>{body}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 // CB-06: Agent-estimate vs prospect-truth comparison panel.
@@ -304,6 +378,9 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
   // Timed replay: when playing, auto-advance the scrubber through the turns, pacing EACH turn by its
   // real measured latency (Turn.latency_ms) so the replay unfolds at the agent's actual thinking speed.
   const [playing, setPlaying] = useState(false);
+  // CB-28: index of the tool-use turn whose "what was pulled" panel is open (null when none). A turn
+  // with retrieved facts is clickable into this panel; selecting another turn closes it.
+  const [pulledTurn, setPulledTurn] = useState<number | null>(null);
 
   // "Export" — client-side download of the already-fetched episode as JSON. No silent no-op: it
   // produces a real file (the forensic record the operator is looking at) named by the call id.
@@ -525,11 +602,17 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
           {ep.turns.map((t, i) => {
             const isAgent = t.speaker === 'agent';
             const latency = t.latency_ms != null ? `${(t.latency_ms / 1000).toFixed(1)}s` : null;
+            // CB-28: a tool-use turn carries the retrieved KB facts that grounded its answer.
+            const pulled = t.retrieved && t.retrieved.length ? t.retrieved : null;
             return (
               <div
                 key={t.turn_id}
                 className={`rv-turn ${isAgent ? 'a' : 'p'}${i === cur ? ' cur' : ''}`}
-                onClick={() => setCur(i)}
+                onClick={() => {
+                  setCur(i);
+                  // Selecting a turn closes any open pulled-info panel unless this turn has its own.
+                  setPulledTurn(pulled ? i : null);
+                }}
               >
                 <div className="rv-tnum">{i + 1}</div>
                 <div className="rv-tc">
@@ -551,6 +634,35 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
                       </span>
                       {t.rationale ? <span className="rv-rat">{`"${humanizeRationale(t.rationale)}"`}</span> : null}
                       {latency ? <span className="rv-lat">{latency}</span> : null}
+                      {/* CB-28: clickable affordance — this turn looked something up; reveal what. */}
+                      {pulled ? (
+                        <button
+                          type="button"
+                          className="rv-pulled"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setCur(i);
+                            setPulledTurn((p) => (p === i ? null : i));
+                          }}
+                          title="Show the knowledge-base facts the agent pulled to ground this answer"
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: 4,
+                            background: pulledTurn === i ? 'var(--accent-soft, var(--surface-2))' : 'transparent',
+                            border: '1px solid var(--border)',
+                            borderRadius: 7,
+                            padding: '1px 7px',
+                            fontSize: 11,
+                            fontWeight: 600,
+                            color: 'var(--text-2)',
+                            cursor: 'pointer',
+                          }}
+                        >
+                          <Icon name="book" size={11} />
+                          {pulled.length === 1 ? '1 source' : `${pulled.length} sources`}
+                        </button>
+                      ) : null}
                     </div>
                   ) : null}
                 </div>
@@ -646,6 +758,15 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
               </div>
             ))}
           </div>
+
+          {/* CB-28: what the agent pulled for the selected tool-use turn (its grounding facts). */}
+          {pulledTurn !== null && ep.turns[pulledTurn]?.retrieved?.length ? (
+            <PulledInfoPanel
+              facts={ep.turns[pulledTurn]!.retrieved as string[]}
+              turnNum={pulledTurn + 1}
+              onClose={() => setPulledTurn(null)}
+            />
+          ) : null}
 
           {/* CB-06: agent-estimate vs prospect-truth panel (self-play / twin only) */}
           {hasTruth && (
