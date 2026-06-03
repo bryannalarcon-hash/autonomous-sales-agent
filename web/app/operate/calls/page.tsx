@@ -128,6 +128,10 @@ export default function CallsPage() {
   const [q, setQ] = useState('');
   const [outcome, setOutcome] = useState(''); // internal key ('' = All)
   const [esc, setEsc] = useState(false);
+  // Scope the operator Calls log to REAL calls (cohort='live'). Experiment/eval cohorts
+  // (held_out / training / sim self-play / per-run coh-*) are persisted into the same DB and would
+  // otherwise flood the log with short synthetic episodes — hidden by default, toggleable.
+  const [liveOnly, setLiveOnly] = useState(true);
   const [rows, setRows] = useState<EpisodeSummary[]>([]);
   const [sel, setSel] = useState<EpisodeSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -135,6 +139,7 @@ export default function CallsPage() {
   useEffect(() => {
     let cancelled = false;
     fetchEpisodes({
+      cohort: liveOnly ? 'live' : undefined,
       outcome: outcome || undefined,
       escalated: esc ? 'true' : undefined,
       limit: '200',
@@ -151,7 +156,7 @@ export default function CallsPage() {
     return () => {
       cancelled = true;
     };
-  }, [outcome, esc]);
+  }, [outcome, esc, liveOnly]);
 
   // Free-text search is client-side over the loaded page (call id).
   const visible = useMemo(
@@ -189,6 +194,17 @@ export default function CallsPage() {
             >
               <Icon name="alert" size={15} />
               Escalated only
+            </button>
+            <button
+              className="gctl"
+              onClick={() => setLiveOnly((v) => !v)}
+              title={liveOnly
+                ? 'Showing real calls only (live). Click to include sim / experiment / eval calls.'
+                : 'Showing ALL cohorts (incl. sim, training, held-out eval). Click to show real calls only.'}
+              style={liveOnly ? { borderColor: 'var(--accent-border)', background: 'var(--accent-soft)', color: 'var(--accent-strong)' } : undefined}
+            >
+              <Icon name="phone" size={15} />
+              {liveOnly ? 'Real calls' : 'All cohorts'}
             </button>
             <div className="grow" />
             <span className="muted" style={{ fontSize: 12.5 }}>{visible.length} calls</span>
