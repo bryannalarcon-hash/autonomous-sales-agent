@@ -21,6 +21,11 @@
 # STREAMED to TTS by the voice worker (from metrics["live_partial"]) — but ONLY while the call is
 # active, so the Live monitor renders the words filling in on the active turn near-real-time; None on
 # a completed/inactive call (the committed transcript carries the final text).
+# CB-30: golden calibration set. episode_summary/episode_detail expose a top-level `golden` boolean
+# (from metrics['golden']); POST /api/episodes/{id}/golden tags/untags one call (404 unknown id) and
+# GET /api/episodes/golden enumerates the set newest-first as full episode_detail payloads, so the set
+# is exportable (transcript+belief+outcome per episode) and replayable by the twin harness. The literal
+# /golden route is declared BEFORE the dynamic /{episode_id} so "golden" isn't captured as an id.
 # CB-33: _is_active also EXCLUDES rows tagged with a test cohort (_TEST_LIVE_COHORTS, default {"test"})
 # — pytest writes in_progress rows into the shared dev DB via the real persist_call_live, so without
 # this a test run would flash phantom "active" calls on the operator monitor (the CB-33 false alarm).
@@ -44,6 +49,12 @@ class _LifecycleUpdate(BaseModel):
     """Body for POST /api/escalations/{id}/lifecycle — the new triage state (validated in the store)."""
 
     lifecycle: str
+
+
+class _GoldenUpdate(BaseModel):
+    """Body for POST /api/episodes/{id}/golden (CB-30) — tag/untag the call for the golden set."""
+
+    golden: bool
 
 # ---------------------------------------------------------------------------
 # Injectable data layer
@@ -72,6 +83,11 @@ class ReadStore(Protocol):
 
     async def update_escalation_lifecycle(self, escalation_id: str, lifecycle: str) -> bool: ...
 
+    # CB-30 golden calibration set: tag/untag (returns False on unknown id) + enumerate the set.
+    async def set_episode_golden(self, episode_id: str, golden: bool) -> bool: ...
+
+    async def list_golden_episodes(self, *, limit: int = 200) -> list[Episode]: ...
+
 
 class _StoreBackedReadStore:
     """Forwards to src.memory.store; imported lazily to avoid dragging asyncpg onto import paths
@@ -93,6 +109,12 @@ class _StoreBackedReadStore:
 
     async def update_escalation_lifecycle(self, escalation_id: str, lifecycle: str) -> bool:
         return await self._store.update_escalation_lifecycle(escalation_id, lifecycle)
+
+    async def set_episode_golden(self, episode_id: str, golden: bool) -> bool:
+        return await self._store.set_episode_golden(episode_id, golden)
+
+    async def list_golden_episodes(self, **kw: Any) -> list[Episode]:
+        return await self._store.list_golden_episodes(**kw)
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +261,11 @@ def episode_summary(ep: Episode) -> dict[str, Any]:
         "escalated": ep.escalated,
         "turn_count": len(ep.turns),
         "duration_ms": metrics.get("duration_ms"),
+        # CB-30: top-level boolean for the golden calibration flag (lives in metrics['golden']). Surfaced
+        # here so both the summary row and episode_detail expose it without the client digging into metrics;
+        # the "golden" indicator/toggle in Call Review reads this. coerced to bool so a missing/odd value is
+        # False, never a raw truthy slug.
+        "golden": bool(metrics.get("golden", False)),
         "created_at": ep.created_at.isoformat() if ep.created_at else None,
     }
 
@@ -455,6 +482,26 @@ def create_operate_router(read_store: Optional[ReadStore] = None) -> APIRouter:
         )
         completed = [e for e in eps if _is_completed(e)][:limit]
         return {"episodes": [episode_summary(e) for e in completed], "count": len(completed)}
+
+    # CB-30: the golden calibration SET. Declared BEFORE the dynamic /api/episodes/{episode_id} route
+    # so the literal "golden" segment isn't captured as an episode_id (FastAPI matches in declaration
+    # order). Returns the same episode_detail shape the Calls list/Review use, newest-first, so the set
+    # is enumerable + exportable (each detail = transcript + belief trajectory + outcome) and the twin
+    # harness can replay any of them — a golden episode is simply a flagged one.
+    @router.get("/api/episodes/golden")
+    async def list_golden_ep(limit: int = 200) -> dict[str, Any]:
+        """CB-30: enumerate the golden calibration set, newest-first, as full Call Review payloads."""
+        eps = await rs.list_golden_episodes(limit=limit)
+        return {"episodes": [episode_detail(e) for e in eps], "count": len(eps)}
+
+    @router.post("/api/episodes/{episode_id}/golden")
+    async def set_golden_ep(episode_id: str, req: _GoldenUpdate) -> dict[str, Any]:
+        """CB-30 WRITE: tag/untag a real call as golden (persists in metrics['golden']). 404 unknown id.
+        Targeted update — does not rewrite the transcript/belief trajectory."""
+        ok = await rs.set_episode_golden(episode_id, req.golden)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"unknown episode {episode_id!r}")
+        return {"episode_id": episode_id, "golden": req.golden}
 
     @router.get("/api/episodes/{episode_id}")
     async def get_episode_ep(episode_id: str) -> dict[str, Any]:

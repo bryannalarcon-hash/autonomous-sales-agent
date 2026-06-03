@@ -10,6 +10,9 @@
 # verifies NO raw internal index (ladder int alone, driver slug) leaks into operator-facing labels.
 # CB-06: episode_detail exposes prospect_trajectory for sim/twin episodes; real (voice) episodes
 # get [] so the frontend panel is correctly absent there.
+# CB-30: episode_detail/summary expose a top-level `golden` boolean; POST /api/episodes/{id}/golden
+# tags/untags a call (404 unknown id) and GET /api/episodes/golden enumerates the set newest-first as
+# full Call Review payloads (the literal /golden route must not be shadowed by the dynamic /{id} route).
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -70,6 +73,21 @@ class FakeReadStore:
                 e.lifecycle = lifecycle
                 return True
         return False
+
+    async def set_episode_golden(self, episode_id: str, golden: bool) -> bool:
+        # Mirror the real store's targeted update: flip metrics['golden'] only, leave turns intact.
+        for e in self._episodes:
+            if e.episode_id == episode_id:
+                if e.metrics is None:
+                    e.metrics = {}
+                e.metrics["golden"] = golden
+                return True
+        return False
+
+    async def list_golden_episodes(self, *, limit: int = 200) -> list[Episode]:
+        rows = [e for e in self._episodes if bool((e.metrics or {}).get("golden"))]
+        rows.sort(key=lambda e: e.created_at, reverse=True)
+        return rows[:limit]
 
 
 def _belief(trust: float, bail: float, stage: str, imminent: bool = False) -> BeliefSnapshot:
@@ -754,3 +772,92 @@ def test_episode_detail_prospect_trajectory_empty_when_metrics_is_none():
     detail = episode_detail(sparse_ep)
     assert "prospect_trajectory" in detail
     assert detail["prospect_trajectory"] == []
+
+
+# =============================== CB-30 — GOLDEN CALIBRATION SET ===================================
+
+
+def test_episode_detail_surfaces_golden_flag():
+    """CB-30: episode_detail/summary expose a top-level `golden` boolean (from metrics['golden']),
+    defaulting to False when the call is untagged — so the Review page can render the indicator and
+    re-hydrate the toggle without digging into metrics."""
+    client = _seeded_client()
+    # The seeded calls are untagged: golden defaults to False on both list rows and the detail.
+    row = next(e for e in client.get("/api/episodes").json()["episodes"] if e["episode_id"] == "CALL-4820")
+    assert row["golden"] is False
+    detail = client.get("/api/episodes/CALL-4820").json()
+    assert detail["golden"] is False
+
+
+def test_golden_toggle_persists_and_lists_in_set():
+    """CB-30: POST /api/episodes/{id}/golden tags a real call (persists in metrics['golden']); the
+    flag survives a re-fetch (episode_detail.golden True), the call appears in GET /api/episodes/golden
+    as a full Call Review payload, and untagging drops it back out. The golden-set entry carries the
+    transcript + belief trajectory + outcome (so it is exportable + replayable)."""
+    client = _seeded_client()
+
+    # Tag CALL-4820 golden.
+    r = client.post("/api/episodes/CALL-4820/golden", json={"golden": True})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"episode_id": "CALL-4820", "golden": True}
+
+    # It persists: re-fetching the detail shows golden True (survives reload).
+    detail = client.get("/api/episodes/CALL-4820").json()
+    assert detail["golden"] is True
+
+    # It is enumerable as a full Call Review payload (transcript + belief trajectory + outcome).
+    body = client.get("/api/episodes/golden").json()
+    assert body["count"] == 1
+    g = body["episodes"][0]
+    assert g["episode_id"] == "CALL-4820"
+    assert g["turns"] and "belief_trajectory" in g and "outcome" in g
+    assert g["golden"] is True
+
+    # Untag it -> drops out of the set, detail reflects False.
+    r2 = client.post("/api/episodes/CALL-4820/golden", json={"golden": False})
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["golden"] is False
+    assert client.get("/api/episodes/golden").json()["count"] == 0
+    assert client.get("/api/episodes/CALL-4820").json()["golden"] is False
+
+
+def test_golden_toggle_404_for_unknown_episode():
+    """CB-30: tagging an unknown episode id is a 404 (no-op), matching the escalation-lifecycle 404."""
+    client = _seeded_client()
+    r = client.post("/api/episodes/NOPE-9999/golden", json={"golden": True})
+    assert r.status_code == 404, r.text
+
+
+def test_golden_list_newest_first_and_excludes_untagged():
+    """CB-30: GET /api/episodes/golden returns ONLY tagged calls, newest-first, excluding untagged."""
+    client = _seeded_client()
+    # Tag two completed calls; CALL-4820 (6m ago) is newer than CALL-4818 (38m ago).
+    client.post("/api/episodes/CALL-4818/golden", json={"golden": True})
+    client.post("/api/episodes/CALL-4820/golden", json={"golden": True})
+
+    body = client.get("/api/episodes/golden").json()
+    ids = [e["episode_id"] for e in body["episodes"]]
+    assert set(ids) == {"CALL-4818", "CALL-4820"}
+    assert ids[0] == "CALL-4820"  # newest-first
+    # An untagged completed call (CALL-4819) is absent from the golden set.
+    assert "CALL-4819" not in ids
+
+
+def test_golden_list_empty_when_none_tagged():
+    """CB-30: GET /api/episodes/golden returns count=0 / empty list when nothing is tagged."""
+    client = _seeded_client()
+    body = client.get("/api/episodes/golden").json()
+    assert body["count"] == 0
+    assert body["episodes"] == []
+
+
+def test_golden_route_not_shadowed_by_dynamic_episode_id():
+    """CB-30: the literal /api/episodes/golden route must resolve to the golden-SET handler, NOT be
+    captured as get_episode(episode_id='golden') (which would 404). Regression guard on route order."""
+    client = _seeded_client()
+    r = client.get("/api/episodes/golden")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # The golden-set shape ({episodes, count}) — never the episode_detail shape (no top-level 'turns').
+    assert "episodes" in body and "count" in body
+    assert "turns" not in body

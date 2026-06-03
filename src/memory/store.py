@@ -1,9 +1,11 @@
 # Async datastore (plan U2) over Postgres+pgvector via asyncpg. Persists/queries the unified
 # Episode schema, per-lead memory (upsert merges slots by phone-hash), version lineage
 # (record/champion/lineage), the ESCALATION REVIEW QUEUE (save/get/list escalation_log rows;
-# the deferred-extreme-moment records U14 writes — dashboard P5), and the EXPERIMENT records
+# the deferred-extreme-moment records U14 writes — dashboard P5), the EXPERIMENT records
 # (save/get/list experiment rows — the persisted champion-vs-challenger runs the dashboard P6 lab /
-# P7 approval queue read; U16). Reads DATABASE_URL from the environment (.env via python-dotenv).
+# P7 approval queue read; U16), and the GOLDEN calibration set (CB-30: set_episode_golden does a
+# targeted jsonb_set on metrics['golden'] without rewriting turns; list_golden_episodes enumerates
+# the tagged set for calibration/replay). Reads DATABASE_URL from the environment (.env via python-dotenv).
 # A module-level connection pool is created lazily and reused. JSONB columns are (de)serialized
 # with a datetime-aware encoder so created_at round-trips. NO LiveKit/voice imports — sim, text,
 # and voice channels all write through this one interface (plan R26 single-shape guarantee).
@@ -198,6 +200,44 @@ async def list_episodes(
     sql = f"SELECT * FROM episode{where} ORDER BY created_at DESC LIMIT ${len(args)}"
     async with pool.acquire() as conn:
         rows = await conn.fetch(sql, *args)
+    return [_row_to_episode(r) for r in rows]
+
+
+async def set_episode_golden(episode_id: str, golden: bool) -> bool:
+    """Tag/untag one episode as part of the GOLDEN calibration set (CB-30). Returns True if a row
+    matched (so the caller can 404 on an unknown id).
+
+    A TARGETED jsonb_set on metrics['golden'] only — it does NOT rewrite turns / belief trajectory /
+    outcome, so flagging a long real call is cheap and never risks clobbering the transcript. metrics
+    is coalesced to '{}' first so an episode with NULL metrics still flips cleanly. The golden set is
+    enumerated by list_golden_episodes; per-episode export already yields transcript+belief+outcome and
+    the twin harness replays any episode id — a golden episode is just a flagged one."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        status = await conn.execute(
+            "UPDATE episode "
+            "SET metrics = jsonb_set(coalesce(metrics, '{}'::jsonb), '{golden}', to_jsonb($1::boolean)) "
+            "WHERE episode_id = $2",
+            golden,
+            episode_id,
+        )
+    # asyncpg returns e.g. "UPDATE 1" — the trailing count is the rows affected (0 => unknown id).
+    return status.rsplit(" ", 1)[-1] != "0"
+
+
+async def list_golden_episodes(*, limit: int = 200) -> list[Episode]:
+    """List the GOLDEN calibration set (CB-30) newest-first — episodes whose metrics['golden'] is true.
+
+    Returns full Episode objects (same shape get_episode/list_episodes return) so the set is directly
+    enumerable + exportable (transcript + belief trajectory + outcome) and replayable by the twin
+    harness. The jsonb predicate matches the flag set by set_episode_golden; ordered created_at DESC."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM episode WHERE (metrics->>'golden')::boolean IS TRUE "
+            "ORDER BY created_at DESC LIMIT $1",
+            limit,
+        )
     return [_row_to_episode(r) for r in rows]
 
 

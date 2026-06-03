@@ -15,6 +15,10 @@
 // CB-28: a tool-use turn (one carrying Turn.retrieved — the KB facts that grounded its answer) shows
 // a clickable "N sources" affordance; clicking it opens the PulledInfoPanel on the right, listing the
 // retrieved snippets with a muted source attribution (raw citation slug softened, never shown bare).
+// CB-30: a PERSISTED "Mark golden / Golden ✓" toggle (beside Export) tags this real call into the
+// golden calibration set via POST /api/episodes/{id}/golden (round-trips through metrics['golden'],
+// re-hydrated from ep.golden so it survives reload); a "Golden" pill shows when flagged. The existing
+// Export already yields the full transcript+belief+outcome record for the tagged set.
 'use client';
 
 import { useMemo, useState } from 'react';
@@ -22,7 +26,7 @@ import { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { Ring } from '@/components/cadence/Spark';
-import { fetchEpisode, fmtDuration } from '@/lib/operate-api';
+import { fetchEpisode, fmtDuration, setEpisodeGolden } from '@/lib/operate-api';
 import { archetypeLabel, humanizeRationale, versionLabel } from '@/lib/labels';
 import type { BeliefSnapshot, EpisodeDetail, ProspectTurnState } from '@/lib/operate-types';
 
@@ -375,6 +379,12 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
   // "Flag" has no backend in this demo, so it's an HONEST local-only marker: toggling it shows a
   // "Flagged" pill on the call strip (a clear state change), reset per visit. Not persisted.
   const [flagged, setFlagged] = useState(false);
+  // CB-30: golden calibration flag. Unlike "Flag", this DOES persist — it round-trips through
+  // metrics['golden'] (POST /api/episodes/{id}/golden) and is re-hydrated from ep.golden on load, so
+  // it survives reload. `goldenPending` disables the toggle mid-request; `goldenError` surfaces a 404.
+  const [golden, setGolden] = useState(false);
+  const [goldenPending, setGoldenPending] = useState(false);
+  const [goldenError, setGoldenError] = useState<string | null>(null);
   // Timed replay: when playing, auto-advance the scrubber through the turns, pacing EACH turn by its
   // real measured latency (Turn.latency_ms) so the replay unfolds at the agent's actual thinking speed.
   const [playing, setPlaying] = useState(false);
@@ -397,6 +407,26 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
     URL.revokeObjectURL(url);
   }
 
+  // CB-30: toggle this call into/out of the golden calibration set. Persists via
+  // POST /api/episodes/{id}/golden, then reflects the confirmed flag locally (so the indicator + the
+  // button label update and the change survives a reload). Optimistically flips, reverting on error.
+  async function toggleGolden() {
+    if (!ep || goldenPending) return;
+    const next = !golden;
+    setGoldenPending(true);
+    setGoldenError(null);
+    setGolden(next); // optimistic
+    try {
+      const res = await setEpisodeGolden(ep.episode_id, next);
+      setGolden(res.golden);
+    } catch (err) {
+      setGolden(!next); // revert
+      setGoldenError(err instanceof Error ? err.message : 'Could not update the golden tag.');
+    } finally {
+      setGoldenPending(false);
+    }
+  }
+
   useEffect(() => {
     let cancelled = false;
     fetchEpisode(id)
@@ -405,6 +435,8 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
           setEp(e);
           setCur(Math.max(0, e.turns.length - 1));
           setError(null);
+          // CB-30: re-hydrate the golden flag from the persisted episode so it survives reload.
+          setGolden(Boolean(e.golden));
         }
       })
       .catch((err) => {
@@ -556,6 +588,13 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
             </div>
           </div>
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 9, alignItems: 'center' }}>
+            {/* CB-30: golden-set indicator — shown whenever this call is tagged into the calibration
+                set. A human label ("Golden") + a star, never the raw metrics key. */}
+            {golden ? (
+              <span className="tag accent dot" title="In the golden calibration set">
+                <Icon name="badge" size={12} /> Golden
+              </span>
+            ) : null}
             {flagged ? (
               <span className="tag warn dot" title="Flagged for follow-up (local to this view)">
                 Flagged
@@ -568,6 +607,24 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
             >
               <Icon name="flag" size={14} />
               {flagged ? 'Unflag' : 'Flag'}
+            </button>
+            {/* CB-30: persisted golden-set toggle (beside Export). The label is a human phrase — "Mark
+                golden" / "Golden ✓" — never the raw metrics key; flipping it round-trips through the
+                backend so the set is enumerable + exportable and survives reload. */}
+            <button
+              className={`btn btn-sm ${golden ? 'btn-ok' : 'btn-ghost'}`}
+              onClick={toggleGolden}
+              disabled={goldenPending}
+              title={
+                goldenError
+                  ? goldenError
+                  : golden
+                    ? 'Remove this call from the golden calibration set'
+                    : 'Add this call to the golden calibration set (for calibration & replay)'
+              }
+            >
+              <Icon name="badge" size={14} />
+              {golden ? 'Golden ✓' : 'Mark golden'}
             </button>
             <button className="btn btn-ghost btn-sm" onClick={exportEpisode} title="Download this call's full record as JSON">
               <Icon name="download" size={14} />

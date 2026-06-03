@@ -83,14 +83,6 @@
 - **Acceptance (promote ONLY if all hold vs the current LLM brain on held-out):** belief-trajectory divergence ≤ a set tolerance; policy act-agreement ≥ a set %; sim2real divergence no worse; outcome distribution preserved (no buy-gate regression); turn latency ~sub-2 s; a confidence-gated FALLBACK to the LLM when an ML model is uncertain (so novel inputs degrade gracefully). R37 + the honest buy-gate intact. Promotion goes through the experiment/grading pipeline, not a hand-merge.
 - **Refs:** `dst.py` (deltas+intent call + the `_extract_slots`/regex-intent-fallback seam), `policy.py` (`Decision` + bounded act vocab), `gates.py` (the deterministic layer to preserve), CB-06 (true-driver trajectories = training labels), the grading/sim2real loop; CB-41 (NLG streaming, a prereq for the latency payoff); the latency research deliverable.
 
-### CB-30 — (future) Golden-set capture of real conversations
-- **Type / Surface / Size:** feature · `data` · M
-- **Prereqs:** CB-22 + CB-23 (call logging + belief persistence must work first)
-- **Current:** the user wants to record a few real conversations as a GOLDEN SET to calibrate/work from — but only once call logging (CB-22) + per-turn belief (CB-23) are verified, so the captured calls are complete + coherent.
-- **Desired:** a way to mark/flag a real call as "golden" and export the set (transcript + belief trajectory + outcome) for use as a calibration reference / replay seed.
-- **Acceptance:** an operator can tag a real call as golden; the golden set is exportable + replayable.
-- **Refs:** user "record a couple of conversations down the line as a golden set"; depends on CB-22/CB-23; the replay/twin harness (CB-06 era).
-
 ---
 
 ## In Progress
@@ -142,6 +134,14 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-30 — Golden-set capture of real conversations (tag + enumerable/exportable set)
+- **Completed:** 2026-06-03
+- **Verification:** non-voice suite **402 passed / 5 skipped** (+3 golden integration tests) + `tests/e2e/test_operate.py` +6 golden tests; `tsc --noEmit` exit 0; adversarial verifier confirmed all functional checks (the lone `concerns` was the pending API restart, now done). **Live-verified after API restart:** POST `/api/episodes/{id}/golden {true}` → 200 + `detail.golden=true` (persists), GET `/api/episodes/golden` (count 19, contains it), toggle `{false}` → 200, unknown id → 404.
+- **What changed:** reused existing seams (single-call export + twin replay already existed; NO migration). `store.set_episode_golden(id, bool)` does a TARGETED `jsonb_set(metrics,'{golden}',…)` (preserves turns + CB-06 prospect_trajectory — verified identical before/after) + `store.list_golden_episodes(limit)` (newest-first, full Episode shape); exported via `src/memory/__init__.py`. `operate.episode_summary/detail` surface a top-level bool `golden`; new routes POST `/api/episodes/{id}/golden` (404 on unknown) + GET `/api/episodes/golden` (full episode_detail payloads = transcript+belief_trajectory+outcome, so the set is enumerable/exportable/replayable); literal `/golden` declared before the dynamic `/{episode_id}` (regression-tested). Review page: a persisted "Mark golden"/"Golden ✓" toggle beside Export (re-hydrated from `ep.golden`, survives reload) + a "Golden" pill (human labels, no slug leak).
+- **Files:** `src/memory/store.py`, `src/memory/__init__.py`, `src/api/operate.py`, `web/lib/operate-types.ts`, `web/lib/operate-api.ts`, `web/app/operate/review/[id]/page.tsx`, `tests/integration/test_store.py`, `tests/e2e/test_operate.py`.
+- **Constraints checked:** no migration; targeted update (no clobber); no internal-index leak (human labels); replay unchanged (golden = a flagged normal episode the twin harness replays identically).
+- **Follow-ups / known gaps:** the shared dev DB already carries ~19 golden tags from dev/test runs — dev cruft the operator can curate (golden is a non-destructive flag, set by the operator per the spec); not an ongoing leak (committed tests use a fake store + test-created episodes).
 
 ### CB-41/CB-38 — Wave 4: stream NLG generation → TTS, surfaced on the live monitor (R37-preserving)
 - **Completed:** 2026-06-02

@@ -40,10 +40,12 @@ _STORE_EXPORTS = (
     "list_episodes",
     "list_escalations",
     "list_experiments",
+    "list_golden_episodes",
     "record_version",
     "save_episode",
     "save_escalation",
     "save_experiment",
+    "set_episode_golden",
     "upsert_lead_by_phone",
 )
 
@@ -96,10 +98,12 @@ __all__ = [
     "list_episodes",
     "list_escalations",
     "list_experiments",
+    "list_golden_episodes",
     "record_version",
     "save_episode",
     "save_escalation",
     "save_experiment",
+    "set_episode_golden",
     "upsert_lead_by_phone",
     # hydrate bridge (U6)
     "hydrate_belief",

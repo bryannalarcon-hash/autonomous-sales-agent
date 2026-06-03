@@ -4,9 +4,11 @@
 // NEXT_PUBLIC_API_BASE convention as lib/api.ts (never embeds secrets). Display helpers (duration /
 // time-ago / initials) format raw numeric backend fields for the glass UI; all SEMANTIC labels come
 // pre-translated from the backend, so nothing here re-derives a human label from an internal index.
-// The lone WRITE is updateEscalationLifecycle (POST /api/escalations/{id}/lifecycle). U16 adds:
+// WRITES: updateEscalationLifecycle (POST /api/escalations/{id}/lifecycle) and CB-30's
+// setEpisodeGolden (POST /api/episodes/{id}/golden — tag/untag the golden calibration set). U16 adds:
 // fetchActiveCalls (/api/live/active), fetchLive now accepts an optional episodeId param, and
-// fetchSampleCall (/api/live/sample) for the "Show sample call" toggle in the empty state.
+// fetchSampleCall (/api/live/sample) for the "Show sample call" toggle in the empty state. CB-30 also
+// adds fetchGoldenEpisodes (GET /api/episodes/golden) to enumerate/export the golden set.
 import { ApiError, API_BASE } from './api';
 import type {
   ActiveCallsResponse,
@@ -145,6 +147,33 @@ export function fetchActiveCalls(): Promise<ActiveCallsResponse> {
  *  SAMPLE badge and no live/recording affordances. */
 export function fetchSampleCall(): Promise<LiveSnapshot> {
   return getJson<LiveSnapshot>('/api/live/sample');
+}
+
+/** Response from GET /api/episodes/golden — the golden calibration set as full Call Review payloads
+ *  (each is the same EpisodeDetail shape Call Review renders / Export downloads), newest-first. */
+export interface GoldenSetResponse {
+  episodes: EpisodeDetail[];
+  count: number;
+}
+
+/** CB-30: fetch the golden calibration set (transcript + belief trajectory + outcome per episode),
+ *  newest-first. The set is exportable as-is and replayable by the twin harness — each entry is the
+ *  full episode record, so callers can enumerate or download the whole set. */
+export function fetchGoldenEpisodes(limit?: number): Promise<GoldenSetResponse> {
+  return getJson<GoldenSetResponse>('/api/episodes/golden', limit ? { limit: String(limit) } : undefined);
+}
+
+/** CB-30 WRITE: tag/untag a real call as golden (persists in metrics['golden']). POSTs to
+ *  /api/episodes/{id}/golden and returns the backend's confirmed {episode_id, golden}. Throws
+ *  ApiError on a 404 (unknown id) so the caller can surface it. */
+export function setEpisodeGolden(
+  id: string,
+  golden: boolean,
+): Promise<{ episode_id: string; golden: boolean }> {
+  return postJson<{ episode_id: string; golden: boolean }>(
+    `/api/episodes/${encodeURIComponent(id)}/golden`,
+    { golden },
+  );
 }
 
 // --- display helpers (formatting only — no semantic-label derivation) ---------------------------

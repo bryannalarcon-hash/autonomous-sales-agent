@@ -2,8 +2,10 @@
 # when DATABASE_URL is unset, so the orchestrator (which brings up Postgres + applies the migration)
 # is the one that actually runs these. Covers: episode round-trip preserves belief trajectory +
 # version tags; lead upsert merges slots by phone-hash; real (voice) and sim episodes share ONE
-# schema (plan R26); and the privacy invariant — the raw phone string NEVER appears in a stored
-# episode or lead row (plan R42). Uses pytest-asyncio (asyncio_mode=auto in pyproject).
+# schema (plan R26); the privacy invariant — the raw phone string NEVER appears in a stored
+# episode or lead row (plan R42); and CB-30's golden calibration set (set_episode_golden round-trips
+# metrics['golden'] with a targeted update that preserves the transcript; list_golden_episodes
+# enumerates the tagged set newest-first). Uses pytest-asyncio (asyncio_mode=auto in pyproject).
 from __future__ import annotations
 
 import os
@@ -253,6 +255,75 @@ async def test_version_lineage_and_champion():
     chal_node = await store.get_lineage(chal)
     assert chal_node.parent_version == base
     assert chal_node.kpi["ladder"] == pytest.approx(0.51)
+
+
+async def test_set_episode_golden_round_trip():
+    """CB-30: set_episode_golden tags an episode (metrics['golden']=True) with a TARGETED update that
+    preserves turns/belief; get_episode + list_golden_episodes reflect it; unset flips it back; an
+    unknown id is a no-op returning False. The golden flag round-trips through metrics."""
+    ep = _make_episode("voice", phash=None)
+    await store.save_episode(ep)
+
+    # Initially not golden, and absent from the golden set.
+    got = await store.get_episode(ep.episode_id)
+    assert got is not None
+    assert bool(got.metrics.get("golden", False)) is False
+    assert ep.episode_id not in {e.episode_id for e in await store.list_golden_episodes()}
+
+    # Tag golden -> True; a matching row returns True; the targeted update must NOT clobber turns.
+    assert await store.set_episode_golden(ep.episode_id, True) is True
+    got = await store.get_episode(ep.episode_id)
+    assert got.metrics["golden"] is True
+    assert len(got.turns) == 3  # transcript preserved by the targeted jsonb_set
+    assert got.turns[2].decision == "ask_goal"
+    golden_ids = {e.episode_id for e in await store.list_golden_episodes()}
+    assert ep.episode_id in golden_ids
+
+    # Untag -> False; drops out of the golden set; other metrics (duration_ms) untouched.
+    assert await store.set_episode_golden(ep.episode_id, False) is True
+    got = await store.get_episode(ep.episode_id)
+    assert got.metrics["golden"] is False
+    assert got.metrics.get("duration_ms") == 41000  # pre-existing metric preserved
+    assert ep.episode_id not in {e.episode_id for e in await store.list_golden_episodes()}
+
+    # Unknown id is a no-op (False), so the API can 404.
+    assert await store.set_episode_golden(f"nope-{uuid.uuid4().hex}", True) is False
+
+
+async def test_set_episode_golden_on_null_metrics_episode():
+    """CB-30: tagging an episode whose metrics is empty/absent still flips cleanly (coalesce '{}')."""
+    ep = _make_episode("voice", phash=None)
+    ep.metrics = {}
+    await store.save_episode(ep)
+
+    assert await store.set_episode_golden(ep.episode_id, True) is True
+    got = await store.get_episode(ep.episode_id)
+    assert got is not None and got.metrics.get("golden") is True
+
+
+async def test_list_golden_episodes_newest_first():
+    """CB-30: list_golden_episodes returns ONLY golden episodes, newest-first, and excludes untagged."""
+    tag = uuid.uuid4().hex[:8]
+    older = _make_episode("voice", phash=None)
+    newer = _make_episode("voice", phash=None)
+    plain = _make_episode("voice", phash=None)
+    for ep in (older, newer, plain):
+        ep.cohort = f"goldset-{tag}"
+    await store.save_episode(older)
+    await store.save_episode(newer)
+    await store.save_episode(plain)
+
+    await store.set_episode_golden(older.episode_id, True)
+    await store.set_episode_golden(newer.episode_id, True)
+    # `plain` is left untagged — it must not appear.
+
+    golden = [e for e in await store.list_golden_episodes() if e.cohort == f"goldset-{tag}"]
+    ids = {e.episode_id for e in golden}
+    assert ids == {older.episode_id, newer.episode_id}
+    assert plain.episode_id not in ids
+    # newest-first: created_at descending.
+    created = [e.created_at for e in golden]
+    assert created == sorted(created, reverse=True)
 
 
 async def test_list_episodes_filters_by_version_cohort_outcome():

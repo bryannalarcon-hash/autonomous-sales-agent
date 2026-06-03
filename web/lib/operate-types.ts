@@ -8,6 +8,8 @@
 // ActiveCallsResponse support the queue-rail of concurrent in-progress calls (/api/live/active).
 // Additions (CB-06): EpisodeDetail gains optional prospect_trajectory for self-play / digital-twin
 // episodes — the prospect's true hidden driver state captured per turn by the on_turn hook.
+// Additions (CB-30): EpisodeSummary/EpisodeDetail gain optional `golden` (the calibration-set flag);
+// the golden set is fetched via fetchGoldenEpisodes and toggled via setEpisodeGolden in operate-api.
 // lib/operate-api.ts types against these.
 
 /** One belief-state driver signal at a turn, already labeled (e.g. "Walk-away risk"). */
@@ -69,6 +71,9 @@ export interface EpisodeSummary {
   escalated: boolean;
   turn_count: number;
   duration_ms: number | null;
+  /** CB-30: true when this call is tagged into the golden calibration set (metrics['golden']). The
+   *  Review page shows a golden indicator + a "Mark golden / Golden ✓" toggle that flips this. */
+  golden?: boolean;
   created_at: string | null;
 }
 
