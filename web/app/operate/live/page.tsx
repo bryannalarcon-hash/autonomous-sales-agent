@@ -49,12 +49,16 @@ import { archetypeLabel, versionLabel } from '@/lib/labels';
 import type { ActiveCallSummary, ActiveCallsResponse, BeliefSnapshot, LiveSnapshot, Turn } from '@/lib/operate-types';
 import { ApiError, API_BASE, startAutoDemo } from '@/lib/api';
 
-const POLL_MS = 5000;
-// CB-31: while a call is ACTIVE, poll the DETAIL snapshot faster (~1 s) so the agent reply streamed
-// by the voice worker (snap.live_partial) fills in word-by-word with ≤~1 s lag instead of waiting for
-// the 5 s poll. The faster poll runs ONLY while a real call is active (gated below); it stops when no
-// call is on the line, so an idle page stays on the cheap 5 s cadence.
-const ACTIVE_DETAIL_POLL_MS = 1000;
+// Queue poll cadence. The 0-turn connect upsert (CB-32) makes a call appear the instant the room is
+// up — but the page only SEES it on the next poll tick, so a slow cadence makes a fresh call show
+// "after the first round" instead of on ring. 2 s surfaces a ringing call near-instantly while staying
+// cheap when idle.
+const POLL_MS = 2000;
+// CB-31/CB-38: while a call is ACTIVE, poll the DETAIL snapshot fast so the agent reply the voice
+// worker STREAMS to TTS (snap.live_partial) fills in word-by-word instead of snapping to the committed
+// turn. A streamed turn lasts only ~1-2 s, so a 1 s poll often misses the partial window before the
+// turn commits; 500 ms catches several partials per turn. Runs ONLY while a real call is active.
+const ACTIVE_DETAIL_POLL_MS = 500;
 
 /** A `now` timestamp that ticks once a second so a live call's elapsed duration counts up in the UI
  *  (the live snapshot has no duration_ms until the call ends). Pure clock — no data fetch. */
