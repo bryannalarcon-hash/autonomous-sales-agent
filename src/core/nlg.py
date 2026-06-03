@@ -4,9 +4,13 @@
 # for one concise spoken-style turn. If retrieved_facts is given (KB grounding, wired in U5), the
 # reply is constrained to those facts (state no fact absent from them). Decouples strategy (policy)
 # from surface text (CraigslistBargain policy<->NLG split). Pure + async, NO LiveKit imports.
-# CB-29 (no hallucinated slots): the system prompt ALWAYS carries a hard grounding rule forbidding the
-# agent from asserting any person/relationship/gender/grade/subject the DST has not confirmed; with no
-# confirmed student slot it must use neutral phrasing ("you"/"the learner"), never "your daughter".
+# CB-29/CB-34 (no hallucinated slots, no presumed learner): the system prompt ALWAYS carries a hard
+# grounding rule forbidding the agent from asserting any person/relationship/gender/grade/subject — or
+# even the EXISTENCE of a learner — the DST has not confirmed; with no confirmed learner it uses neutral
+# phrasing ("you") and finds out who the tutoring is for first, never "your daughter".
+# CB-36 (no invented conversational context): a second hard rule forbids referencing any objection,
+# topic, or concern the prospect did NOT raise, and requires acknowledging a disclosure/complaint
+# before any pitch. Both rules are appended LAST so an authored config prompt can't override them.
 from __future__ import annotations
 
 from typing import Any, Optional, Sequence
@@ -41,27 +45,46 @@ _PERSONA_FALLBACK = (
     "educational, and concise. You speak in short, natural spoken sentences (this may be read aloud)."
 )
 
-# CB-29 (hallucinated slots): a HARD grounding rule that always applies. The agent invented a
-# "daughter"/"student" the caller never mentioned (and presumed a gender/grade/subject). It must
-# speak ONLY from the CONFIRMED belief slots (KNOWN_SO_FAR) + retrieved facts — never asserting a
-# person, relationship, gender, grade, subject, or any other detail the DST has not actually filled.
-# When there is no confirmed learner/student slot, use neutral phrasing ("you" / "the learner"),
-# never "your daughter"/"your son"/"your child"/"your student".
+# CB-29/CB-34 (hallucinated slots + presumed learner): a HARD grounding rule that always applies. The
+# agent invented a "daughter"/"student" the caller never mentioned (presumed a gender/grade/subject)
+# AND presumed a learner EXISTS ("what grade is the learner in?") before discovery established one. It
+# must speak ONLY from the CONFIRMED belief slots (KNOWN_SO_FAR) + retrieved facts — never asserting a
+# person, relationship, gender, grade, subject, or the very EXISTENCE of a learner the DST has not
+# confirmed. With no confirmed learner, use neutral phrasing ("you" / "the learner") and do not assume
+# the caller even has a learner — find out WHO the tutoring is for first.
 _NO_HALLUCINATED_SLOTS = (
     "GROUNDING RULE (do not break): speak ONLY from KNOWN_SO_FAR (the confirmed facts) and any "
     "retrieved facts below. Do NOT invent or presume ANY detail the prospect has not stated — never "
     "assert a child, son, daughter, student, their gender, their grade, their subject, or any "
-    "relationship that is not in KNOWN_SO_FAR. If no student/learner is named in KNOWN_SO_FAR, say "
-    "\"you\" or \"the learner\", never \"your daughter\"/\"your son\"/\"your child\"/\"your student\". "
+    "relationship that is not in KNOWN_SO_FAR. Do NOT presume a learner even EXISTS: if no learner/"
+    "student is confirmed in KNOWN_SO_FAR, do not ask about \"the learner\"/\"your student\" as if one "
+    "is given — first find out who the tutoring is for (the caller themselves, their child, or someone "
+    "else). Use \"you\", never \"your daughter\"/\"your son\"/\"your child\"/\"your student\". "
     "Ask, don't assume."
+)
+
+# CB-36 (no invented conversational context): the agent referenced things the caller never raised — it
+# invented "timing matters" / "think it through", answered a "free resources" objection nobody raised,
+# and pitched right after the caller disclosed being mistreated by a past tutor. NLG must respond ONLY
+# to what the caller actually said this call: never introduce an objection, concern, or topic the
+# prospect did not raise (ACTIVE_OBJECTION/PROSPECT_ASKED carry what they DID raise), and when they
+# disclose a concern or a bad experience, ACKNOWLEDGE it — do not pivot to a pitch or sales line.
+_NO_INVENTED_CONTEXT = (
+    "CONTEXT RULE (do not break): respond ONLY to what the prospect actually said. Do NOT introduce an "
+    "objection, worry, or topic they did not raise (e.g. do not bring up \"timing\", \"thinking it "
+    "over\", or free resources unless THEY did), and do NOT answer a concern nobody voiced. If they "
+    "disclosed a problem or a bad past experience, acknowledge THAT first — never follow a disclosure "
+    "with a pitch or a sales push."
 )
 
 
 def _persona_system(config: AgentConfig) -> str:
     """The persona system prompt: prefer the authored NLG prompt + persona, else a safe fallback.
 
-    Always appends the CB-29 no-hallucinated-slots grounding rule LAST so it can't be overridden by
-    an authored prompt — the agent must never assert a person/relationship/grade the DST hasn't filled.
+    Always appends the CB-29/CB-34 no-hallucinated-slots/no-presumed-learner grounding rule AND the
+    CB-36 no-invented-context rule LAST so an authored prompt can't override them — the agent must
+    never assert a person/relationship/grade/learner the DST hasn't confirmed, and must respond only
+    to what the prospect actually raised (no invented objections/topics; acknowledge disclosures).
     """
     persona = config.persona
     persona_line = (
@@ -71,7 +94,15 @@ def _persona_system(config: AgentConfig) -> str:
     )
     authored = config.prompts.get("nlg") or ""
     base = "\n".join(
-        p for p in (_PERSONA_FALLBACK, persona_line, authored, _NO_HALLUCINATED_SLOTS) if p
+        p
+        for p in (
+            _PERSONA_FALLBACK,
+            persona_line,
+            authored,
+            _NO_HALLUCINATED_SLOTS,
+            _NO_INVENTED_CONTEXT,
+        )
+        if p
     ).strip()
     return base
 

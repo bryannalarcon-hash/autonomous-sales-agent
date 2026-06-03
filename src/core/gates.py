@@ -2,6 +2,14 @@
 # each takes a PROPOSED Decision (from src/core/policy.py), the belief, and the AgentConfig, and
 # returns the ALLOWED/OVERRIDDEN Decision — gates have FINAL say over the LLM proposal (neuro-
 # symbolic: LLM proposes, gates decide). apply_gates() chains them in priority order.
+#   de_escalate         — CB-37: hostility (belief.meta["hostility"]) or EXTREME bail
+#                         (>= extreme_bail_deescalate) -> escalate (graceful hand-off/exit); runs FIRST
+#                         so nothing downstream can re-introduce a pitch/close/re-ask on a hostile call.
+#   no_repeat_discovery — CB-35: drop a re-ask of a slot already FILLED / DECLINED
+#                         (belief.meta["declined_slots"]) / asked >= max_slot_asks
+#                         (belief.meta["asked_slots"]); never re-ask the same question a 3rd time.
+#   establish_who_first — CB-34: a learner-specific ask first establishes WHO the tutoring is for
+#                         (belief.meta["learner_established"]/["learner_denied"]) — never presume a learner.
 #   skip_known          — never ask a slot already filled at/above lock confidence.
 #   offer_low_commitment_on_budget— repeated FIRM budget refusals (cumulative count in belief.meta) ->
 #                         offer the FREE callback rung (help + a future meeting), denying only the paid
@@ -70,6 +78,15 @@ _DEFAULTS: dict[str, float] = {
     # 9 & 11 with ZERO discovery). The free 'callback' rung is exempt (a no-cost follow-up is never
     # pushy). Default 1: the agent must have learned at least one concrete thing about the learner.
     "discovery_slots_before_close": 1,
+    # CB-37: at/above this bail_risk (OR any detected hostility), the agent must DE-ESCALATE / offer a
+    # graceful exit / escalate — never pitch, close, or re-ask. This is stricter than pushiness_cap
+    # (which merely backs pressure off to a low-pressure act): extreme bail means the call is over, so
+    # we hand off rather than keep engaging. Set ABOVE pushiness_cap so there's a back-off band first.
+    "extreme_bail_deescalate": 0.9,
+    # CB-35: a discovery slot ASKED at least this many times within one call is dropped permanently —
+    # the agent never re-asks the same question a third time (the live call re-asked grade 5x). Asked
+    # TWICE is the ceiling; the third proposed ask is dropped.
+    "max_slot_asks": 2,
 }
 
 
@@ -101,6 +118,155 @@ def skip_known(decision: Any, belief: BeliefState, config: AgentConfig) -> Any:
         out.rationale = f"skip_known: {decision.target_slot} already known; confirming not re-asking"
         return out
     return decision
+
+
+# --- no_repeat_discovery (CB-35: never re-ask an answered / declined / over-asked slot) ---------
+
+# Learner-specific discovery slots whose presumption a learner-denial invalidates (CB-34): if the
+# caller denied having a learner, asking any of these is presuming the learner exists.
+_LEARNER_SLOTS = frozenset({"grade_level", "subject", "goal", "timeline", "prior_tutoring"})
+
+
+def _redirect_after_dropped_ask(decision: Any, belief: BeliefState, reason: str) -> Any:
+    """Replace a dropped discovery `ask` with a non-repeating act: answer an open question if one is
+    pending, otherwise re-anchor on value (pitch). Never silence, never re-ask the dropped slot."""
+    out = decision.copy()
+    out.act = "answer_via_kb" if belief.open_question else "pitch"
+    out.target_slot = None
+    out.tier = None
+    out.rationale = reason
+    return out
+
+
+def no_repeat_discovery(decision: Any, belief: BeliefState, config: AgentConfig) -> Any:
+    """Never re-ask a discovery slot that is already FILLED, DECLINED, or asked too many times (CB-35).
+
+    The live call re-asked "what grade?" five times even after the caller answered "Third" and after
+    declining a learner. This HARD guard drops the repeat: an `ask` (or `confirm_known` that would
+    re-prompt) for a slot that is (a) already filled at lock confidence, (b) recorded as DECLINED in
+    belief.meta["declined_slots"], or (c) already asked >= max_slot_asks times
+    (belief.meta["asked_slots"][slot]) is redirected to a non-repeating act. skip_known still handles
+    the confirm-instead-of-ask for a freshly filled slot; this catches the declined / over-asked cases
+    skip_known does not. asked_slots is maintained in respond() from the GATED decision's target_slot."""
+    if decision.act != "ask" or not decision.target_slot:
+        return decision
+    slot = decision.target_slot
+    # Already known -> skip_known handles it (confirm, don't re-ask); leave it for that gate.
+    if belief.slot_confidence(slot) >= _LOCK_CONFIDENCE:
+        return decision
+    declined = slot in set(belief.meta.get("declined_slots", []))
+    asked = int(dict(belief.meta.get("asked_slots", {})).get(slot, 0))
+    over_asked = asked >= int(_threshold(config, "max_slot_asks"))
+    if declined:
+        return _redirect_after_dropped_ask(
+            decision, belief, f"no_repeat_discovery: '{slot}' was declined; dropping it permanently"
+        )
+    if over_asked:
+        return _redirect_after_dropped_ask(
+            decision, belief,
+            f"no_repeat_discovery: '{slot}' already asked {asked}x; dropping to avoid repeating",
+        )
+    return decision
+
+
+# --- establish_who_first (CB-34: don't presume a learner exists before discovery establishes one) ---
+
+def establish_who_first(decision: Any, belief: BeliefState, config: AgentConfig) -> Any:
+    """Establish WHO the tutoring is for before any learner-specific question (CB-34).
+
+    The live call asked "what grade is the learner in?" before discovery had established a learner even
+    existed — the caller protested "I did not say I had a learner" — and then later PITCHED after the
+    denial, producing a broken context-less reply. A decision PRESUMES a learner when it asks a
+    learner-specific slot (grade/subject/goal/timeline/prior_tutoring) OR tries to sell (pitch/close).
+    Until a learner is ESTABLISHED (belief.meta["learner_established"]), any presuming decision is
+    redirected: answer the caller's open question if they raised one, else ask the 'who_for' step. A
+    non-presuming act (answer_via_kb / handle_objection / escalate / the who_for ask itself) passes
+    untouched. To avoid a who-is-this-for loop, once who_for has been asked max_slot_asks times with no
+    answer we stop redirecting and let the (give-up) decision through."""
+    # A learner is "known" when the DST flagged it (meta) OR any learner-specific slot is already filled
+    # (if we know the grade/subject, a learner obviously exists — covers beliefs built straight from
+    # slots without the meta flag, the normal post-discovery state).
+    learner_known = bool(belief.meta.get("learner_established")) or any(
+        belief.slot_confidence(s) >= _LOCK_CONFIDENCE for s in _LEARNER_SLOTS
+    )
+    if learner_known:
+        return decision  # we know who it's for — learner-specific discovery / pitch / close is fine
+    learner_ask = decision.act == "ask" and decision.target_slot in _LEARNER_SLOTS
+    # A PITCH/CLOSE is blocked here ONLY when the caller EXPLICITLY DENIED a learner and we haven't
+    # re-established one — the demonstrated failure (pitching right after "I didn't say I had a learner",
+    # which produced a context-less broken reply). A normal warm pre-close pitch is governed by
+    # close_floor / advance_to_close, NOT this gate, so we don't block legitimate closes.
+    sell_after_denial = decision.act in ("pitch", "attempt_close") and bool(belief.meta.get("learner_denied"))
+    if not (learner_ask or sell_after_denial):
+        return decision  # answer_via_kb / handle_objection / escalate / who_for ask / warm pitch — fine
+    # Don't loop forever: if who-it's-for was already asked the cap number of times with no answer,
+    # stop redirecting and let the decision through (graceful give-up; matches no_repeat_discovery).
+    asked_who = int(dict(belief.meta.get("asked_slots", {})).get("who_for", 0))
+    if asked_who >= int(_threshold(config, "max_slot_asks")):
+        return decision
+    out = decision.copy()
+    if belief.open_question:
+        # The caller asked something — answer it rather than pushing another who-question at them.
+        out.act = "answer_via_kb"
+        out.target_slot = None
+        out.rationale = (
+            "establish_who_first: no learner established; answering the caller's question before any "
+            "learner-specific step or pitch"
+        )
+        return out
+    # No learner established (or just denied), no open question -> find out who it's for before any
+    # learner-specific question OR pitch/close.
+    out.act = "ask"
+    out.target_slot = "who_for"
+    out.tier = None
+    out.rationale = (
+        f"establish_who_first: no learner established yet; establishing who the tutoring is for before "
+        f"'{decision.target_slot or decision.act}'"
+    )
+    return out
+
+
+# --- de_escalate (CB-37: extreme bail / hostility -> de-escalate, never pitch/close/re-ask) --------
+
+def _hostile_or_extreme_bail(belief: BeliefState, config: AgentConfig) -> Optional[str]:
+    """Return a de-escalation reason if the caller is hostile/abusive OR bail_risk is extreme; else None."""
+    if bool(belief.meta.get("hostility")):
+        return "caller hostile/abusive"
+    if float(belief.drivers.get("bail_risk", 0.0)) >= _threshold(config, "extreme_bail_deescalate"):
+        return "bail_risk extreme"
+    return None
+
+
+# Acts that are NEVER acceptable once the caller is hostile or about to walk: any pressure/close, any
+# discovery re-ask. We force a graceful de-escalation (escalate to a human / offer an exit) instead.
+_DEESCALATE_BLOCKED_ACTS = frozenset({"attempt_close", "pitch", "ask", "confirm_known", "handle_objection"})
+
+
+def de_escalate(decision: Any, belief: BeliefState, config: AgentConfig) -> Any:
+    """At extreme bail OR detected hostility, STOP selling and de-escalate (CB-37).
+
+    The live call kept pitching at bail=0.77 and even after "Fuck you". pushiness_cap backs pressure
+    off to a low-pressure act, but at EXTREME bail (>= extreme_bail_deescalate) or any detected
+    hostility the right move is to disengage gracefully — never pitch, close, or re-ask. We override
+    any selling/discovery act to `escalate` (a graceful human hand-off / exit). answer_via_kb and an
+    already-`escalate`/`disqualify` act are left alone so the agent can still answer a final direct
+    question or release. Runs FIRST in the chain so nothing downstream can re-introduce pressure."""
+    reason = _hostile_or_extreme_bail(belief, config)
+    if reason is None:
+        return decision
+    if decision.act not in _DEESCALATE_BLOCKED_ACTS:
+        return decision  # answer_via_kb / escalate / disqualify are fine — not pressure
+    belief.escalation_imminent = True  # surface to the live monitor / SessionReport
+    out = decision.copy()
+    out.act = "escalate"
+    out.target_slot = None
+    out.tier = None
+    out.concession = None
+    out.rationale = (
+        f"de_escalate: {reason}; stopping the pitch and offering a graceful hand-off/exit instead of "
+        "pushing or re-asking"
+    )
+    return out
 
 
 # --- offer_low_commitment_on_budget -----------------------------------------------------------
@@ -587,15 +753,29 @@ def apply_gates(
 
     Order matters: escalation is checked FIRST and LAST — first so an EXTREME moment short-circuits
     everything, and again last so an override another gate produced still can't slip past an extreme
-    trigger. Between them: skip_known -> address_direct_input -> must_clear_objection -> price_gate
-    -> pushiness_cap -> offer_low_commitment_on_budget (last, so the free-callback offer has final say).
+    trigger. de_escalate runs right after the first escalation check (CB-37): hostility or extreme bail
+    hands off gracefully before any gate can propose pressure. Between them: skip_known ->
+    no_repeat_discovery (CB-35) -> establish_who_first (CB-34) -> address_direct_input ->
+    must_clear_objection -> price_gate -> advance_to_close -> close_floor -> pushiness_cap ->
+    offer_low_commitment_on_budget (last, so the free-callback offer has final say).
     """
     # Extreme moments dominate: nothing else matters if we must defer.
     escalated = escalation_triggers(decision, belief, config, history=history)
     if escalated.act == "escalate":
         return escalated
 
+    # CB-37: hostility or EXTREME bail short-circuits to a graceful hand-off BEFORE anything else can
+    # propose pressure or a discovery re-ask — the call is over, disengage rather than keep selling.
+    deescalated = de_escalate(decision, belief, config)
+    if deescalated.act == "escalate":
+        belief.escalation_imminent = True
+        return deescalated
+
     d = skip_known(decision, belief, config)
+    # CB-35: drop a re-ask of an answered/declined/over-asked discovery slot (HARD no-repeat guard).
+    d = no_repeat_discovery(d, belief, config)
+    # CB-34: don't presume a learner exists — a learner-specific ask first establishes who it's for.
+    d = establish_who_first(d, belief, config)
     d = address_direct_input(d, belief, config, history=history)  # answer/handle input, but let pitch advance
     d = must_clear_objection(d, belief, config)
     d = price_gate(d, belief, config)

@@ -12,6 +12,8 @@
 #     errors so a persistence hiccup never crashes the call path. CB-31: an optional `live_partial`
 #     carries the in-progress (not-yet-committed) agent reply being streamed to TTS, written to
 #     metrics["live_partial"] so the monitor can render words filling in before the turn commits.
+#     CB-33: cohort defaults to "live" but reads LIVE_PERSIST_COHORT — the DB-gated tests set it to
+#     "test" so their live upserts are excluded from the operator monitor (no phantom active call).
 #   - persist_call_end(session, ...) saves it via the store in FK-safe order (lead -> episode ->
 #     escalations) and persists per-lead memory (persist_lead_after_call, phone-hash only). The lead
 #     key is SINGLE-SOURCED server-side: raw_phone -> schema.phone_hash(raw_phone); a bound-hash call
@@ -23,6 +25,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -160,6 +163,11 @@ async def persist_call_live(
     can surface it and the monitor renders the words filling in before the turn commits. It is metadata
     only (NOT a committed Turn); when absent (the per-turn / connect-time upsert) the key is omitted, so
     the next upsert after the turn commits clears it.
+
+    CB-33: the cohort is normally "live" (a real call). The DB-gated tests that drive THIS function
+    against the shared dev Postgres set LIVE_PERSIST_COHORT="test" so their in_progress upserts are
+    tagged "test" — operate._is_active excludes that cohort, so a pytest run can't flash a phantom
+    "active" call on the operator monitor. Prod leaves the env unset -> "live" (unchanged behavior).
     """
     try:
         from src.memory import store
@@ -184,6 +192,10 @@ async def persist_call_live(
         if live_partial:
             metrics["live_partial"] = live_partial
 
+        # CB-33: "live" in prod; the DB-gated tests set LIVE_PERSIST_COHORT="test" so their upserts are
+        # tagged "test" (excluded from the live monitor by operate._is_active) — never a phantom call.
+        cohort = os.environ.get("LIVE_PERSIST_COHORT", "live")
+
         episode = Episode(
             episode_id=episode_id,
             turns=turns,
@@ -195,7 +207,7 @@ async def persist_call_live(
             channel=channel,
             lead_phone_hash=None,
             persona=persona_name,
-            cohort="live",
+            cohort=cohort,
             escalated=False,
             metrics=metrics,
             created_at=created_at,

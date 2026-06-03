@@ -631,13 +631,60 @@ _RUN_HELD_OUT_SEED = 7
 
 # COST/availability bound for the A/B (CB-15: it is a full real self-play run — minutes, paid — so it
 # runs in a BACKGROUND task, not inline, and is bounded + serialized rather than hanging the request or
-# stacking paid work). The background run is wrapped in asyncio.wait_for(_RUN_TIMEOUT_S) and guarded by
-# a semaphore of _RUN_CONCURRENCY permits acquired BEFORE the task is spawned: a 2nd run while one holds
-# the permit returns 503 (busy) without starting more paid work; a run that exceeds the timeout settles
+# stacking paid work). The background run is wrapped in asyncio.wait_for(<budget>) and guarded by a
+# semaphore of _RUN_CONCURRENCY permits acquired BEFORE the task is spawned: a 2nd run while one holds
+# the permit returns 503 (busy) without starting more paid work; a run that exceeds the budget settles
 # the record to a terminal `rejected` (CB-20 — never a perpetual `running`). A full job-queue is out of
 # scope here.
-_DEFAULT_RUN_TIMEOUT_S = 180.0
+#
+# CB-40: the budget is NOT a fixed 180s any more. Since CB-15 made the run ASYNC (the request returns
+# 202 and a background task settles the record), the cap protects no caller — it only acted as a
+# guillotine that killed every honest real-LLM A/B (a less-pushy challenger holds LONGER conversations,
+# so a modest run blew past 180s and settled "rejected — timed out"; confirmed at n=8 AND n=4). The
+# budget now SCALES with the run's actual size (compute_run_timeout_s): both arms run sequentially, so
+# the work is ~ n_per_arm * 2 arms * max_turns turns, each turn a paid LLM round-trip. We size to a
+# per-turn budget with a generous floor (tiny runs still get minutes) and a sane absolute ceiling so a
+# genuinely hung run still settles failed instead of running forever.
 _DEFAULT_RUN_CONCURRENCY = 1
+# Turns the A/B self-play is bounded to PER episode. Mirrors run_experiment / selfplay.run_batch's
+# max_turns default (24); the background run passes this SAME value to run_experiment so the budget and
+# the actual cap can never drift. Kept here so compute_run_timeout_s sizes from the real bound.
+_RUN_MAX_TURNS = 24
+# Per-turn wall-clock budget (s): amortized over a self-play episode (most episodes terminate well
+# before max_turns, so this is a per-MAX-turn allowance, not a per-actual-turn one). Sized so a typical
+# run (n up to the _MAX_RUN_N cap) lands inside the scaling band below the ceiling — the budget then
+# genuinely scales with n + turns — while a pathological all-arms-run-to-the-cap job is what the ceiling
+# catches. Still generous: a slow model or a retry must not trip the budget on a healthy run.
+_RUN_SECONDS_PER_TURN = 3.0
+# Floor: even a tiny run (n=5, the minimum sample) gets at least this long, so the budget never starves
+# a legitimately short A/B. Comfortably above the old 180s cap.
+_RUN_TIMEOUT_FLOOR_S = 300.0
+# Absolute ceiling: a genuinely hung/runaway run still settles `rejected` rather than holding the single
+# concurrency permit forever (CB-20). ~30 min.
+_RUN_TIMEOUT_CEILING_S = 1800.0
+
+
+def compute_run_timeout_s(
+    n: int,
+    max_turns: int = _RUN_MAX_TURNS,
+    *,
+    seconds_per_turn: float = _RUN_SECONDS_PER_TURN,
+    floor_s: float = _RUN_TIMEOUT_FLOOR_S,
+    ceiling_s: float = _RUN_TIMEOUT_CEILING_S,
+) -> float:
+    """The wall-clock budget (seconds) for a background A/B of `n` personas PER ARM at `max_turns`
+    turns/episode (CB-40). Replaces the vestigial fixed 180s cap, which since CB-15 (async runs)
+    protected no request and only killed honest real-LLM runs (a less-pushy challenger talks longer ->
+    >180s -> falsely "timed out").
+
+    Sizing: both arms run SEQUENTIALLY on the same frozen held-out set, so the run does about
+    `n * 2 arms * max_turns` paid LLM turns; at `seconds_per_turn` each that is the estimate. The result
+    is clamped to [floor_s, ceiling_s] so a tiny run still gets minutes (floor) and a genuinely hung run
+    still settles failed (ceiling, CB-20). Monotonic non-decreasing in both `n` and `max_turns`. Inputs
+    are coerced to non-negative so a degenerate 0 can't yield a negative budget (the floor wins)."""
+    arms = 2
+    estimate = max(0, int(n)) * arms * max(0, int(max_turns)) * float(seconds_per_turn)
+    return float(min(max(estimate, float(floor_s)), float(ceiling_s)))
 
 
 class MetricChange(BaseModel):
@@ -705,7 +752,7 @@ def create_improve_router(
     champion_config_provider: Optional[Callable[[], AgentConfig]] = None,
     llm_client_factory: Optional[Callable[[], LLMClient]] = None,
     experiment_runner: Optional[Callable[..., Awaitable[list[Any]]]] = None,
-    run_timeout_s: float = _DEFAULT_RUN_TIMEOUT_S,
+    run_timeout_s: Optional[float] = None,
     run_max_concurrency: int = _DEFAULT_RUN_CONCURRENCY,
 ) -> APIRouter:
     """Build the /api Improve router. `improve_store` is injectable (default Postgres store, tests
@@ -719,11 +766,17 @@ def create_improve_router(
 
     `run_timeout_s` / `run_max_concurrency` BOUND the paid BACKGROUND A/B (CB-15): POST
     /api/experiments/run persists a `running` record + returns 202 immediately, then a background task
-    runs the A/B wrapped in asyncio.wait_for(run_timeout_s) and guarded by a semaphore of
+    runs the A/B wrapped in asyncio.wait_for(<budget>) and guarded by a semaphore of
     run_max_concurrency permits — a contended concurrent run returns 503 (busy) up front, and a run
     past the budget settles the record to a terminal state rather than hanging or lingering `running`
-    forever (CB-20). server.create_app uses the defaults; tests override them for fast, deterministic
-    coverage. All endpoints are async."""
+    forever (CB-20).
+
+    CB-40: `run_timeout_s` defaults to None = AUTO — the budget is computed PER RUN from its size via
+    compute_run_timeout_s(n, _RUN_MAX_TURNS) (scales with n and turns, floored to minutes, capped at
+    ~30 min). The old fixed 180s cap killed every honest real-LLM A/B once CB-15 made runs async, so it
+    is gone. Pass an explicit `run_timeout_s` ONLY to override the auto budget (tests set a tiny value
+    to force a fast timeout deterministically). server.create_app uses the auto default. All endpoints
+    are async."""
     store: ImproveStore = improve_store if improve_store is not None else _StoreBackedImproveStore()
     get_config = champion_config_provider or (lambda: load_config("champion_v0"))
     # One semaphore for the whole router instance bounds concurrent paid runs. Created here (3.10+
@@ -791,6 +844,15 @@ def create_improve_router(
         # CB-24: a specific failure reason captured here is threaded to _settle_failed_run so the lab
         # explains a timeout vs an exception class rather than the generic "timed out or failed".
         failure_reason: Optional[str] = None
+        # CB-40: size the budget to THIS run. AUTO (run_timeout_s is None) -> scale from n + the run's
+        # own max_turns so a longer (less-pushy) A/B isn't falsely killed; an explicit override (tests)
+        # wins so a tiny value can force a fast, deterministic timeout. Pass the SAME max_turns to
+        # run_experiment so the budget and the actual turn cap can never drift.
+        timeout_s = (
+            run_timeout_s
+            if run_timeout_s is not None
+            else compute_run_timeout_s(n, _RUN_MAX_TURNS)
+        )
         try:
             held_out = frozen_held_out(seed=_RUN_HELD_OUT_SEED, n=n, rotation_index=0)
             experiment = await asyncio.wait_for(
@@ -801,9 +863,10 @@ def create_improve_router(
                     _make_llm,
                     _make_llm,
                     seed=_RUN_HELD_OUT_SEED,
+                    max_turns=_RUN_MAX_TURNS,
                     runner=experiment_runner,
                 ),
-                timeout=run_timeout_s,
+                timeout=timeout_s,
             )
             # CB-25: persist the A/B "mock calls" (both arms) with deterministic ids before settling, so
             # the detail page can list them and Review can open each. Best-effort — a persist hiccup
@@ -833,11 +896,12 @@ def create_improve_router(
             await store.save_experiment(record)
             settled = True
         except asyncio.TimeoutError:
-            # CB-24: distinguish a timeout — show how long it ran before the budget tripped.
+            # CB-24: distinguish a timeout — show how long it ran before the budget tripped. CB-40: the
+            # budget is the size-scaled (or overridden) value computed above, not a fixed 180s.
             failure_reason = (
-                f"the run timed out after {run_timeout_s:g}s — no result recorded"
+                f"the run timed out after {timeout_s:g}s — no result recorded"
             )
-            logger.warning("experiment run %s timed out after %ss", experiment_id, run_timeout_s)
+            logger.warning("experiment run %s timed out after %ss", experiment_id, timeout_s)
         except Exception as exc:
             # CB-24: name the failure (the exception class) instead of the generic "failed".
             failure_reason = (

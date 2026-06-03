@@ -21,6 +21,11 @@
 # STREAMED to TTS by the voice worker (from metrics["live_partial"]) — but ONLY while the call is
 # active, so the Live monitor renders the words filling in on the active turn near-real-time; None on
 # a completed/inactive call (the committed transcript carries the final text).
+# CB-33: _is_active also EXCLUDES rows tagged with a test cohort (_TEST_LIVE_COHORTS, default {"test"})
+# — pytest writes in_progress rows into the shared dev DB via the real persist_call_live, so without
+# this a test run would flash phantom "active" calls on the operator monitor (the CB-33 false alarm).
+# Tests set LIVE_PERSIST_COHORT="test" so their live upserts land in the excluded cohort; tests/conftest
+# additionally DELETEs any rows a run created so nothing accumulates.
 from __future__ import annotations
 
 import os
@@ -99,6 +104,18 @@ _UNFINISHED_OUTCOMES = frozenset({None, "", "in_progress"})  # not-yet-terminal 
 _COMPLETED_OVERFETCH = 3   # over-fetch multiplier for P3 completed-list scan
 _MAX_FETCH = 10000
 
+# CB-33: cohorts written ONLY by the test suite (the DB-gated integration/e2e tests that drive the
+# REAL persist_call_live against the shared dev Postgres). A row tagged with one of these is a test
+# artifact and MUST NEVER surface as a live/active call on the operator monitor — so a pytest run
+# can't flash a phantom "ongoing call" (the false alarm CB-33 fixes). Production live calls use
+# "live"; tests set LIVE_PERSIST_COHORT="test" so their in_progress upserts land here instead.
+# Overridable via env (comma-separated) only to widen the exclusion, never to drop "test".
+_TEST_LIVE_COHORTS = frozenset(
+    c.strip()
+    for c in os.environ.get("LIVE_TEST_COHORTS", "test").split(",")
+    if c.strip()
+) | {"test"}
+
 
 def _is_completed(ep: Episode) -> bool:
     """Terminal outcome + at least one turn — EXCEPT a terminal 'abandoned' hang-up, which is a real
@@ -121,8 +138,14 @@ def _is_active(ep: Episode, *, now: Optional[datetime] = None) -> bool:
     partial or an old seed row, which has NO heartbeat (or a stale one). created_at is the call START
     and is held STABLE across upserts, so it CANNOT measure freshness (a long real call would wrongly
     expire); the heartbeat is the only valid last-activity signal. No/garbled heartbeat => not live,
-    so legacy in_progress rows written before heartbeat tracking never masquerade as live calls."""
+    so legacy in_progress rows written before heartbeat tracking never masquerade as live calls.
+
+    CB-33: a row tagged with a TEST cohort (see _TEST_LIVE_COHORTS) is a pytest artifact written into
+    the shared dev DB by the DB-gated tests — it is NEVER a real live call, so it is excluded here
+    regardless of heartbeat freshness (the durable defense behind the conftest teardown cleanup)."""
     if ep.outcome not in _UNFINISHED_OUTCOMES:
+        return False
+    if (ep.cohort or "") in _TEST_LIVE_COHORTS:
         return False
     hb = (ep.metrics or {}).get("live_heartbeat")
     if not hb:

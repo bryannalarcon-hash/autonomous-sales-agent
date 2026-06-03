@@ -4,6 +4,9 @@
 # and that the episode_id used by the live upserts matches the one /end finalizes
 # so both paths upsert the SAME row. DB-free: all store calls are captured via the
 # injected hook pattern that already exists for call_end_persist_hook.
+# CB-33: the suite-wide conftest sets LIVE_PERSIST_COHORT="test" so any real live upsert stays off the
+# operator monitor; the prod-default ("live" cohort) assertion below clears that env to test the genuine
+# fall-through default.
 from __future__ import annotations
 
 import asyncio
@@ -131,7 +134,13 @@ def test_persist_call_live_returns_in_progress_episode():
         saved.append(ep)
         return ep.episode_id
 
-    with patch("src.memory.store.save_episode", side_effect=fake_save):
+    # CB-33: the session conftest sets LIVE_PERSIST_COHORT="test" so test live upserts stay off the
+    # operator monitor. This test pins the PROD DEFAULT (cohort "live"), so it clears that env var to
+    # exercise the genuine fall-through default independent of the suite-wide test tag.
+    with patch("src.memory.store.save_episode", side_effect=fake_save), \
+            patch.dict("os.environ", {}, clear=False):
+        import os as _os
+        _os.environ.pop("LIVE_PERSIST_COHORT", None)
         ep = _run_async(persist_call_live(
             session, config=cfg, channel="text",
             created_at=created_at, episode_id=episode_id,
@@ -141,7 +150,7 @@ def test_persist_call_live_returns_in_progress_episode():
     assert ep.episode_id == episode_id
     assert ep.outcome == "in_progress"
     assert ep.lead_phone_hash is None
-    assert ep.cohort == "live"
+    assert ep.cohort == "live"  # prod default (env cleared above)
     assert ep.created_at == created_at
     assert len(saved) == 1
     assert saved[0].episode_id == episode_id

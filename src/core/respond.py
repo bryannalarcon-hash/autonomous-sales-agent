@@ -11,6 +11,9 @@
 # CB-28: on a TOOL-USE act (answer_via_kb) grounded in retrieved_facts, the grounding facts are also
 # stamped on decision.meta["retrieved"] (JSON-able strings) so the runtime can persist them onto
 # Turn.retrieved and Call Review can show WHAT information was pulled for that answer.
+# CB-35: after the gated decision, respond() records the asked discovery slot on new_belief.meta
+# (asked_slots count + pending_ask_slot) so the no-repeat guard drops over-asked slots and the next
+# turn's DST grade-extraction knows the grade was just asked. Carried across the call by BeliefState.copy().
 from __future__ import annotations
 
 import logging
@@ -32,6 +35,28 @@ _timing_log = logging.getLogger("brain.timing")
 # CB-28: acts that GROUND their reply in retrieved KB facts (tool-use). Only these capture the
 # retrieved payload onto decision.meta["retrieved"] for Call Review's tool-use inspection panel.
 _TOOL_ACTS = frozenset({"answer_via_kb"})
+
+
+# CB-35: discovery acts that ASK the prospect for a slot value (used to count re-asks). confirm_known
+# is excluded — it confirms what we already have, it does not re-prompt the prospect for the answer.
+_ASK_ACTS = frozenset({"ask"})
+
+
+def _record_asked_slot(belief: BeliefState, decision: Any) -> None:
+    """Maintain the per-call ASKED-slot bookkeeping on belief.meta from the GATED decision (CB-35).
+
+    On an `ask` for a slot: bump belief.meta["asked_slots"][slot] and set ["pending_ask_slot"] = slot
+    (so the no_repeat_discovery gate can drop an over-asked slot next turn, and the DST knows the grade
+    was just asked). Any non-ask act clears the pending marker so a stale "we just asked X" can't carry
+    into an unrelated turn. Mutates the belief in place; copy() carries meta to the next turn's input."""
+    if decision.act in _ASK_ACTS and decision.target_slot:
+        slot = decision.target_slot
+        asked = dict(belief.meta.get("asked_slots", {}))
+        asked[slot] = int(asked.get(slot, 0)) + 1
+        belief.meta["asked_slots"] = asked
+        belief.meta["pending_ask_slot"] = slot
+    else:
+        belief.meta["pending_ask_slot"] = None
 
 
 def _last_agent_act(history: Optional[Sequence[Any]]) -> Optional[str]:
@@ -88,6 +113,13 @@ async def respond(
     # escalation streak (escalation_imminent is set inside the gates when an EXTREME trigger fires).
     if decision.confidence is not None:
         new_belief.decision_confidence = float(decision.confidence)
+
+    # CB-35: record which discovery slot the agent actually ASKS this turn so the no-repeat guard can
+    # drop a slot asked too many times, and so next turn's DST grade-extraction knows the grade was just
+    # asked (bare-number acceptance). Counted from the GATED decision (what the agent really does), and
+    # carried across the call on belief.meta by BeliefState.copy(). Only the `ask` act sets a pending
+    # slot + increments the count; any non-ask clears the pending marker so a stale one can't linger.
+    _record_asked_slot(new_belief, decision)
 
     # CB-28: when this turn is a TOOL-USE act (answer_via_kb) grounded in retrieved facts, capture
     # the facts that grounded it on decision.meta["retrieved"] (JSON-able strings) so the runtime can

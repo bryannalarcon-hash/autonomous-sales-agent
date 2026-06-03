@@ -12,8 +12,12 @@
 // SERVER-SIDE demo call that streams turns into the monitor over ~1-2 min, independent of the
 // browser; the existing queue poll surfaces + auto-selects it (no navigation, no client orchestrator
 // — navigating away no longer kills the call). A 503 (no LLM key / capacity) shows its reason.
-// The call-duration timer ticks live (useNow, 1 s) off created_at for active calls; auto-scroll is a
-// real toggle that pins the transcript scroller to the newest turn while on.
+// The call-duration timer ticks live (useNow, 1 s) off created_at for active calls.
+// CB-39 (auto-follow, don't trap the operator): the transcript scroller auto-follows the newest turn
+// ONLY while the operator is stuck to the bottom (within ~40px, tracked by an onScroll handler into
+// stuckToBottomRef); if they scroll UP to read earlier turns on a long call, new turns no longer yank
+// them down, and follow re-arms once they return to the bottom. The Auto-scroll toggle is the explicit
+// override on top of this (OFF = never follow; turning it back ON jumps to bottom and re-arms).
 // CB-12 (real-time streaming): for the SELECTED active call the page ALSO opens an SSE stream
 // (GET /api/demo/auto/stream?episode_id=<id>) and re-fetches the detail snapshot on each per-turn
 // event, so prospect/agent bubbles appear within sub-second of the server committing them instead of
@@ -435,14 +439,34 @@ function CallMonitor({
       ? now - startedMs
       : ((ep.metrics?.duration_ms as number | undefined) ?? null);
 
-  // Auto-scroll: when ON, pin the transcript scroller to the bottom as new turns stream in.
+  // Auto-scroll (CB-39): "auto-follow" the newest turn, but NEVER yank the operator down while they
+  // are reading earlier turns. The follow fires on a new turn ONLY when (a) the toggle is ON and
+  // (b) the scroller is currently stuck to the bottom (within ~40px). An onScroll handler tracks that
+  // stuck-to-bottom boolean in a ref (so it's read synchronously by the append-effect without an extra
+  // render): the moment the operator scrolls up, follow pauses; when they scroll back to the bottom it
+  // re-arms. The toggle is the operator's explicit override on top of this — OFF means never follow.
+  const FOLLOW_THRESHOLD_PX = 40;
   const [autoScroll, setAutoScroll] = useState(true);
   const streamRef = useRef<HTMLDivElement>(null);
+  // True while the scroller sits within FOLLOW_THRESHOLD_PX of the bottom. Starts true (transcript
+  // mounts pinned to the newest turn). A ref (not state) so the append-effect below reads the live
+  // value without resubscribing or causing a render on every scroll event.
+  const stuckToBottomRef = useRef(true);
+
+  const handleStreamScroll = useCallback(() => {
+    const el = streamRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stuckToBottomRef.current = distanceFromBottom < FOLLOW_THRESHOLD_PX;
+  }, []);
+
   useEffect(() => {
-    if (!autoScroll) return;
+    // Follow only when the toggle is on AND the operator hasn't scrolled up. If they scrolled up,
+    // leave their scroll position untouched so they can read earlier turns on a long call.
+    if (!autoScroll || !stuckToBottomRef.current) return;
     const el = streamRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [ep.turns.length, autoScroll]);
+  }, [ep.turns.length, autoScroll, livePartial]);
 
   return (
     <div className="lv">
@@ -508,13 +532,26 @@ function CallMonitor({
                   role="switch"
                   aria-checked={autoScroll}
                   aria-label="Toggle auto-scroll"
-                  onClick={() => setAutoScroll((v) => !v)}
+                  onClick={() =>
+                    setAutoScroll((v) => {
+                      const next = !v;
+                      // Turning follow back ON re-arms it: jump to the newest turn and mark stuck so
+                      // the next append keeps following (otherwise enabling it while scrolled up would
+                      // do nothing until the operator manually returned to the bottom).
+                      if (next) {
+                        const el = streamRef.current;
+                        if (el) el.scrollTop = el.scrollHeight;
+                        stuckToBottomRef.current = true;
+                      }
+                      return next;
+                    })
+                  }
                 >
                   <i />
                 </span>
               </span>
             </div>
-            <div className="lv-stream scroll" ref={streamRef}>
+            <div className="lv-stream scroll" ref={streamRef} onScroll={handleStreamScroll}>
               {ep.turns.map((t) => (
                 <TranscriptTurn key={t.turn_id} turn={t} />
               ))}

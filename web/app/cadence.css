@@ -306,7 +306,14 @@
 .cadence .lv-dur { font-family: var(--font-display); font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
 .cadence .lv-vtag { font-size: 11px; color: var(--text-3); margin-top: 2px; }
 .cadence .lv-tcard { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; position: relative; }
-.cadence .lv-stream { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px 20px; display: flex; flex-direction: column; gap: 15px; justify-content: flex-end; }
+/* CB-39: the transcript scroller. overflow-y:auto + a bounded height (flex:1/min-height:0 inside the
+   flex .lv-tcard) so it genuinely scrolls on a long call. NOTE: do NOT use justify-content:flex-end
+   here — on an overflowing column flex container that pushes the TOP turns above the scroll origin so
+   they become unreachable (the operator could not scroll up). Instead the FIRST turn gets margin-top:
+   auto, which bottom-aligns the transcript while it is short but keeps every earlier turn reachable
+   once it overflows. JS follow-to-bottom is gated on "stuck to bottom" in page.tsx. */
+.cadence .lv-stream { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; padding: 16px 18px 20px; display: flex; flex-direction: column; gap: 15px; }
+.cadence .lv-stream > :first-child { margin-top: auto; }
 .cadence .lv-turn { display: flex; flex-direction: column; gap: 5px; max-width: 88%; }
 .cadence .lv-turn.p { align-self: flex-start; }
 .cadence .lv-turn.a { align-self: flex-end; align-items: flex-end; max-width: 92%; }
