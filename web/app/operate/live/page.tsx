@@ -28,9 +28,13 @@
 // before the brain composes a turn) and the committed reply text on each "turn" event. ActiveAgentTurn
 // renders a clearly-LABELED "Generating…" spinner during the compose window (a — so the ~6 s gap is
 // never blank) and then REVEALS the reply word-by-word (b — useWordReveal) until the snapshot catches
-// up. The reveal text is the REAL committed reply, shown incrementally on the demo SSE path; real-voice
-// token streaming (core LLM + LiveKit TTS streaming) is DEFERRED. Both reuse the existing `.lv-speak`
-// dots + inline styles (no new cadence.css tokens).
+// up. The reveal text is the REAL committed reply, shown incrementally on the demo SSE path.
+// CB-31 (real-voice word streaming): for a REAL phone/web-voice call (no demo SSE), the voice worker
+// streams the agent reply to TTS in word chunks and upserts the growing partial onto the live row
+// (snap.live_partial). This page polls the DETAIL faster (~1 s via ACTIVE_DETAIL_POLL_MS) while a call
+// is active, and ActiveAgentTurn renders snap.live_partial on the active turn (taking precedence over
+// the spinner/dots), so the words fill in near-real-time and the partial clears once the turn commits.
+// Both reuse the existing `.lv-speak` dots + inline styles (no new cadence.css tokens).
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -42,6 +46,11 @@ import type { ActiveCallSummary, ActiveCallsResponse, BeliefSnapshot, LiveSnapsh
 import { ApiError, API_BASE, startAutoDemo } from '@/lib/api';
 
 const POLL_MS = 5000;
+// CB-31: while a call is ACTIVE, poll the DETAIL snapshot faster (~1 s) so the agent reply streamed
+// by the voice worker (snap.live_partial) fills in word-by-word with ≤~1 s lag instead of waiting for
+// the 5 s poll. The faster poll runs ONLY while a real call is active (gated below); it stops when no
+// call is on the line, so an idle page stays on the cheap 5 s cadence.
+const ACTIVE_DETAIL_POLL_MS = 1000;
 
 /** A `now` timestamp that ticks once a second so a live call's elapsed duration counts up in the UI
  *  (the live snapshot has no duration_ms until the call ends). Pure clock — no data fetch. */
@@ -137,17 +146,25 @@ function useWordReveal(text: string | null, seq: number): { shown: string; revea
   return { shown: out, revealing: count < wordCount };
 }
 
-/** CB-21: the active agent turn at the bottom of a LIVE transcript. Shows a labeled "Generating…"
- *  spinner while the brain composes, then reveals the just-arrived reply word-by-word, and falls back
- *  to the bare pulsing dots when live without an explicit generation signal. Reuses the existing
- *  `.lv-speak` dots (cadence.css) — label + reveal text are inline-styled, no new design tokens. */
+/** CB-21 / CB-31: the active agent turn at the bottom of a LIVE transcript. Priority order:
+ *  (1) CB-31 livePartial — the REAL voice worker is streaming this turn's reply word-by-word to TTS
+ *      (polled ~1 s via snap.live_partial); render the partial text directly as it grows, with a
+ *      trailing caret. This is the real-phone/web-voice streaming path.
+ *  (2) CB-21(b) streamReveal — the DEMO SSE path's just-committed reply, revealed word-by-word.
+ *  (3) CB-21(a) generating — the brain is composing (demo SSE "generating"): labeled spinner.
+ *  (4) idle live: bare pulsing dots between turns.
+ *  Reuses the existing `.lv-speak` dots (cadence.css) — label + reveal/partial text are inline-styled,
+ *  no new design tokens. */
 function ActiveAgentTurn({
   generating,
   streamReveal,
+  livePartial,
   lastAgentText,
 }: {
   generating: boolean;
   streamReveal: { text: string; seq: number } | null;
+  // CB-31: the in-progress reply being streamed to TTS on a real voice call (snap.live_partial).
+  livePartial?: string | null;
   // The text of the last committed agent turn in the snapshot — when it already equals the reveal
   // text, the snapshot has caught up so we stop revealing (no duplicate bubble).
   lastAgentText?: string | null;
@@ -159,14 +176,26 @@ function ActiveAgentTurn({
   // otherwise the snapshot's full bubble already carries this turn, so we only need the spinner (when
   // generating) or the idle dots.
   const showReveal = !!streamReveal && revealing && shown.length > 0 && !snapshotCaughtUp;
+  // CB-31: the live streamed partial takes precedence — it's the actual words being spoken right now
+  // on a real call. Suppress it once the snapshot's last committed agent turn already equals it (the
+  // turn committed; its full bubble now carries the text, so no duplicate).
+  const showLivePartial =
+    !!livePartial && livePartial.length > 0 && lastAgentText !== livePartial;
 
   return (
     <div className="lv-turn a" data-testid="active-agent-turn">
       <div className="lv-th">
         Alex (agent)<span>·</span>
-        {generating ? 'generating…' : 'now'}
+        {showLivePartial ? 'speaking…' : generating ? 'generating…' : 'now'}
       </div>
-      {showReveal ? (
+      {showLivePartial ? (
+        // CB-31: the real voice reply streamed so far (the SAME text the brain decided, surfaced as
+        // the worker speaks it) + a trailing caret. data-testid lets the e2e assert the partial path.
+        <div className="lv-bub" data-testid="live-partial">
+          {livePartial}
+          <span aria-hidden style={{ opacity: 0.6 }}>▍</span>
+        </div>
+      ) : showReveal ? (
         // The reply text revealed so far (real committed text, shown incrementally) + a trailing caret.
         <div className="lv-bub" data-testid="stream-reveal">
           {shown}
@@ -381,6 +410,9 @@ function CallMonitor({
   // CB-21(b): the latest committed reply text to reveal word-by-word on the active (demo) turn.
   streamReveal?: { text: string; seq: number } | null;
 }) {
+  // CB-31: the real voice worker's in-progress streamed reply for the active turn, carried on the
+  // live snapshot (only present while active). Rendered on ActiveAgentTurn as the words it speaks.
+  const livePartial = snap.live_partial ?? null;
   const ep = snap.episode!;
   const lastBelief = [...ep.turns].reverse().find((t) => t.belief)?.belief ?? null;
   const escalationImminent = snap.priority?.escalation_imminent ?? lastBelief?.escalation_imminent ?? false;
@@ -495,6 +527,7 @@ function CallMonitor({
                 <ActiveAgentTurn
                   generating={!!generating}
                   streamReveal={streamReveal ?? null}
+                  livePartial={livePartial}
                   lastAgentText={
                     [...ep.turns].reverse().find((t) => t.speaker === 'agent')?.text ?? null
                   }
@@ -887,6 +920,39 @@ export default function LivePage() {
       es?.close();
     };
   }, [selectedEpisodeId, endedSnap]);
+
+  // CB-31: a fast (~1 s) detail poll while a REAL call is on the line, so the voice worker's streamed
+  // partial reply (snap.live_partial) fills in word-by-word in near-real-time instead of waiting for
+  // the 5 s poll. Active only while the selected call is genuinely active and not frozen-ended; it
+  // tears down (back to the cheap 5 s cadence) the moment the call ends or no call is selected. The
+  // 5 s pollDetail above stays as the always-on fallback; this just adds finer-grained refreshes.
+  const callActive = snap?.active === true && snap.sample !== true && !endedSnap;
+  useEffect(() => {
+    if (!selectedEpisodeId || !callActive) return;
+    let cancelled = false;
+    let refreshing = false;
+    const epId = selectedEpisodeId;
+    const fastPoll = async () => {
+      if (cancelled || refreshing) return;
+      refreshing = true;
+      try {
+        const s = await fetchLive(epId);
+        if (!cancelled) {
+          setSnap(s);
+          setError(null);
+        }
+      } catch {
+        // transient — the 5 s poll reconciles.
+      } finally {
+        refreshing = false;
+      }
+    };
+    const id = setInterval(fastPoll, ACTIVE_DETAIL_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [selectedEpisodeId, callActive]);
 
   // N3: gate the shell's top-title LIVE pill on whether we're genuinely active (not sample, and not
   // showing the frozen ended view — a finished call is never "live").

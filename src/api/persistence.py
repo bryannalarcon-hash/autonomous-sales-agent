@@ -9,7 +9,9 @@
 #   - persist_call_live(session, ...) upserts an in_progress Episode per turn so the Live monitor
 #     can query calls WHILE they are happening. Uses a stable episode_id + created_at passed by the
 #     caller (both must stay constant across upserts). Anonymous (lead_phone_hash=None). Swallows DB
-#     errors so a persistence hiccup never crashes the call path.
+#     errors so a persistence hiccup never crashes the call path. CB-31: an optional `live_partial`
+#     carries the in-progress (not-yet-committed) agent reply being streamed to TTS, written to
+#     metrics["live_partial"] so the monitor can render words filling in before the turn commits.
 #   - persist_call_end(session, ...) saves it via the store in FK-safe order (lead -> episode ->
 #     escalations) and persists per-lead memory (persist_lead_after_call, phone-hash only). The lead
 #     key is SINGLE-SOURCED server-side: raw_phone -> schema.phone_hash(raw_phone); a bound-hash call
@@ -141,6 +143,7 @@ async def persist_call_live(
     channel: str,
     created_at: datetime,
     episode_id: str,
+    live_partial: Optional[str] = None,
 ) -> Optional[Episode]:
     """Upsert an in_progress Episode each turn so the Live monitor can query calls mid-call.
 
@@ -151,6 +154,12 @@ async def persist_call_live(
     The store is imported lazily so this module stays DB-free at import time. Swallows/logs DB errors
     like persist_call_end does — a persistence hiccup must NEVER crash the live call path. Returns the
     Episode on success or None on error.
+
+    CB-31: `live_partial` is the in-progress agent reply text being STREAMED to TTS for the turn that
+    has NOT committed yet — when set it is written to metrics["live_partial"] so operate.live_snapshot
+    can surface it and the monitor renders the words filling in before the turn commits. It is metadata
+    only (NOT a committed Turn); when absent (the per-turn / connect-time upsert) the key is omitted, so
+    the next upsert after the turn commits clears it.
     """
     try:
         from src.memory import store
@@ -159,6 +168,21 @@ async def persist_call_live(
         turns: list[Turn] = list(state.turns)
         stamp = config.stamp()
         persona_name = getattr(getattr(config, "persona", None), "name", None)
+
+        metrics: dict[str, Any] = {
+            # live_heartbeat = the moment of THIS upsert (last activity). _is_active (operate.py) reads
+            # it to keep a call "live" only while fresh — so a real call stays live for its whole run
+            # (the beat advances every turn) while an abandoned partial goes stale and drops out.
+            # duration_ms = now − stable start, so the Live monitor's running clock advances each turn
+            # (the per-second UI tick interpolates between these; clamped ≥0 for clock-skew safety).
+            "turn_count": len(turns),
+            "live_heartbeat": datetime.now(timezone.utc).isoformat(),
+            "duration_ms": max(0, int((datetime.now(timezone.utc) - created_at).total_seconds() * 1000)),
+        }
+        # CB-31: only carry the partial when one was passed (a mid-stream upsert) so the per-turn /
+        # connect-time upsert leaves the key absent and the monitor stops showing it once committed.
+        if live_partial:
+            metrics["live_partial"] = live_partial
 
         episode = Episode(
             episode_id=episode_id,
@@ -173,16 +197,7 @@ async def persist_call_live(
             persona=persona_name,
             cohort="live",
             escalated=False,
-            # live_heartbeat = the moment of THIS upsert (last activity). _is_active (operate.py) reads
-            # it to keep a call "live" only while fresh — so a real call stays live for its whole run
-            # (the beat advances every turn) while an abandoned partial goes stale and drops out.
-            # duration_ms = now − stable start, so the Live monitor's running clock advances each turn
-            # (the per-second UI tick interpolates between these; clamped ≥0 for clock-skew safety).
-            metrics={
-                "turn_count": len(turns),
-                "live_heartbeat": datetime.now(timezone.utc).isoformat(),
-                "duration_ms": max(0, int((datetime.now(timezone.utc) - created_at).total_seconds() * 1000)),
-            },
+            metrics=metrics,
             created_at=created_at,
         )
         await store.save_episode(episode)

@@ -5,6 +5,12 @@
 # turns commit (state.turns grows past turn=1), the belief advances, and persist_call_end finalizes
 # a terminal Episode. This is the regression harness for the live-call bug where SpeechHandle
 # done-callbacks never fired so 0 turns persisted and the committed belief never advanced.
+# CB-32 + CB-31 (test_voice_sim_connect_upsert_and_word_streaming): the harness also patches
+# persist_call_live to RECORD each in_progress upsert and wraps llm_node to record the chunks it
+# yields, then asserts (CB-32) a 0-turn in_progress upsert fires BEFORE the first committed turn — the
+# entrypoint's connect-time upsert, fired explicitly here since the sim doesn't run entrypoint — and
+# (CB-31) llm_node streams the reply as >1 chunk (rejoining to the EXACT reply, R37 parity), a
+# non-empty live_partial is written DURING a turn, and the turn still commits exactly once.
 #
 # HOW AUDIO IS INJECTED (the crux):
 #   A MockSTT subclasses livekit.agents.stt.STT and returns a MockSpeechStream from stream().
@@ -349,11 +355,23 @@ async def _run_sim(
     config: Any,
     brain_llm: MockLLMClient,
     captured_episode: list[Any],
+    captured_live: Optional[list[dict[str, Any]]] = None,
+    captured_chunks: Optional[list[list[str]]] = None,
 ) -> None:
     """Drive a full multi-turn simulated call through the REAL AgentSession pipeline.
 
     Returns when all caller lines have been fed and the shutdown path has persisted
     the final Episode into `captured_episode`.
+
+    CB-32/CB-31 instrumentation (optional):
+      - `captured_live`: every persist_call_live call is recorded as a dict
+        {turn_count, live_partial, has_partial, before_first_commit} so the test can assert a 0-turn
+        in_progress upsert fires BEFORE the first committed turn (CB-32) and that a live_partial is
+        written DURING a turn while it streams (CB-31). The connect-time upsert (the entrypoint's
+        post-disclosure _upsert_live_voice) is fired explicitly here, since the sim does not run the
+        real entrypoint.
+      - `captured_chunks`: the worker's llm_node is wrapped to record the list of chunks it yields per
+        turn, so the test can assert the reply streamed as >1 chunk (CB-31).
     """
     from livekit.agents import AgentSession
     from livekit.agents.voice.turn import TurnHandlingOptions
@@ -439,6 +457,45 @@ async def _run_sim(
     original_persist = persistence_mod.persist_call_end
     persistence_mod.persist_call_end = _fake_persist_end  # type: ignore[assignment]
 
+    # CB-32/CB-31: patch persist_call_live to a DB-free stub that RECORDS each upsert (turn_count +
+    # whether a live_partial was carried + whether it fired before the first commit). The worker calls
+    # persist_call_live (lazily imported inside _upsert_live_voice / _upsert_live_partial), so patching
+    # the persistence module's attribute is what those lazy imports resolve to.
+    original_persist_live = persistence_mod.persist_call_live
+
+    async def _fake_persist_live(vs: Any, *, config: Any, channel: str,
+                                 created_at: Any = None, episode_id: Any = None,
+                                 live_partial: Any = None, **kwargs: Any) -> Any:
+        if captured_live is not None:
+            committed_agent_turns = sum(
+                1 for t in vs.state.turns if getattr(t, "speaker", None) == "agent"
+            )
+            captured_live.append({
+                "turn_count": len(vs.state.turns),
+                "agent_turns": committed_agent_turns,
+                "live_partial": live_partial,
+                "has_partial": bool(live_partial),
+                "before_first_commit": committed_agent_turns == 0,
+            })
+        return None
+
+    persistence_mod.persist_call_live = _fake_persist_live  # type: ignore[assignment]
+
+    # CB-31: wrap the agent's llm_node so the chunks it yields per turn are recorded, proving the reply
+    # streams as >1 chunk (the real async-generator path runs unchanged underneath).
+    if captured_chunks is not None:
+        _orig_llm_node = agent.llm_node
+
+        async def _recording_llm_node(chat_ctx: Any, tools: Any, model_settings: Any):
+            this_turn: list[str] = []
+            async for chunk in _orig_llm_node(chat_ctx, tools, model_settings):
+                this_turn.append(chunk)
+                yield chunk
+            if this_turn:
+                captured_chunks.append(this_turn)
+
+        agent.llm_node = _recording_llm_node  # type: ignore[method-assign]
+
     try:
         worker_mod._register_persistence(
             fake_ctx, agent, config,
@@ -462,6 +519,11 @@ async def _run_sim(
                 break
         else:
             raise RuntimeError("AgentSession never reached started state")
+
+        # CB-32: mirror the entrypoint's connect-time upsert — fire ONE _upsert_live_voice right after
+        # the session starts (the entrypoint does this immediately after session.start + disclosure),
+        # BEFORE any caller line is fed / any turn commits. captured_live records it as a 0-turn upsert.
+        await worker_mod._upsert_live_voice(agent, config)
 
         logger.info("Session started. Feeding %d caller lines...", len(caller_lines))
 
@@ -520,6 +582,7 @@ async def _run_sim(
 
     finally:
         persistence_mod.persist_call_end = original_persist  # type: ignore[assignment]
+        persistence_mod.persist_call_live = original_persist_live  # type: ignore[assignment]
         if not session._closing and session._started:
             await session.aclose()
 
@@ -656,3 +719,91 @@ async def test_voice_sim_multi_turn_belief_advances_per_turn() -> None:
             "Only %d agent turn(s) committed; skipping multi-turn assertion (need >= 2)",
             len(agent_turns),
         )
+
+
+@pytest.mark.asyncio
+async def test_voice_sim_connect_upsert_and_word_streaming() -> None:
+    """CB-32 + CB-31 through the REAL AgentSession pipeline.
+
+    CB-32 (call visible at connect): the entrypoint upserts a 0-turn in_progress episode the instant
+    the room is up + the disclosure is spoken, BEFORE the first user turn / first committed brain turn.
+    We assert the FIRST recorded persist_call_live had 0 committed agent turns (before_first_commit),
+    so the call would show in the monitor's "Connecting…" state immediately.
+
+    CB-31 (real-voice word streaming): llm_node streams the (already-decided) reply to TTS in WORD
+    chunks (an AsyncIterator[str]) and upserts the growing PARTIAL text as it streams. We assert:
+      - the reply streamed as >1 chunk (it didn't return one whole string), and the chunks rejoin to
+        the EXACT committed reply (R37 parity — no word re-decided), and
+      - at least one persist_call_live carried a non-empty live_partial DURING a turn (the partial the
+        monitor renders filling in), and
+      - the turn still COMMITTED exactly once (state.turns grew; the never-committed bug stays fixed).
+    """
+    config = load_config("champion_v0")
+    reply = "Sure, let me get a few details about what your child is working on."
+    brain_llm = _agent_mock(act="ask", reply=reply)
+    captured_episode: list[Any] = []
+    captured_live: list[dict[str, Any]] = []
+    captured_chunks: list[list[str]] = []
+
+    await _run_sim(
+        caller_lines=["Hi, I'm looking for math tutoring.", "How much does it cost?"],
+        config=config,
+        brain_llm=brain_llm,
+        captured_episode=captured_episode,
+        captured_live=captured_live,
+        captured_chunks=captured_chunks,
+    )
+
+    # ---- CB-32: an in_progress upsert fired BEFORE the first committed turn ----
+    assert captured_live, "persist_call_live was never called — no live upsert recorded"
+    assert captured_live[0]["before_first_commit"] is True, (
+        f"CB-32: the FIRST live upsert must fire before any committed agent turn (the connect-time "
+        f"0-turn upsert), but the first recorded upsert had {captured_live[0]['agent_turns']} agent "
+        f"turns: {captured_live[0]}"
+    )
+    assert captured_live[0]["turn_count"] == 0, (
+        f"CB-32: the connect-time upsert must carry 0 turns, got {captured_live[0]['turn_count']}"
+    )
+
+    # ---- CB-31: the reply streamed as >1 chunk and rejoins to the exact reply ----
+    assert captured_chunks, "llm_node never yielded any chunks — the reply did not stream"
+    first_turn_chunks = captured_chunks[0]
+    assert len(first_turn_chunks) > 1, (
+        f"CB-31: llm_node must STREAM the reply in multiple word chunks, got "
+        f"{len(first_turn_chunks)} chunk(s): {first_turn_chunks!r}"
+    )
+    # R37 parity: the streamed chunks rejoin to the EXACT reply the brain decided (no re-decision).
+    assert "".join(first_turn_chunks) == reply, (
+        f"CB-31 parity: chunks must rejoin to the exact reply. "
+        f"got {''.join(first_turn_chunks)!r} != {reply!r}"
+    )
+
+    # ---- CB-31: a non-empty live_partial was written DURING a turn (mid-stream) ----
+    partials = [r for r in captured_live if r["has_partial"]]
+    assert partials, (
+        f"CB-31: at least one persist_call_live must carry a non-empty live_partial (the in-progress "
+        f"reply the monitor renders filling in). Recorded upserts: {captured_live}"
+    )
+    # The partial is (a prefix of) the SAME reply being streamed — a substring of the final reply.
+    some_partial = partials[0]["live_partial"]
+    assert some_partial and reply.startswith(some_partial.rstrip()) or some_partial in reply, (
+        f"CB-31: the live_partial must be a prefix of the streamed reply, got {some_partial!r}"
+    )
+
+    # ---- CB-31: the turn STILL committed exactly once (never-committed bug stays fixed) ----
+    assert captured_episode, "No episode captured — shutdown/commit did not fire"
+    ep = captured_episode[0]
+    agent_turns = [t for t in ep.turns if t.speaker == "agent"]
+    assert len(agent_turns) >= 1, "CB-31: streaming must not break the commit — no agent turn committed"
+    # The committed agent reply text equals the brain's reply (commit uses pending.reply_text, not the
+    # chunked stream — transcript fidelity is preserved regardless of chunking).
+    assert any(t.text == reply for t in agent_turns), (
+        f"CB-31: committed agent turn text must be the full reply (unchunked), got "
+        f"{[t.text for t in agent_turns]!r}"
+    )
+
+    logger.info(
+        "PASS CB-32/CB-31: first_upsert_before_commit=%s chunks=%d partials=%d committed_agent_turns=%d",
+        captured_live[0]["before_first_commit"], len(first_turn_chunks),
+        len(partials), len(agent_turns),
+    )

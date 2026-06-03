@@ -102,6 +102,10 @@ export interface LiveSnapshot {
   /** True when this snapshot was synthesized from a completed call as a preview/demo; the monitor
    *  must display a "SAMPLE" badge and suppress all LIVE/recording affordances. */
   sample?: boolean;
+  /** CB-31: the in-progress (not-yet-committed) agent reply being STREAMED to TTS on a real voice
+   *  call — present ONLY while active, so the monitor renders the words filling in on the active
+   *  turn near-real-time. null/absent once the turn commits or on an inactive/sample call. */
+  live_partial?: string | null;
   episode: EpisodeDetail | null;
   priority?: {
     trust: number | null;

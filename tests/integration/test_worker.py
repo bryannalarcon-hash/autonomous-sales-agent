@@ -6,7 +6,9 @@
 # as tests/integration/test_voice_adapter). The LOAD-BEARING test is the COMPLIANCE gate (the blocking
 # finding): with a not-yet-can_converse ConsentGate a user turn is NOT run through the brain (raises
 # ConsentError, no transcript captured); with a ready gate it proceeds. Also covers: empty-text
-# short-circuit, llm_node surfacing the buffered reply (and "" on the None branches), the
+# short-circuit, llm_node STREAMING the buffered reply in word chunks (CB-31 — chunks rejoin to the
+# exact reply, >1 chunk, yields nothing on the None branches, still commits at end) + the pure
+# _word_chunks parity/grouping helper, the
 # _wire_commit_on_speech done-callback committing on uninterrupted playout vs discarding on barge-in,
 # the persist-forwarding capture (escalation EscalationLog buffered + close-tier tracked on commit),
 # and the pure room-metadata helpers (_room_jurisdiction / _room_raw_phone from metadata + SIP attrs).
@@ -135,6 +137,18 @@ def _make_worker_agent(
 _CONFIG = load_config("champion_v0")
 
 
+async def _drain_llm_node(agent: Any) -> str:
+    """Run the worker's (now STREAMING) llm_node to completion and return the rejoined reply.
+
+    CB-31: llm_node is an async generator yielding word chunks of the SAME reply (and committing the
+    turn at the end). Tests that previously did `await agent.llm_node(...)` for the reply string now
+    drain the generator and re-join the chunks — which equals the original reply (R37 parity)."""
+    chunks: list[str] = []
+    async for chunk in agent.llm_node(None, None, None):
+        chunks.append(chunk)
+    return "".join(chunks)
+
+
 # --- Lightweight livekit-free stubs (the hooks only read these shapes) --------------------------
 class _StubMessage:
     """Stands in for lkllm.ChatMessage — on_user_turn_completed only reads `.text_content`."""
@@ -211,41 +225,87 @@ async def test_on_user_turn_completed_short_circuits_on_empty_text():
 
 
 async def test_llm_node_surfaces_buffered_reply():
-    """llm_node returns the reply_text the brain ALREADY produced for the current speech_id (parity:
-    it surfaces, never re-decides)."""
+    """llm_node STREAMS the reply_text the brain ALREADY produced for the current speech_id in word
+    chunks (CB-31); rejoining the chunks yields the EXACT reply (parity: it surfaces, never
+    re-decides). It also streams >1 chunk for a multi-word reply."""
     agent = _make_worker_agent()
     await agent.on_user_turn_completed(None, _StubMessage("How much does it cost per month?"))
     sid = agent._pending_speech_id
     expected = agent.voice_session.state.pending[sid].reply_text
-    assert await agent.llm_node(None, None, None) == expected
+    # Drive the generator manually so we can also count chunks (CB-31: multi-word reply -> >1 chunk).
+    chunks: list[str] = []
+    async for chunk in agent.llm_node(None, None, None):
+        chunks.append(chunk)
+    assert "".join(chunks) == expected  # R37 parity: chunks rejoin to the exact reply
+    assert len(chunks) > 1  # CB-31: the reply streamed in word chunks, not one whole string
 
 
-async def test_llm_node_returns_empty_on_none_branches():
-    """llm_node returns "" when there is no pending speech (no turn yet) or the pending entry is
-    missing (e.g. already committed/discarded) — the defensive None branches yield ""."""
+async def test_llm_node_yields_nothing_on_none_branches():
+    """llm_node yields NOTHING (the rejoined output is "") when there is no pending speech (no turn
+    yet) or the pending entry is missing (already committed/discarded) — the defensive None branches
+    return from the async generator before yielding."""
     agent = _make_worker_agent()
     # (a) no turn has happened: _pending_speech_id is None
-    assert await agent.llm_node(None, None, None) == ""
+    assert await _drain_llm_node(agent) == ""
     # (b) a speech_id is set but its pending entry is gone (committed/discarded)
     await agent.on_user_turn_completed(None, _StubMessage("Hi there."))
     sid = agent._pending_speech_id
     agent.voice_session.state.pending.pop(sid)
-    assert await agent.llm_node(None, None, None) == ""
+    assert await _drain_llm_node(agent) == ""
 
 
 async def test_llm_node_commits_the_turn_reliably():
-    """Regression for the live-call bug: llm_node COMMITS the turn (the reliable state write). The
-    SpeechHandle done-callback did NOT fire on real calls, so turns/belief never persisted (every
-    brain turn logged turn=1; a real call saved an empty in_progress shell that never reached Calls
-    or Live). After llm_node: the pending is drained, an agent Turn is captured, history grew."""
+    """Regression for the live-call bug: llm_node COMMITS the turn at the END of streaming (the
+    reliable state write). The SpeechHandle done-callback did NOT fire on real calls, so turns/belief
+    never persisted (every brain turn logged turn=1; a real call saved an empty in_progress shell that
+    never reached Calls or Live). After draining llm_node: pending drained, an agent Turn captured,
+    history grew — the streaming refactor (CB-31) must NOT reintroduce the never-committed bug."""
     agent = _make_worker_agent()
     await agent.on_user_turn_completed(None, _StubMessage("How much for SAT prep?"))
     sid = agent._pending_speech_id
     assert sid in agent.voice_session.state.pending  # buffered by on_user_turn_completed, not committed
-    await agent.llm_node(None, None, None)
+    await _drain_llm_node(agent)
     assert sid not in agent.voice_session.state.pending  # committed -> pending drained
     assert agent.voice_session.turn_for_speech_id(sid) is not None  # captured agent Turn
     assert len(agent.voice_session.state.history) == 2  # user + agent
+
+
+# =============================== CB-31: word-chunking (pure, livekit-free) =======================
+
+
+def test_word_chunks_rejoin_to_exact_reply():
+    """CB-31 R37 parity: _word_chunks splits a reply into ordered chunks that REJOIN byte-for-byte to
+    the original (no word is added/dropped/re-decided). The whole point — the chunks streamed to TTS
+    are the SAME reply the brain produced."""
+    w = _worker()
+    for reply in (
+        "one",
+        "one two",
+        "Sure, let me get a few details about what your child is working on.",
+        "Multiple   spaces  and\nnewlines preserved here.",
+        "A longer reply that should split into several word groups for natural TTS prosody units.",
+    ):
+        chunks = w._word_chunks(reply)
+        assert "".join(chunks) == reply, (reply, chunks)
+
+
+def test_word_chunks_streams_multiple_chunks_for_multiword_reply():
+    """CB-31: a multi-word reply yields >1 chunk (so it streams progressively to TTS / the monitor),
+    while a single word yields exactly one chunk and empty/whitespace yields none."""
+    w = _worker()
+    assert len(w._word_chunks("How much does it cost per month right now")) > 1
+    assert w._word_chunks("Hello") == ["Hello"]
+    assert w._word_chunks("") == []
+    assert w._word_chunks("    ") == []
+
+
+def test_word_chunks_groups_by_words_per_chunk():
+    """CB-31: chunks group ~words_per_chunk words each (greedy), so the chunk count is bounded by the
+    word count / group size — enough chunks to stream progressively without one-word-at-a-time TTS."""
+    w = _worker()
+    chunks = w._word_chunks("a b c d e f g", words_per_chunk=3)
+    assert chunks == ["a b c ", "d e f ", "g"]
+    assert "".join(chunks) == "a b c d e f g"
 
 
 # =============================== commit-vs-discard done-callback ================================
@@ -415,7 +475,7 @@ async def test_escalated_then_continued_disconnect_settles_escalated():
     )
     # Turn 1: the agent escalates (committed via llm_node, the reliable state write).
     await agent.on_user_turn_completed(None, _StubMessage("I want to speak to a human."))
-    await agent.llm_node(None, None, None)
+    await _drain_llm_node(agent)
 
     # Turn 2: the agent keeps talking with a NON-terminal act (handle_objection) — the brain did not
     # stop after escalating, exactly the reported failure. Swap the agent mock's served decision.
@@ -423,7 +483,7 @@ async def test_escalated_then_continued_disconnect_settles_escalated():
         act="handle_objection", target_slot=None, reply="I understand — while we connect you…"
     )
     await agent.on_user_turn_completed(None, _StubMessage("But how much does it cost?"))
-    await agent.llm_node(None, None, None)
+    await _drain_llm_node(agent)
 
     turns = agent.voice_session.state.turns
     acts = w._agent_acts(turns)
@@ -450,7 +510,7 @@ async def test_no_close_disconnect_settles_released_not_in_progress():
     w = _worker()
     agent = _make_worker_agent(llm=_agent_mock(act="ask", target_slot="goal"))
     await agent.on_user_turn_completed(None, _StubMessage("Hi, tell me about tutoring."))
-    await agent.llm_node(None, None, None)
+    await _drain_llm_node(agent)
 
     turns = agent.voice_session.state.turns
     acts = w._agent_acts(turns)

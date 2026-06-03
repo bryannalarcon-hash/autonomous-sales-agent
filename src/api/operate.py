@@ -17,6 +17,10 @@
 # CB-28: each serialized turn also carries "retrieved" — the KB facts/chunks that grounded a tool-use
 # answer (answer_via_kb), or None on non-tool turns — so Call Review can make a tool turn clickable
 # into a panel showing what information was pulled. Persisted on Turn.retrieved by the runtime.
+# CB-31: live_snapshot exposes "live_partial" — the in-progress (not-yet-committed) agent reply being
+# STREAMED to TTS by the voice worker (from metrics["live_partial"]) — but ONLY while the call is
+# active, so the Live monitor renders the words filling in on the active turn near-real-time; None on
+# a completed/inactive call (the committed transcript carries the final text).
 from __future__ import annotations
 
 import os
@@ -261,9 +265,17 @@ def live_snapshot(
     belief = _last_belief(ep)
     last_agent = next((t for t in reversed(ep.turns) if t.speaker == "agent"), None)
     bd = _belief_to_dict(belief)
+    # CB-31: the in-progress agent reply being STREAMED to TTS (set by the worker's word-streaming
+    # llm_node via persist_call_live's live_partial -> metrics["live_partial"]). Surfaced ONLY while
+    # the call is genuinely active so the monitor renders the words filling in on the active turn; on
+    # a completed/frozen call it is dropped (the committed transcript carries the final text). Cleared
+    # to None once the turn commits (the next per-turn upsert omits the key).
+    live_partial = (ep.metrics or {}).get("live_partial") if active else None
     payload: dict[str, Any] = {
         "active": active,
         "episode": episode_detail(ep),
+        # CB-31: the streaming partial of the active (uncommitted) agent turn, or None.
+        "live_partial": live_partial if isinstance(live_partial, str) and live_partial else None,
         # The four FOREMOST signals, lifted out so the client never has to dig for them.
         "priority": {
             "trust": next(
