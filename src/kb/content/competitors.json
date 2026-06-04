@@ -1,24 +1,87 @@
 {
   "_meta": {
-    "title": "Competitor differentiators",
+    "title": "Competitor comparison",
     "kb_version": "kb_v0",
-    "note": "Illustrative, KB-grounded differentiators for competitive questions (plan AE7). The agent answers competitor questions using ONLY these points and invents no facts about competitors."
+    "note": "Sourced, honest comparison of Varsity Tutors (Nerdy) vs. named competitors for use in sales conversations. Tags: VERIFIED = from Varsity Tutors' own pages or the competitor's official site; REPORTED = from third-party reviews/journalism; ESTIMATED = a range synthesized across sources. Competitor facts drift, so each price/format claim is dated and prefers official pages. The agent compares honestly and does NOT badmouth or invent competitor weaknesses. Per-hour figures are referenced for context only; the live rate card lives in pricing.json, not here. Retrieved 2026-06-04. CONTRADICTIONS noted in individual sections: VT does not post rates publicly and reviewers report refunds on unused sessions are hard to get (REPORTED) — VT's binding remedy is the published Tutor Satisfaction Guarantee (one free replacement session up to two hours), not an open refund; the demo policies.json '14-day refund' is illustrative, not VT's real policy.",
+    "sources": [
+      "https://www.varsitytutors.com/guarantee",
+      "https://www.varsitytutors.com/online-tutoring",
+      "https://www.varsitytutors.com/tutoring-prices-rates-cost",
+      "https://www.varsitytutors.com/membership/overview",
+      "https://prepmaven.com/blog/test-prep/varsity-tutors-review/",
+      "https://prepmaven.com/blog/test-prep/wyzant-vs-varsity-tutors/",
+      "https://tuition-ed.com/blog/wyzant-vs-varsity-tutors-comparison/",
+      "https://support.wyzant.com/hc/en-us/articles/208598116-What-is-the-service-fee",
+      "https://blog.wyzant.com/how-much-does-tutoring-cost/",
+      "https://www.tutor.com/faq/pricing",
+      "https://www.sylvanlearning.com/how-sylvan-works/pricing/",
+      "https://tutors.com/costs/kumon-cost",
+      "https://www.khanacademy.org/",
+      "https://www.khanmigo.ai/learners",
+      "https://en.wikipedia.org/wiki/Chegg_Tutors",
+      "https://www.cnbc.com/2025/10/27/chegg-slashes-45percent-of-workforce-blames-new-realities-of-ai.html",
+      "https://preply.com/en/how-it-works",
+      "https://kapdec.com/blog/private-tutoring-rates-in-the-u-s-2025-what-you-need-to-know/",
+      "https://en.wikipedia.org/wiki/Bloom's_2_sigma_problem",
+      "https://www.nber.org/papers/w27476",
+      "https://www.myengineeringbuddy.com/blog/varsity-tutors-reviews-alternatives-pricing-offerings/"
+    ]
   },
   "sections": [
     {
-      "id": "competitor_vs_marketplace",
-      "title": "Versus tutor marketplaces (e.g. Wyzant)",
-      "text": "Compared with open tutor marketplaces like Wyzant, where families browse and vet independent tutors themselves, this service does the matching for you: tutors are pre-vetted and the service pairs the student with a tutor based on subject, level, and learning style. It adds weekly progress tracking and a satisfaction guarantee with free re-match, so the family is not on their own to evaluate, manage, or replace a tutor. The differentiator is managed, vetted 1:1 matching plus progress tracking rather than a self-serve marketplace."
+      "id": "competitor_positioning_summary",
+      "title": "Where Varsity Tutors fits (summary positioning)",
+      "text": "Varsity Tutors (a Nerdy company) is a managed, full-service tutoring service rather than a self-serve marketplace: it screens its instructors, matches the student to a tutor for them, and supports the family with education consultants from the first consultation through ongoing check-ins (VERIFIED, varsitytutors.com/online-tutoring, retrieved 2026-06-04). It advertises 3,000+ subjects and a large vetted instructor network, plus a no-obligation consultation to start (VERIFIED). The honest tradeoff: VT typically costs more per hour than a budget marketplace tutor and does not post a public rate card, so families trade a higher, less-transparent price for done-for-you matching, screening, and a satisfaction guarantee. Position VT on value and reduced family effort, not on being the cheapest."
     },
     {
-      "id": "competitor_vs_content_libraries",
-      "title": "Versus content libraries (e.g. Khan Academy, Chegg)",
-      "text": "Compared with self-study content libraries like Khan Academy or Chegg, which offer videos, articles, and question banks the student works through alone, this service provides structured, live 1:1 instruction with a real tutor who adapts to the student in real time, holds them accountable, and personalizes the plan. Content libraries are a useful free or low-cost supplement, but they are passive and self-directed; the differentiator here is live human structure, accountability, and personalization on top of (not instead of) self-study."
+      "id": "competitor_wyzant",
+      "title": "Versus Wyzant (tutor marketplace)",
+      "text": "Wyzant is an open marketplace where independent tutors set their own rates and the family browses, vets, and books a tutor themselves; reported rates span roughly $15 to $400+ per hour with an average commonly cited around $35 to $60, and Wyzant adds a service fee on lessons (REPORTED/VERIFIED, blog.wyzant.com and support.wyzant.com, retrieved 2026-06-04). That makes Wyzant attractive on price and choice for a family willing to do the screening and management themselves. Varsity Tutors instead does the matching and screening for you and stands behind it with the Tutor Satisfaction Guarantee, so the family is not on its own to evaluate or replace a tutor. The honest tradeoff: Wyzant can be cheaper and more hands-on-selectable; VT is more managed and consistent."
     },
     {
-      "id": "competitor_vs_in_person_centers",
-      "title": "Versus in-person tutoring centers",
-      "text": "Compared with in-person tutoring centers, this service is online, so there is no commute and sessions fit around the family's schedule with more available time slots, including evenings and weekends. It is typically lower cost than a brick-and-mortar center because there is no facility overhead, and it gives access to a wider pool of specialized tutors than any single local center. The differentiators are flexibility, broader tutor selection, and cost versus a physical center."
+      "id": "competitor_tutor_com",
+      "title": "Versus Tutor.com (on-demand homework help)",
+      "text": "Tutor.com focuses on on-demand, often short homework-help sessions (the typical session is reported around 20 to 25 minutes) sold via monthly hour subscriptions, and it is widely offered free through libraries and the military (REPORTED, tutor.com/faq/pricing and edureviewer, retrieved 2026-06-04). It is strong for quick, in-the-moment help on a specific problem, often without a consistent assigned tutor. Varsity Tutors is built for scheduled, ongoing 1:1 relationships with a matched tutor and a personalized plan toward a goal. The honest tradeoff: Tutor.com is great for cheap or free on-demand help; VT is better when a family wants a consistent tutor and a structured plan over weeks."
+    },
+    {
+      "id": "competitor_sylvan",
+      "title": "Versus Sylvan Learning (learning centers)",
+      "text": "Sylvan Learning delivers tutoring through franchised learning centers (with an online option), typically starting with a paid skills assessment and then a personalized plan; reported costs average roughly $50 to $55 per hour with assessments often around $50 to $95 and the same pricing online or in person (REPORTED/VERIFIED, sylvanlearning.com/how-sylvan-works/pricing and tutors.com, retrieved 2026-06-04; local franchise prices vary). Sylvan's strengths are an established brand, a formal diagnostic, and an in-person option for families who want it. Varsity Tutors is online-first with a larger national tutor pool and no commute, and matching is centralized rather than tied to one local center. The honest tradeoff: Sylvan offers a physical center and a structured assessment; VT offers broader tutor selection and location flexibility."
+    },
+    {
+      "id": "competitor_kumon",
+      "title": "Versus Kumon (worksheet-based enrichment)",
+      "text": "Kumon is a long-running, worksheet-driven math and reading program built on daily repetitive practice and incremental mastery, typically priced around $150 to $200 per subject per month in the U.S. (higher in some metros), plus registration and materials fees (REPORTED, tutors.com/costs/kumon-cost, retrieved 2026-06-04). Kumon is not 1:1 tutoring: students mostly work through standardized worksheets with center staff overseeing, which builds discipline and fundamentals but is not personalized live instruction. Varsity Tutors provides live, one-on-one teaching adapted to the individual student in real time. The honest tradeoff: Kumon is a structured, lower-cost practice routine for fundamentals; VT is personalized live instruction for a specific goal or gap."
+    },
+    {
+      "id": "competitor_khan_academy",
+      "title": "Versus Khan Academy (free self-study)",
+      "text": "Khan Academy is a genuinely excellent, 100% free self-study library of videos and practice across many subjects, and its Khanmigo AI tutor is about $4 per month for families (VERIFIED, khanacademy.org and khanmigo.ai, retrieved 2026-06-04). Its design limit is that it has no live human tutor: the student must find the right material, stay disciplined, and self-diagnose mistakes (VERIFIED — Khan Academy states it offers no live classes or office hours). Varsity Tutors adds what free content cannot: a live tutor who personalizes in real time, holds the student accountable, and builds a plan. The honest framing for buyers: recommend Khan as a free supplement, and position VT as the live structure on top of it — not a replacement for a free resource the family is right to value."
+    },
+    {
+      "id": "competitor_chegg",
+      "title": "Versus Chegg (study help / homework Q&A)",
+      "text": "Chegg is a homework-help and study-tools subscription (Chegg Study around $15.95/month for a capped number of expert questions), not a live tutoring service: Chegg discontinued its live 1:1 Chegg Tutors product in January 2021 and has since been cutting staff amid AI competition (VERIFIED, en.wikipedia.org/wiki/Chegg_Tutors and cnbc.com Oct 2025, retrieved 2026-06-04). So Chegg and Varsity Tutors are not really the same category. Chegg is useful and cheap for looking up worked solutions and quick answers; VT provides scheduled, personalized live instruction with a matched tutor. The honest framing: present Chegg as a low-cost answer/reference tool, and VT as live teaching that explains the why — do not characterize Chegg as a current tutoring competitor."
+    },
+    {
+      "id": "competitor_preply",
+      "title": "Versus Preply (global tutor marketplace)",
+      "text": "Preply is a global marketplace, strongest for languages, where independent tutors set their own rates (reported roughly $15 to $50 per hour for English, with a wide overall range) billed as a weekly subscription; the family browses and picks the tutor, gets a paid trial lesson, and can switch tutors for free or request a refund if unsatisfied (REPORTED/VERIFIED, preply.com/en/how-it-works and brighterly, retrieved 2026-06-04). Preply can be very affordable and offers a huge tutor pool, especially for conversational languages. Varsity Tutors is U.S.-focused, screens and matches the tutor for the family, and emphasizes academic subjects and test prep. The honest tradeoff: Preply often wins on price and language breadth and self-selection; VT wins on done-for-you matching, screening, and academic/test-prep depth."
+    },
+    {
+      "id": "competitor_private_local",
+      "title": "Versus an independent / local private tutor",
+      "text": "A local independent tutor (a teacher, grad student, or private pro found by referral) is reported to charge roughly $25 to $80 per hour on average in the U.S., ranging higher for specialized SAT/ACT or advanced STEM work (REPORTED, kapdec.com 2025 and tutorcruncher, retrieved 2026-06-04). The upside is a personal relationship, possible in-person sessions, and direct negotiation. The risks the family carries alone are vetting credentials, scheduling, finding a replacement if it is not working, and no formal guarantee. Varsity Tutors absorbs that work: it screens instructors, matches the student, and backs it with the Tutor Satisfaction Guarantee. The honest tradeoff: a trusted local tutor can be cheaper and personal; VT reduces the family's vetting and backstop risk."
+    },
+    {
+      "id": "competitor_vetting_difference",
+      "title": "How tutor vetting differs (managed vs. self-serve)",
+      "text": "The core structural difference is who screens the tutor. On marketplaces (Wyzant, Preply) the family does the vetting from profiles and reviews; with a private tutor the family vets directly. Varsity Tutors screens centrally — it states only a tiny fraction of applicants make it through, with an application, a video interview, and a background check before contact (VERIFIED on rigor, varsitytutors.com; REPORTED detail that screening depth and tutor pay vary, prepmaven 2024). Be honest and specific: VT's value is that it takes vetting off the family's plate, not that competitor tutors are unqualified — many marketplace and private tutors are excellent. Frame it as managed-and-guaranteed versus do-it-yourself, not good-versus-bad."
+    },
+    {
+      "id": "competitor_efficacy_evidence",
+      "title": "Does 1:1 tutoring beat the alternatives (evidence)",
+      "text": "Independent research supports the format Varsity Tutors sells. Bloom's classic 'two-sigma' finding reported that one-to-one tutored students outperformed about 98% of classroom peers (REPORTED, en.wikipedia.org/wiki/Bloom's_2_sigma_problem; the exact two-sigma magnitude is debated). A large 2024 meta-analysis of PreK-12 tutoring found consistent positive effects (pooled effect size around 0.29-0.37 SD), with stronger results from higher-dosage, teacher-led tutoring (VERIFIED/REPORTED, nber.org/papers/w27476 and Sage 2024). Use this honestly: the evidence backs consistent, well-delivered 1:1 tutoring over passive self-study, while noting effects depend on dosage and quality. VT separately cites its own 98% satisfaction and 4.9/5 session rating (VERIFIED as VT marketing claims, varsitytutors.com)."
     }
   ]
 }

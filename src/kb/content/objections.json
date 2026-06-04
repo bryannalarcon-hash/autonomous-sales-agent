@@ -1,8 +1,22 @@
 {
   "_meta": {
-    "title": "Objection rebuttals",
+    "title": "Objection handling",
     "kb_version": "kb_v0",
-    "note": "KB-grounded rebuttals for the FULL nine-objection tutoring taxonomy (plan R30). Each section carries an `objection` slug; all nine slugs are required to be present. Rebuttals are empathetic, low-pressure, and grounded in the programs/pricing/policies/competitor KB — they invent no facts not supported elsewhere in the KB."
+    "note": "Sourced, honest objection rebuttals for a Varsity Tutors (Nerdy) sales agent. Each section carries an `objection` slug from: price | efficacy_doubt | diy_free | timing | decision_maker. MULTIPLE angles per slug (price, efficacy_doubt, diy_free are weighted heaviest because eval personas hammer them). Rebuttals are grounded in REAL Varsity Tutors facts — the published Tutor Satisfaction Guarantee (one free replacement session up to two hours after the initial session), a no-obligation free consultation, centrally screened/vetted 1:1 tutors, matched-for-you personalization, 3,000+ subjects, and scheduling flexibility — plus independent efficacy research. They are empathetic, low-pressure, and NEVER fabricate guarantees or pressure the buyer. HONESTY NOTE: VT does not advertise an open money-back refund on unused sessions and reviewers report refunds can be hard to get; the remedy the agent may promise is the re-match free-session guarantee and the free consultation, not a blanket refund. The demo policies.json '14-day refund / pause / free anytime re-match' figures are ILLUSTRATIVE and are not asserted here as VT's real terms. Retrieved 2026-06-04.",
+    "sources": [
+      "https://www.varsitytutors.com/guarantee",
+      "https://www.varsitytutors.com/online-tutoring",
+      "https://www.varsitytutors.com/tutoring-prices-rates-cost",
+      "https://www.varsitytutors.com/membership/overview",
+      "https://prepmaven.com/blog/test-prep/varsity-tutors-review/",
+      "https://www.myengineeringbuddy.com/blog/varsity-tutors-reviews-alternatives-pricing-offerings/",
+      "https://www.khanacademy.org/",
+      "https://www.khanmigo.ai/learners",
+      "https://en.wikipedia.org/wiki/Bloom's_2_sigma_problem",
+      "https://www.nber.org/papers/w27476",
+      "https://journals.sagepub.com/doi/10.3102/00028312231208687",
+      "https://kapdec.com/blog/private-tutoring-rates-in-the-u-s-2025-what-you-need-to-know/"
+    ]
   },
   "objection_taxonomy": [
     "price",
@@ -17,58 +31,172 @@
   ],
   "sections": [
     {
-      "id": "objection_price",
+      "id": "obj_price_value_per_outcome",
       "objection": "price",
-      "title": "Price / affordability",
-      "text": "On price: the membership is a monthly commitment, so it helps to look at value per month rather than a lump sum. Bundled membership hours lower the effective per-hour rate below pay-as-you-go, and there are multiple tiers, so a family can start on a lighter tier and scale up only if they need more hours. Framed against the goal — a target grade or a test-date score lift — steady weekly support is an investment toward a concrete outcome, and the satisfaction guarantee plus the 14-day refund window remove the risk of paying for something that is not working."
+      "title": "Price — frame against the outcome",
+      "text": "I hear you, and you're right that it's a real investment. The way most families find it useful to look at it is cost against the specific outcome you want — a grade that's slipping, a test-date score, a class your student is at risk in. Varsity Tutors is live, one-on-one instruction with a tutor matched and screened for your student, which is built to move that one outcome rather than spread thin. If you tell me the subject and goal, I can walk you through which membership size fits, and we can start with a no-obligation consultation so you see the plan before committing."
     },
     {
-      "id": "objection_efficacy_doubt",
+      "id": "obj_price_membership_efficiency",
+      "objection": "price",
+      "title": "Price — membership lowers the effective hourly rate",
+      "text": "Totally fair to want the math. Buying a monthly membership bundles a set number of hours, which brings the effective per-hour cost below booking sessions one at a time, and you can start on a lighter plan and only scale up if the student actually needs more hours. You're not locked into the largest package to begin. I can size the smallest plan that still hits your goal so you're not paying for hours you won't use — want me to do that for the subject you have in mind?"
+    },
+    {
+      "id": "obj_price_risk_removed",
+      "objection": "price",
+      "title": "Price — the guarantee protects the spend",
+      "text": "The fear with any tutoring spend is paying for a tutor who isn't a fit. Varsity Tutors addresses that directly: its published Tutor Satisfaction Guarantee says if you're not satisfied with the tutor after that first session, they'll connect you with a better-fit tutor and your next session is free, up to two hours (VERIFIED, varsitytutors.com/guarantee, retrieved 2026-06-04). So the cost of a bad match is covered by a free re-match session rather than coming out of your pocket. To be straight with you, that's the guarantee — it's a free replacement session, not an open refund on unused hours — so I'd never oversell it as money-back."
+    },
+    {
+      "id": "obj_price_vs_alternatives",
+      "objection": "price",
+      "title": "Price — honest comparison to cheaper options",
+      "text": "If budget is the deciding factor, I'll be honest: there are cheaper routes — a marketplace tutor or an independent local tutor can run lower per hour (REPORTED, roughly $25 to $80/hour for private tutors, kapdec.com 2025), and free tools like Khan Academy cost nothing. What you'd be doing yourself in those cases is the vetting, the scheduling, and finding a replacement if it isn't working. Varsity Tutors' price includes taking that work off you — screened tutors, matching done for you, education-consultant support, and the satisfaction guarantee. If done-for-you and backed isn't worth the difference for you, a cheaper option may genuinely be the better call, and I can tell you what to look for."
+    },
+    {
+      "id": "obj_price_consultation_first",
+      "objection": "price",
+      "title": "Price — see value before paying",
+      "text": "You don't have to decide on price in the dark. The consultation is free and no-obligation, and an education consultant will lay out the recommended plan, the subject focus, and the monthly cost so the number is attached to a concrete plan rather than a guess (VERIFIED, varsitytutors.com, retrieved 2026-06-04). Would it help to start there, see exactly what's proposed for your student, and decide on price once it's specific? No pressure to commit on this call."
+    },
+    {
+      "id": "obj_efficacy_research_backed",
       "objection": "efficacy_doubt",
-      "title": "Efficacy doubt (will it actually work?)",
-      "text": "On whether tutoring will actually help: tutors are vetted before they ever work with a student, the student is matched to a tutor by subject, level, and learning style, and progress is tracked weekly so improvement is visible rather than assumed. If a tutor is not the right fit, the free re-match guarantee means the family is never stuck — they get paired with a different tutor at no extra cost. The combination of a vetted, matched tutor plus weekly progress tracking plus a re-match guarantee is what makes the outcome dependable rather than a gamble."
+      "title": "Efficacy — the format is research-backed",
+      "text": "It's a fair question — does tutoring actually move the needle. The independent research is encouraging on the format Varsity Tutors uses: Bloom's well-known study found one-to-one tutored students outperformed about 98% of classroom peers (REPORTED, en.wikipedia.org/wiki/Bloom's_2_sigma_problem), and a large 2024 meta-analysis of PreK-12 tutoring found consistent positive effects, stronger with regular, higher-dosage sessions (VERIFIED/REPORTED, nber.org/papers/w27476). The honest caveat is that results depend on consistency and a good tutor fit — which is exactly why VT screens tutors and lets you re-match for free if the fit's off."
     },
     {
-      "id": "objection_diy_free",
+      "id": "obj_efficacy_vetting_matching",
+      "objection": "efficacy_doubt",
+      "title": "Efficacy — vetted tutors matched to the student",
+      "text": "What makes one-on-one work or not is usually the tutor and the fit. Varsity Tutors screens its instructors centrally — it states only a small fraction of applicants make it through, with an application, interview, and background check before they ever meet a student (VERIFIED on rigor, varsitytutors.com; REPORTED detail, prepmaven 2024) — and then matches your student to a tutor on subject, level, and learning style rather than handing you a directory to guess from. The point is to stack the odds toward a tutor who actually clicks, which is the single biggest driver of whether tutoring helps."
+    },
+    {
+      "id": "obj_efficacy_rematch_guarantee",
+      "objection": "efficacy_doubt",
+      "title": "Efficacy — you're not stuck if it isn't working",
+      "text": "The doubt usually isn't 'can tutoring work' but 'what if it doesn't work for us.' Varsity Tutors' Tutor Satisfaction Guarantee covers that: if you're not satisfied after the first session, they'll re-match you to a better-fit tutor and the next session is free, up to two hours (VERIFIED, varsitytutors.com/guarantee, retrieved 2026-06-04). So a weak first match isn't a dead end or a sunk cost — you adjust the tutor, not abandon the goal. That re-match safety net is what turns it from a gamble into something you can course-correct."
+    },
+    {
+      "id": "obj_efficacy_personalization",
+      "objection": "efficacy_doubt",
+      "title": "Efficacy — real-time personalization beats one-size-fits-all",
+      "text": "A classroom or a video can't stop and re-teach the one step your student is stuck on; a live 1:1 tutor can. Varsity Tutors sessions are two-way video with an interactive whiteboard and collaborative workspace, and the tutor adapts in real time to where your student actually is (VERIFIED, varsitytutors.com, retrieved 2026-06-04). That live adjustment — catching the specific misunderstanding the moment it shows up — is the mechanism behind tutoring's results, and it's the thing self-paced material structurally can't do."
+    },
+    {
+      "id": "obj_efficacy_honest_expectations",
+      "objection": "efficacy_doubt",
+      "title": "Efficacy — set honest expectations",
+      "text": "I won't promise a specific score jump on a sales call — anyone who guarantees an exact number is overselling. What the research and VT's own satisfaction data support is that consistent, well-matched 1:1 tutoring reliably helps when the student shows up and does the work (VT cites a 98% satisfaction rate and a 4.9/5 session rating as its own claims; independent meta-analysis confirms positive effects). The honest deal is: we give your student a screened, matched tutor and a plan, you get a free re-match if the fit's wrong, and you judge the progress yourself. That's a fair way to test whether it's working for you."
+    },
+    {
+      "id": "obj_diy_complement_not_replace",
       "objection": "diy_free",
-      "title": "DIY / free alternatives",
-      "text": "On using free resources instead: free content libraries like Khan Academy are genuinely useful, but they are passive and self-directed — the student has to find the right material, stay disciplined, and self-diagnose what they are getting wrong. Live 1:1 tutoring adds the three things free resources cannot: structure (a plan tied to the student's goal), accountability (a scheduled tutor expecting them each week), and personalization (a tutor adapting in real time to that student's gaps). Tutoring works well on top of free resources, not instead of them."
+      "title": "DIY/free — tutoring complements free resources, doesn't replace them",
+      "text": "Khan Academy and YouTube are genuinely great, and I'd never tell you to stop using them — Khan is 100% free and excellent (VERIFIED, khanacademy.org, retrieved 2026-06-04). The honest gap is that they're self-directed: the student has to find the right material, stay disciplined, and figure out on their own what they're getting wrong. A live Varsity Tutors tutor adds the three things free content can't — a plan, accountability, and real-time personalization — and works best layered on top of free study, not instead of it. If free tools alone are getting the job done for you, keep going; tutoring is for when self-study has stalled."
     },
     {
-      "id": "objection_timing",
+      "id": "obj_diy_accountability",
+      "objection": "diy_free",
+      "title": "DIY/free — the missing ingredient is accountability",
+      "text": "Most families who try free resources first aren't short on content — they're short on follow-through. A scheduled tutor who's expecting your student each week creates accountability that a free video library can't: someone notices when practice slips and adjusts the plan. Varsity Tutors lets you reserve recurring time with a matched tutor so it becomes a routine rather than a someday intention. If the honest blocker is that 'we have the resources but it's not happening,' that's exactly the gap a live tutor closes."
+    },
+    {
+      "id": "obj_diy_self_diagnosis_limit",
+      "objection": "diy_free",
+      "title": "DIY/free — students can't reliably self-diagnose gaps",
+      "text": "The catch with free, self-paced study is that a struggling student often can't tell which step they're actually getting wrong — and Khan Academy by design has no live human to ask, no live classes or office hours (VERIFIED, khanacademy.org). A Varsity Tutors tutor watches the student work, spots the specific misconception in the moment, and re-teaches just that — which is far faster than the student rewatching ten minutes of video hoping it clicks. Free content is a great library; a tutor is the person who knows which book to hand you and why."
+    },
+    {
+      "id": "obj_diy_ai_tutor_limit",
+      "objection": "diy_free",
+      "title": "DIY/free — AI tools help, but aren't a matched human tutor",
+      "text": "AI tools like Khanmigo (about $4/month) are useful and cheap, and they're good for hints and Socratic nudges (VERIFIED, khanmigo.ai, retrieved 2026-06-04). Where they fall short is sustained accountability, reading a frustrated kid's body language, adjusting a multi-week plan to a real deadline, and earning a reluctant student's buy-in — that's what a screened, matched human tutor does. I'd honestly suggest using both: an AI helper between sessions and a Varsity Tutors tutor for the live teaching and the plan. They solve different parts of the problem."
+    },
+    {
+      "id": "obj_diy_when_free_is_right",
+      "objection": "diy_free",
+      "title": "DIY/free — be honest about when free is enough",
+      "text": "Straight answer: if your student is self-motivated, only needs occasional clarification, and is keeping pace, free resources like Khan Academy are probably enough and tutoring would be overkill. The signal that it's time for a tutor is when self-study has plateaued — grades stuck, a deadline looming, or the student avoiding the subject. If you're not there yet, I'd rather you save the money; if you are, that's the moment live 1:1 with a matched tutor earns its cost. Where do you feel your student is right now?"
+    },
+    {
+      "id": "obj_timing_deadline_driven",
       "objection": "timing",
-      "title": "Timing (is now the right time?)",
-      "text": "On timing: the right time is usually tied to the deadline. If there is a test date — an SAT, ACT, or AP exam — a study plan needs enough weeks to finish before the exam, so starting earlier means a calmer, more effective plan rather than a last-minute cram; a typical test-prep package runs 8 to 12 weeks. For ongoing subjects, addressing a gap before it compounds into the next unit is easier than catching up later. There is no long-term contract and the membership can be paused over a break, so starting now does not lock the family into a commitment they cannot adjust."
+      "title": "Timing — the right time is tied to the deadline",
+      "text": "Timing usually comes down to the deadline, not the calendar. If there's a test date — SAT, ACT, an AP exam — a study plan needs enough weeks to finish comfortably, so starting earlier means a calmer, paced plan instead of a last-minute cram; group test-prep courses are commonly structured around a multi-week run (e.g., a 16-hour course) for that reason (REPORTED, varsitytutors pricing, retrieved 2026-06-04). For an ongoing class, catching a gap before it compounds into the next unit is easier than digging out later. If you share the deadline, I can tell you the latest sensible start date — no pressure to start before then."
     },
     {
-      "id": "objection_decision_maker",
+      "id": "obj_timing_low_commitment_start",
+      "objection": "timing",
+      "title": "Timing — a low-commitment way to start now",
+      "text": "If now feels uncertain, you don't have to commit big to begin. Start with the free, no-obligation consultation to get a plan, and you can begin on the smallest membership and see how the first sessions go — and if the first tutor isn't a fit, the Tutor Satisfaction Guarantee gives you a free re-match session (VERIFIED, varsitytutors.com/guarantee, retrieved 2026-06-04). That makes 'start now' a small, reversible step rather than a leap. Would a consultation this week, with nothing owed if you decide it's not the moment, be a reasonable first move?"
+    },
+    {
+      "id": "obj_timing_cost_of_waiting",
+      "objection": "timing",
+      "title": "Timing — name the cost of waiting honestly",
+      "text": "Waiting is sometimes the right call, so let's be honest about it. The real question is whether the gap gets cheaper or more expensive to fix later. In a sequential subject like math, an unaddressed gap tends to compound into the next unit, so a month of waiting can mean more catch-up hours later; before a fixed test date, waiting shrinks the runway and forces a more intense, costlier sprint. If your situation isn't time-sensitive, there's no harm in waiting — but if there's a deadline or a compounding gap, starting sooner usually costs less total, not more."
+    },
+    {
+      "id": "obj_decision_maker_equip_the_conversation",
       "objection": "decision_maker",
-      "title": "Decision-maker (need to check with someone)",
-      "text": "On needing to check with a partner or the other parent: that makes complete sense — this is a family decision. The most useful next step is to gather the specifics they will want to see — which subject, the goal, the tier and monthly cost, and the schedule — so the conversation at home is easy. A no-pressure consultation or a low-commitment trial session can be booked first so the decision-maker has something concrete to react to, and because there is no long-term contract and a 14-day refund window, the family can start and still step back if the other decision-maker is not on board."
+      "title": "Decision-maker — make the home conversation easy",
+      "text": "That makes complete sense — this is a family decision and your partner should weigh in. The most useful thing I can do is hand you the specifics they'll want: the subject and goal, the recommended tutor match, the plan, and the exact monthly cost, so the conversation at home is concrete instead of vague. Want me to put that together from the free consultation so you're walking in with the real numbers rather than 'a tutoring thing'? No need to decide anything until you've both talked."
     },
     {
-      "id": "objection_scheduling",
+      "id": "obj_decision_maker_no_pressure_path",
+      "objection": "decision_maker",
+      "title": "Decision-maker — a reversible, low-risk next step",
+      "text": "There's no rush to commit before you've checked with the other decision-maker. We can start with the free, no-obligation consultation so there's something specific to react to, and if you do begin and the first tutor isn't right, the Tutor Satisfaction Guarantee covers a free re-match session (VERIFIED, varsitytutors.com/guarantee, retrieved 2026-06-04). I'll be transparent that this is a recurring monthly membership, so I'd want both of you comfortable with that before any charge — I can hold a recommended plan for you to review together rather than booking anything today. And if it helps, tell me which part you think they'll push back on — cost, whether it works, or timing — and I'll give you the honest facts on that point so you can decide together with full information."
+    },
+    {
+      "id": "obj_scheduling_flexibility",
       "objection": "scheduling",
-      "title": "Scheduling (we are too busy)",
-      "text": "On a busy schedule: because tutoring is online there is no commute, and sessions are booked at times the family and tutor both choose, including evenings and weekends. A recurring weekly slot can be reserved with the same tutor so it becomes a fixed routine, and any session can be rescheduled at no charge up to 12 hours before it starts. Membership hours are flexible — they can be used in shorter or longer sessions across subjects — so the schedule flexes around the family rather than the other way around."
+      "title": "Scheduling — built around a busy family",
+      "text": "Sessions are booked through the member portal at times you and the tutor both pick, and you can hold a recurring weekly slot with the same tutor so it becomes a routine rather than a scramble (VERIFIED, varsitytutors.com/how-we-help). If something comes up, sessions can be rescheduled with reasonable notice. Between sessions, 24/7 on-demand help and unlimited live group classes mean support is there even when a one-on-one slot is hard to find that week."
     },
     {
-      "id": "objection_online_vs_in_person",
+      "id": "obj_scheduling_busy_week",
+      "objection": "scheduling",
+      "title": "Scheduling — when the week is already packed",
+      "text": "You do not have to find a big block of time. Sessions can be as short and as frequent as fits the week, evenings and weekends included, and because everything is online there is no commute on either side. We can map a realistic cadence in the free consultation around the activities you already have, rather than forcing a fixed time."
+    },
+    {
+      "id": "obj_online_effectiveness",
       "objection": "online_vs_in_person",
-      "title": "Online vs in-person skepticism",
-      "text": "On whether online tutoring is as good as in-person: online 1:1 sessions are live and video-based, with an interactive whiteboard and screen sharing, and every session is recorded so the student can review it afterward — which an in-person session does not give. Online also means no commute, more available time slots, and access to a wider pool of specialized tutors than any single local center. For most students the live, personalized attention matters far more than the room it happens in, and the recording and flexibility are added advantages over in-person."
+      "title": "Online vs in-person — why online 1:1 works",
+      "text": "Online one-on-one happens live on a shared Learning Platform with a virtual whiteboard, screen sharing, and (where enabled) session recordings to review later — capabilities a kitchen-table session does not have (VERIFIED, varsitytutors.com/how-we-help). Going online also means you are matched to the best-fit vetted tutor anywhere in the country, not just whoever is nearby. Varsity Tutors' school programs are rated ESSA Evidence Level III, evidence that well-run online tutoring drives real gains (VERIFIED, varsitytutors.com/school-solutions)."
     },
     {
-      "id": "objection_student_resistance",
+      "id": "obj_online_vs_in_person_tradeoff",
+      "objection": "online_vs_in_person",
+      "title": "Online vs in-person — the honest tradeoff",
+      "text": "Some families do prefer being in the same room, and that is fair. The honest tradeoff is that online removes commute time, widens the pool of specialist tutors, and adds recordings and digital materials — and if the format is not working for your student, the satisfaction guarantee lets you switch tutors at no cost (VERIFIED, varsitytutors.com/guarantee). The free consultation is a no-risk way to see whether the online setup feels right before committing."
+    },
+    {
+      "id": "obj_student_resistance_match",
       "objection": "student_resistance",
-      "title": "Student resistance (my child does not want a tutor)",
-      "text": "On a student who is reluctant: that is common and the matching process is built for it — the student is paired with a tutor by learning style, not just subject, and the goal is a tutor the student actually connects with rather than one who feels like extra school. The free re-match guarantee means that if the first tutor does not click, the family can switch at no cost until the fit is right, and a low-commitment trial session lets the student try it before anything ongoing is decided. Sessions are collaborative and personalized, which usually feels very different to a student than a classroom."
+      "title": "A reluctant student — fit comes first",
+      "text": "If your child is not excited about tutoring, the tutor match matters more than anything. Varsity Tutors matches for fit and personality, not just subject, and if the first tutor does not click the Tutor Satisfaction Guarantee gives you a free replacement session with someone new (VERIFIED, varsitytutors.com/guarantee). Good tutors spend the early sessions rebuilding confidence rather than piling on drills, which is usually what turns a reluctant student around."
     },
     {
-      "id": "objection_trust_legitimacy",
+      "id": "obj_student_resistance_low_pressure",
+      "objection": "student_resistance",
+      "title": "A reluctant student — start small and low-pressure",
+      "text": "You do not have to commit your child to an intense schedule to start. We can begin with a single low-pressure session focused on a topic they are comfortable with so it feels like help, not punishment, and let momentum build from there. The free consultation can even include planning how to frame it positively at home."
+    },
+    {
+      "id": "obj_trust_legitimacy_company",
       "objection": "trust_legitimacy",
-      "title": "Trust / legitimacy (is this a real, trustworthy service?)",
-      "text": "On trust and legitimacy: tutors are vetted before working with any student, progress is tracked weekly so the family can see what they are paying for, and the service stands behind the experience with a satisfaction guarantee, a free tutor re-match, and a 14-day full-refund window with no long-term contract. A family can start with a no-pressure consultation or a single trial session to see how it works before committing, so there is a low-risk way to verify the service is what it claims before any ongoing commitment."
+      "title": "Is this legit? — who Varsity Tutors is",
+      "text": "Varsity Tutors is the consumer brand of Nerdy Inc., a publicly traded U.S. company (NYSE: NRDY) operating since 2007, and has worked with over a million students and 1,000+ school and district partners (VERIFIED company/IR; scale figures REPORTED). It is not a gig marketplace of strangers — it is an established platform with a published satisfaction guarantee. You can also read independent reviews and check the BBB profile for the accredited headquarters before deciding."
+    },
+    {
+      "id": "obj_trust_legitimacy_safety",
+      "objection": "trust_legitimacy",
+      "title": "Is this legit? — tutor vetting and safety",
+      "text": "Tutors are centrally screened — only a small fraction of applicants (reported around 6%) are accepted — and go through background checks, so you are not vetting a stranger yourself (VERIFIED screening rigor, varsitytutors.com/how-we-help; ~6% REPORTED). Sessions happen on the monitored Learning Platform and can be recorded for safety and review, and the company complies with FERPA and COPPA for student data. If anything ever feels off, the satisfaction guarantee lets you change tutors immediately."
     }
   ]
 }

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import random
 import uuid
 from typing import Any, Callable, Optional, Sequence
@@ -311,7 +312,12 @@ async def run_episode(
             break
 
         # 4. Agent turn through the SINGLE brain entry point (DST -> gated policy -> NLG).
+        # retrieve_facts may be SYNC (in-memory fixtures) or ASYNC (the real pgvector RAG hook,
+        # build_live_retrieve_hook); await it when it returns a coroutine so self-play can ground on
+        # the SAME KB store the live demo/voice paths use (otherwise the agent runs with no KB).
         facts = retrieve_facts(belief, corrupted_text) if retrieve_facts is not None else None
+        if inspect.isawaitable(facts):
+            facts = await facts
         decision, reply, belief = await respond(
             belief,
             history,

@@ -1,0 +1,147 @@
+{
+  "_meta": {
+    "title": "Company, scale & tutor credentials",
+    "kb_version": "kb_v0",
+    "note": "REAL sourced facts about Nerdy Inc. (NYSE: NRDY) and its Varsity Tutors brand for a tutoring sales-agent KB. Retrieved 2026-06-04. SOURCING TIERS per claim: VERIFIED = stated in an official/IR/SEC-filed or primary-vendor source (Nerdy IR press releases, nerdy.com, varsitytutors.com, SEC); REPORTED = stated on a vendor marketing page or reputable third party but not in a financial filing (e.g. the 40,000+ tutors / 1M+ students / 3,000+ subjects marketing figures, which are vendor-published and recur across pages); ESTIMATED/UNVERIFIED = secondary aggregators only, flagged inline. CONTRADICTIONS RESOLVED: (1) Founding year — one Nerdy press release says the idea began '15 years ago' while St. Louis Magazine, St. Louis Post-Dispatch, and Chuck Cohn's bio all give 2007; resolved to 2007 (the PR phrasing is consistent with a ~2022 publication date). (2) Tutor acceptance rate — third-party aggregators (e.g. JobzMall) cite 'fewer than 15% of applicants approved', but official Nerdy/Varsity Tutors pages only say a 'small fraction' make it through; the precise 15% figure is tagged UNVERIFIED and the conservative 'small fraction' wording is used as the primary claim. (3) Full-year 2025 revenue — guidance was $175-177M; the realized Q4-2025 revenue was $49.1M (VERIFIED in the IR release), but a single audited full-year 2025 total was not re-quoted in the materials retrieved, so the full-year figure is given as the company's own $175-177M guidance range rather than as a confirmed actual. NOT-VERIFIED / could not confirm: a single audited FY2025 revenue actual; named universities tied to an acceptance-rate stat; SOC 2 certification (the safety page lists FERPA/COPPA/PCI/WCAG but not SOC 2).",
+    "sources": [
+      "https://nerdy.com/",
+      "https://nerdy.com/who-we-are",
+      "https://nerdy.com/chuck-cohn-bio",
+      "https://investors.nerdy.com/news/news-details/2026/Nerdy-Announces-Fourth-Quarter-2025-Financial-Results/default.aspx",
+      "https://www.businesswire.com/news/home/20260226513294/en/Nerdy-Announces-Fourth-Quarter-2025-Financial-Results",
+      "https://www.businesswire.com/news/home/20210920005887/en/Nerdy-and-TPG-Pace-Tech-Opportunities-Announce-Closing-of-Business-Combination",
+      "https://investors.nerdy.com/news/news-details/2021/Nerdy-to-Become-Public-Company-via-Business-Combination-with-TPG-Pace-Tech-Opportunities/default.aspx",
+      "https://www.varsitytutors.com/",
+      "https://www.varsitytutors.com/how-we-operate",
+      "https://www.varsitytutors.com/schools",
+      "https://www.varsitytutors.com/schools/safety-and-compliance",
+      "https://www.varsitytutors.com/best-top-private-tutoring",
+      "https://www.businesswire.com/news/home/20250429401366/en/Varsity-Tutors-Launches-Live-AI-Platform-for-Schools-Delivering-NextGeneration-Tutoring-Teacher-Support-System",
+      "https://www.businesswire.com/news/home/20251001573077/en/Varsity-Tutors-Introduces-New-LiveAI-Tools-and-Capabilities-That-Teachers-and-School-Administrators-Can-Use-to-Support-Student-Learning",
+      "https://www.stlmag.com/news/varsity-tutors/",
+      "https://www.stltoday.com/business/columns/david-nicklaus/varsity-tutors-goes-public-1-7-billion-deal-makes-it-first-tech-unicorn-in-st/article_08d2bfb4-5ab1-5d6c-b4a6-2610f1b2740f.html"
+    ]
+  },
+  "sections": [
+    {
+      "id": "company_who_we_are",
+      "title": "Who Nerdy and Varsity Tutors are",
+      "text": "Varsity Tutors is the consumer brand of Nerdy Inc., a live online learning company that connects learners of all ages with experts across thousands of subjects. The mission, in the company's own words, is to transform the way people learn through technology by connecting learners with the best experts. Varsity Tutors is the flagship offering; Nerdy is the parent company that builds and operates the underlying live learning platform. (VERIFIED — nerdy.com, varsitytutors.com.)"
+    },
+    {
+      "id": "company_public_company",
+      "title": "Publicly traded on the NYSE (NRDY)",
+      "text": "Nerdy Inc. is a publicly traded company on the New York Stock Exchange under the ticker symbol NRDY. It became public on September 20, 2021 by completing a business combination with the special-purpose acquisition company (SPAC) TPG Pace Tech Opportunities, a deal that valued Nerdy at roughly a $1.7 billion market capitalization at announcement. Being a public company means Nerdy's operations and financials are subject to regular, transparent regulatory review. (VERIFIED — Nerdy IR / Business Wire, 2021.)"
+    },
+    {
+      "id": "company_founding_story",
+      "title": "Founded in 2007 by Chuck Cohn",
+      "text": "Varsity Tutors was founded in 2007 by Chuck Cohn while he was a junior studying finance and entrepreneurship at Washington University in St. Louis, after he struggled to find one-on-one help for a calculus course. He started it with a roughly $1,000 loan from his parents — about $450 on a simple website and $550 on flyers and letterhead — and bootstrapped the business before leaving a private-equity role at the end of 2011 to run it full time. Cohn remains the company's Founder, Chairman, and CEO. (VERIFIED — nerdy.com bio, St. Louis Magazine, St. Louis Post-Dispatch.)"
+    },
+    {
+      "id": "company_headquarters",
+      "title": "Headquartered in St. Louis",
+      "text": "Nerdy and Varsity Tutors are headquartered in the St. Louis, Missouri area, where the company was founded. Local press has described Nerdy as the St. Louis region's first tech 'unicorn' following its 2021 public-market debut. The company operates as a distributed live online learning platform, so tutoring is delivered nationwide rather than from a single physical center. (VERIFIED — St. Louis Post-Dispatch, KSDK.)"
+    },
+    {
+      "id": "company_what_it_does",
+      "title": "What the service actually does",
+      "text": "Varsity Tutors is a comprehensive online learning destination, not just a single tutoring format. It provides learning experiences across more than 3,000 subjects in multiple formats — one-on-one instruction, small-group classes, large-format group classes, on-demand study support, and adaptive self-study. All live instruction happens over Varsity Tutors' proprietary Live Learning Platform with two-way video. (VERIFIED for formats/platform — nerdy.com, varsitytutors.com; 3,000+ subjects is REPORTED vendor-published.)"
+    },
+    {
+      "id": "company_scale_tutors_students",
+      "title": "Scale: tutors, students, and subjects",
+      "text": "Across its 15-plus-year history, Varsity Tutors reports having connected over 1 million students with more than 40,000 tutors, with access to 40,000-plus instructors and 3,000-plus subjects online. These reach figures are vendor-published marketing numbers that recur consistently across Varsity Tutors' own pages, so they are REPORTED rather than audited financial figures. They convey the breadth of the network rather than a point-in-time headcount. (REPORTED — varsitytutors.com.)"
+    },
+    {
+      "id": "company_scale_instruction_hours",
+      "title": "Scale: hours of live instruction",
+      "text": "Varsity Tutors operates what it describes as the largest live, virtual tutoring platform in the United States. The company has reported delivering more than 5 million hours of live, two-way, video-based intensive instruction in a single year through its proprietary Live Learning Platform. This volume sits behind both the consumer (family) business and the schools business. (REPORTED — varsitytutors.com / Varsity Tutors for Schools.)"
+    },
+    {
+      "id": "company_active_members_q4_2025",
+      "title": "Consumer membership base (most recent earnings)",
+      "text": "As of December 31, 2025, Nerdy reported approximately 33.2 thousand active Consumer Learning Members, with average revenue per member (ARPM) of $364, up 21% year over year. Learning Membership revenue was $41.6 million in the fourth quarter of 2025, up 6% year over year. These are point-in-time paying-member metrics from Nerdy's official quarterly earnings, distinct from the cumulative all-time reach numbers. (VERIFIED — Nerdy Q4 2025 IR release.)"
+    },
+    {
+      "id": "company_financials_q4_2025",
+      "title": "Recent financial results (Q4 2025)",
+      "text": "For the fourth quarter of 2025, Nerdy reported revenue of $49.1 million, up 2% year over year and above its $45-47 million guidance, with a gross margin of 66.8%. The company posted a net loss of $14.0 million (narrower than the prior year) and returned to positive non-GAAP adjusted EBITDA of $1.3 million, beating guidance. For full-year 2026 the company guided to revenue of $180-190 million with roughly break-even adjusted EBITDA. (VERIFIED — Nerdy Q4 2025 IR release.)"
+    },
+    {
+      "id": "company_full_year_2025_note",
+      "title": "Full-year 2025 revenue (guidance basis)",
+      "text": "Nerdy guided full-year 2025 revenue to a range of $175-177 million, a figure that appears consistently across its 2025 investor communications. A single audited full-year 2025 actual was not separately re-quoted in the materials retrieved here, so this range is the company's own guidance rather than a confirmed final total. The realized Q4 2025 quarter of $49.1 million was above its quarterly guidance. (VERIFIED guidance — Nerdy IR; final FY2025 actual NOT-VERIFIED in retrieved sources.)"
+    },
+    {
+      "id": "company_tutor_vetting_overview",
+      "title": "How tutors are vetted (overview)",
+      "text": "Varsity Tutors vets every tutor applicant through a multi-step process rather than simply listing anyone who signs up. The screening combines verification of academic background and professional experience, a formal interview, and a mock or simulated tutoring session to evaluate how clearly the candidate teaches. The company states that only a small fraction of applicants make it through this vetting process. (VERIFIED process steps — varsitytutors.com; the often-cited 'fewer than 15% approved' figure appears only on third-party aggregators and is UNVERIFIED.)"
+    },
+    {
+      "id": "company_tutor_credentials",
+      "title": "Tutor qualifications and credentials",
+      "text": "Varsity Tutors states it hand-picks highly credentialed tutors, many of whom have graduated from some of the most reputable academic programs in the world, including institutions such as Harvard, Stanford, Yale, Princeton, and MIT. The company emphasizes that academic excellence alone is not sufficient — it screens for the ability to communicate difficult concepts clearly, noting it has turned away applicants with perfect test scores who could not teach effectively. Tutors are matched to a student's needs, level, and learning style. (REPORTED/VERIFIED — varsitytutors.com vetting pages.)"
+    },
+    {
+      "id": "company_background_checks",
+      "title": "Background checks on tutors",
+      "text": "Every tutor undergoes comprehensive background screening as part of Varsity Tutors' hiring process. Reported screening includes a multi-state criminal background check and a national sex-offender registry check, with additional checks (such as motor-vehicle records, and in some cases drug screening or a credit check) applied depending on the role and state regulations. This safety screening is a baseline requirement before a tutor can work with students. (VERIFIED that comprehensive background checks are required — varsitytutors.com safety page; the specific check types are REPORTED via job-FAQ aggregators.)"
+    },
+    {
+      "id": "company_session_recording",
+      "title": "Recorded sessions for safety and review",
+      "text": "Sessions delivered on the Varsity Tutors Live Learning Platform are recorded. Recordings serve two purposes: students and parents can rewatch a session to review material they missed, and the recording supports a safe, accountable learning environment. Recordings are accessible to the client (the family) and to Varsity Tutors staff, and are not shared with anyone else; clients can opt out of recording. (VERIFIED — varsitytutors.com / tutor help center.)"
+    },
+    {
+      "id": "company_safety_monitoring",
+      "title": "Real-time monitoring and academic integrity",
+      "text": "For its schools platform, Varsity Tutors uses real-time AI monitoring that proactively flags inappropriate content and helps keep sessions safe and on task. The company also enforces an Academic Honor Code with strict guidelines intended to preserve academic integrity and ethical tutoring practices. Together with recorded sessions and tutor background checks, these controls form a layered approach to student safety. (VERIFIED — varsitytutors.com Safety & Compliance page.)"
+    },
+    {
+      "id": "company_data_privacy",
+      "title": "Data privacy and compliance",
+      "text": "Varsity Tutors states it adheres to FERPA, COPPA, and state-specific data-privacy requirements, and maintains secure data handling with encryption and PCI-compliant payment security. The company explicitly says it never sells or shares student data for marketing, and that its reporting and analytics are used only for educational improvement. Its platform is stated to meet WCAG 2.1 AA accessibility standards and to support single sign-on and user authentication. (VERIFIED — varsitytutors.com Safety & Compliance page.)"
+    },
+    {
+      "id": "company_live_ai_platform",
+      "title": "The Live + AI technology platform",
+      "text": "Nerdy's current platform is branded Live + AI, an AI-powered live-learning system that pairs expert human tutors with AI tools. Its design philosophy is that technology should amplify, not replace, the human relationship at the center of learning — combining the empathy and adaptability of a real expert with the real-time precision and scale of AI. AI helps match students to their ideal tutor based on skills, learning style, and schedule, and provides real-time analytics, progress summaries, and around-the-clock support. (VERIFIED — Nerdy / Varsity Tutors Live + AI announcements, 2025.)"
+    },
+    {
+      "id": "company_ai_native_replatform",
+      "title": "AI-native rebuild of the platform",
+      "text": "During the fourth quarter of 2025, Nerdy completed a re-platforming and launch of its Live + AI platform built using AI-native coding. This investment underpins both the consumer membership product and the schools product, and is positioned as the foundation for delivering personalized learning at scale. The company frames AI as a tool that makes its human tutors more effective rather than a substitute for them. (VERIFIED — Nerdy Q4 2025 IR release.)"
+    },
+    {
+      "id": "company_varsity_tutors_for_schools",
+      "title": "Varsity Tutors for Schools (institutional)",
+      "text": "Beyond serving families directly, Varsity Tutors runs an institutional business — Varsity Tutors for Schools — that sells high-dosage tutoring, targeted intervention, and AI teacher tools to school districts. The company reports partnerships with over 1,000 districts nationwide and has worked with more than 500 school districts on customized tutoring programs. Nerdy's Institutional revenue was $7.2 million in Q4 2025, up 6% year over year, with 56 Varsity Tutors for Schools contracts executed in the quarter. (VERIFIED — Nerdy IR; district counts REPORTED via Varsity Tutors for Schools.)"
+    },
+    {
+      "id": "company_schools_outcomes",
+      "title": "Outcomes and teacher support at the district level",
+      "text": "Varsity Tutors reports that students in its high-dosage school programs can achieve up to 2x gains in targeted skill areas. Its Live + AI platform for schools also includes 40-plus AI-powered teacher tools that the company says can reduce lesson-planning and administrative workload by roughly 7 to 10 or more hours per week. These institutional results are cited to demonstrate measured impact, not just reach. (REPORTED — Varsity Tutors for Schools / Live + AI announcements.)"
+    },
+    {
+      "id": "company_leadership",
+      "title": "Leadership",
+      "text": "Chuck Cohn is the Founder, Chairman, and Chief Executive Officer of Nerdy, having started the company in 2007 and led it through its 2021 public listing. The company has continued to build out an executive team, including a 2025 appointment of a Chief Operating Officer. Cohn previously worked in investment banking and private equity before committing full time to the business. (VERIFIED founder/CEO — nerdy.com bio, Nerdy IR; specific roster of other named executives varies by source and was not fully cross-confirmed.)"
+    },
+    {
+      "id": "company_international",
+      "title": "International footprint",
+      "text": "Varsity Tutors expanded beyond the United States in part through acquisition, including purchasing the U.K.-based company First Tutors to extend its reach internationally. The company's online, video-based model lets it deliver tutoring across geographies without a physical presence in each market. The core of the business remains U.S.-focused, where it operates the largest live virtual tutoring platform. (VERIFIED acquisition — St. Louis Post-Dispatch; 'largest U.S. platform' REPORTED — varsitytutors.com.)"
+    },
+    {
+      "id": "company_why_trust",
+      "title": "Why a family can trust the service",
+      "text": "Several independent signals support trusting Varsity Tutors with a child's learning: it is a NYSE-listed public company (NRDY) subject to financial transparency, it has a 15-plus-year operating history, and it screens tutors with comprehensive background checks plus a multi-step vetting process that only a small fraction of applicants pass. On top of that, every live session is recorded and reviewable, sessions are monitored for safety, and the company commits to FERPA/COPPA-aligned data privacy with a pledge never to sell student data. For a cost- and safety-conscious parent, these are concrete, verifiable trust factors rather than marketing claims alone. (VERIFIED composite — Nerdy IR + varsitytutors.com safety/vetting pages.)"
+    },
+    {
+      "id": "company_human_plus_ai_value",
+      "title": "Human expert plus AI — the value framing",
+      "text": "Varsity Tutors' core value proposition is a vetted human expert made more effective by AI, not an AI chatbot standing in for a teacher. A real tutor delivers the live, personalized instruction and relationship, while AI handles matching the right tutor, tracking progress, surfacing real-time analytics, and offering 24/7 study support between sessions. For families weighing cost against quality, the pitch is that this combination delivers measurable learning gains — up to 2x in targeted skills in the schools data — with the accountability of a public company behind it. (VERIFIED framing — Nerdy / Varsity Tutors Live + AI materials.)"
+    }
+  ]
+}

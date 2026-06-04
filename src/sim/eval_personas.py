@@ -55,6 +55,7 @@ async def run_named_eval(
     max_turns: int = 24,
     noise: float = 0.0,
     persist: bool = True,
+    retrieve_facts: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Run ONE named eval persona through the agent brain (self-play) and return a summary dict:
     {episode, episode_id, persona, cohort, outcome, turn_count, qualified, disqualifier, transcript}.
@@ -63,7 +64,11 @@ async def run_named_eval(
     sequiturs drive the prospect prompt). The episode is persisted (unless persist=False) under the
     eval cohort from build_eval_cohort(name) — never 'live' — so it stays out of the operator live
     Calls log. The two LLM clients are SEPARATE on purpose (agent vs prospect are different model
-    families); inject MockLLMClients in tests so no network is touched."""
+    families); inject MockLLMClients in tests so no network is touched.
+
+    retrieve_facts (optional) is the KB grounding hook threaded into the brain so the agent can
+    answer with REAL Nerdy facts (the CLI wires the live pgvector hook; tests pass None to stay
+    offline). It may be sync or async — selfplay awaits it when needed."""
     persona = named_persona(name)
     cohort = build_eval_cohort(name)
     episode = await run_episode(
@@ -76,6 +81,7 @@ async def run_named_eval(
         max_turns=max_turns,
         noise=noise,
         persist=persist,
+        retrieve_facts=retrieve_facts,
     )
     turn_count = int((episode.metrics or {}).get("turn_count", 0))
     return {
@@ -105,20 +111,39 @@ async def _main(name: str, seed: int, max_turns: int, noise: float, persist: boo
     load_dotenv()
     agent_model = os.environ.get("AGENT_MODEL", "anthropic/claude-sonnet-4.5")
     sim_model = os.environ.get("SIM_MODEL", "openai/gpt-4o")
+    config = load_config("champion_v0")
     cohort = build_eval_cohort(name)
+
+    # Wire the REAL KB grounding hook (the SAME build_live_retrieve_hook the demo API + voice worker
+    # use), so the agent answers with real Nerdy facts from pgvector instead of running KB-blind.
+    # Needs the embedder (sentence-transformers) + asyncpg — run this CLI under /usr/bin/python3.
+    # Set EVAL_NO_KB=1 to disable (offline / no-DB sanity run). Lazy import: the heavy ML deps load
+    # only on the real CLI path, never on a plain module import.
+    retrieve_facts = None
+    if os.environ.get("EVAL_NO_KB", "").strip().lower() not in ("1", "true", "yes", "on"):
+        from src.kb.embeddings import SentenceTransformerEmbedder
+        from src.kb.live import build_live_retrieve_hook
+
+        _live_hook = build_live_retrieve_hook(SentenceTransformerEmbedder(), kb_version=config.kb_version, k=4)
+
+        async def retrieve_facts(belief: Any, text: str) -> Any:  # noqa: ANN001 (selfplay hook shape)
+            return await _live_hook(text, kb_version=config.kb_version, k=4)
+
     print(
         f"eval_personas — persona={name} cohort={cohort} agent NLG={agent_model} prospect={sim_model} "
+        f"kb={config.kb_version if retrieve_facts else 'OFF'} "
         f"seed={seed} max_turns={max_turns} noise={noise} persist={persist}"
     )
     result = await run_named_eval(
         name,
         OpenRouterClient(model=agent_model),
         OpenRouterClient(model=sim_model),
-        load_config("champion_v0"),
+        config,
         seed=seed,
         max_turns=max_turns,
         noise=noise,
         persist=persist,
+        retrieve_facts=retrieve_facts,
     )
     print("---- TRANSCRIPT ----")
     for line in result["transcript"]:

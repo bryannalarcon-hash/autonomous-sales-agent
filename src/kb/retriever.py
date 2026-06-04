@@ -200,7 +200,11 @@ async def retrieve(
     """
     if k <= 0:
         return []
-    qvec = embedder.embed([query])[0]
+    # embed_query (NOT embed): the query side carries the BGE retrieval instruction prefix for the
+    # real model (passages don't), which is what bge-*-en-v1.5 is trained for — using plain embed()
+    # here degrades recall badly on a large corpus. FakeEmbedder.embed_query == embed (lexical), so
+    # the deterministic tests are unchanged.
+    qvec = embedder.embed_query(query)
     pool = await store.get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(

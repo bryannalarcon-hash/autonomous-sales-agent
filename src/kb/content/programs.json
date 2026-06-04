@@ -1,34 +1,223 @@
 {
   "_meta": {
-    "title": "Programs",
+    "title": "Programs, subjects & delivery",
     "kb_version": "kb_v0",
-    "note": "Illustrative, domain-plausible DEMO data for a tutoring service (Nerdy / Varsity Tutors style). NOT real-world-true. Groundedness = consistency to this KB."
+    "note": "Real-world sourcing of Nerdy / Varsity Tutors programs, subjects, and delivery model for a sales-agent KB. Retrieved 2026-06-04 from varsitytutors.com (subject, test-prep, how-it-works, schools, classes, guarantee pages), nerdy.com, member-services.varsitytutors.com, and Nerdy investor/press releases. Claims are tagged inline: [VERIFIED] = stated on a Varsity Tutors / Nerdy primary page; [REPORTED] = stated by Varsity Tutors but seen via third-party reviews / search snippets and not re-confirmed on a primary page this pass; [ESTIMATED] = inferred. CONTRADICTIONS RESOLVED: (1) Tutor-network size: pages say both '40,000+ instructors' and '3,000+ subjects' — these are different axes (experts vs subjects), not a conflict; both retained. (2) 'Only 6% of applicants pass' vetting [VERIFIED how-we-help] vs generic 'thorough screening' wording elsewhere — kept the specific 6% figure as the authoritative claim. (3) Live large-format class capacity 'up to 5,000 students' is [REPORTED] from a classes-FAQ snippet; small-group size is given as '2-5' (1:1 packages), '6-9' (SAT class), and '~12 avg' (general classes) depending on program, so group size is stated PER PROGRAM rather than as one global number. (4) Refunds/contract rigidity is from third-party review snippets [REPORTED], not a Varsity Tutors page, and is flagged as such. Pricing ('$50-$100/hr') is [REPORTED] from third-party reviews and may be stale; treated as illustrative, not a quote.",
+    "sources": [
+      "https://www.varsitytutors.com/how-we-help",
+      "https://www.varsitytutors.com/all-course-subjects",
+      "https://www.varsitytutors.com/test-prep",
+      "https://www.varsitytutors.com/test-prep/act",
+      "https://www.varsitytutors.com/classes/topics/test-prep/sat-tutoring",
+      "https://www.varsitytutors.com/classes/topics/test-prep/sat-class",
+      "https://www.varsitytutors.com/instant-tutoring",
+      "https://www.varsitytutors.com/schools",
+      "https://www.varsitytutors.com/schools/live-learning-platform",
+      "https://www.varsitytutors.com/classes/faq",
+      "https://www.varsitytutors.com/guarantee",
+      "https://www.varsitytutors.com/algebra_1-tutors",
+      "https://www.varsitytutors.com/t/science",
+      "https://www.varsitytutors.com/t/languages",
+      "https://www.varsitytutors.com/graduate_test_prep-tutors",
+      "https://member-services.varsitytutors.com/hc/en-us/articles/15454690494107-What-is-the-Live-Learning-Platform",
+      "https://nerdy.com/"
+    ]
   },
   "sections": [
     {
+      "id": "program_company_overview",
+      "title": "Who Nerdy / Varsity Tutors is",
+      "text": "Varsity Tutors is the consumer learning brand of Nerdy, Inc. (NYSE: NRDY), operating since 2007. Nerdy positions itself as a 'Live + AI' learning company whose purpose-built, proprietary Live Learning Platform connects learners to experts across 3,000+ subjects. [VERIFIED nerdy.com / varsitytutors.com] Varsity Tutors describes itself as the largest live, virtual tutoring platform in the U.S., serving millions of students and families plus more than 1,000 schools and districts. [VERIFIED schools page]"
+    },
+    {
+      "id": "program_learners_served",
+      "title": "Who it serves (all ages)",
+      "text": "Varsity Tutors serves learners of all ages, from elementary school through college and beyond, including adult and professional learners. [VERIFIED how-we-help] Nerdy frames this as 'preschool fundamentals to professional mastery.' [REPORTED Nerdy press] In practice the grade bands are K-8 (math, reading, phonics, science), high school (algebra, biology, chemistry, physics, literature), and college/adult (calculus, statistics, economics, languages). [VERIFIED how-we-help]"
+    },
+    {
+      "id": "program_formats_overview",
+      "title": "Delivery formats at a glance",
+      "text": "Varsity Tutors offers learning in several formats so a family can pick the level of support that fits: live 1-on-1 private tutoring, small-group classes, large-format 'Varsity Tutors Live' group classes, 24/7 on-demand study support (chat tutoring and essay review), and adaptive self-study with practice tests and flashcards. [VERIFIED nerdy.com / schools / instant-tutoring] All live formats run on the same online Live Learning Platform. [VERIFIED]"
+    },
+    {
       "id": "program_1to1_online",
-      "title": "1:1 online tutoring",
-      "text": "1:1 online tutoring pairs a student with a single vetted tutor for live, video-based sessions. Each session is one-on-one and personalized to the student's goals, pace, and current gaps. Tutors share an interactive whiteboard and screen, and every session is recorded so the student and parent can review it later. This is the core offering and the foundation of the ongoing membership."
+      "title": "1-on-1 online tutoring",
+      "text": "1-on-1 online private tutoring is the core offering: a student is matched with a single vetted expert for live, video-based sessions personalized to their goals, pace, and gaps. [VERIFIED how-we-help] Varsity Tutors says it looks at '100+ variables to create a personalized learning plan' and searches its 40,000+ experts to pinpoint the right tutor. [VERIFIED how-we-help] Every session is recorded so the student can rewatch tricky parts and a parent can follow progress. [VERIFIED]"
     },
     {
       "id": "program_small_group",
-      "title": "Small-group sessions",
-      "text": "Small-group sessions place 2 to 5 students of similar level with one tutor. They cost less per hour than 1:1 tutoring and add peer motivation and discussion, while still giving far more individual attention than a classroom. Small-group is a good fit for families who want a lower price point or for students who learn well alongside peers."
+      "title": "Small-group classes",
+      "text": "Small-group classes place a handful of similar-level students with one instructor, costing less per hour than 1:1 while keeping more individual attention than a school classroom. [VERIFIED classes] Group size depends on the program: SAT prep classes run about 6-9 students, and general live classes average roughly 12 students. [REPORTED classes-FAQ] Small group is a good fit for families wanting a lower price point or students who learn well alongside peers. [ESTIMATED from program design]"
     },
     {
-      "id": "program_test_prep",
-      "title": "Test prep (SAT / ACT / AP)",
-      "text": "Test-prep programs target the SAT, ACT, and AP exams. They are structured around a diagnostic practice test, a study plan tied to the student's actual test date, official-style practice sections, and timing/strategy coaching. Test-prep packages are scoped to a target test date so the plan finishes before the exam."
+      "id": "program_live_large_classes",
+      "title": "Large-format 'Varsity Tutors Live' classes",
+      "text": "Varsity Tutors offers large-format group classes, including free ones a family can register for without buying a paid package. [REPORTED classes-FAQ] These large classes can hold a very large audience (reported up to ~5,000 students) and pair an instructor with a moderator who fields questions in chat. [REPORTED classes-FAQ] They cover academic and enrichment topics and are designed for enriched, low-commitment learning; they are not a substitute for personalized 1-on-1 work. [ESTIMATED]"
     },
     {
-      "id": "program_subject_tutoring",
-      "title": "Subject tutoring (K-12 and college)",
-      "text": "Subject tutoring covers individual academic subjects for students from kindergarten through college, including math (elementary through calculus), the sciences, English and writing, foreign languages, and college-level coursework. Sessions can be ongoing weekly support or short-term help for a specific class, unit, or upcoming exam."
+      "id": "program_on_demand_homework_help",
+      "title": "24/7 on-demand tutoring (homework help)",
+      "text": "On-demand 'Instant Tutoring' connects a student with a live tutor at the push of a button, with tutors online 24 hours a day and no appointment needed. [VERIFIED instant-tutoring] It covers 250+ subjects (e.g., Algebra, ACT/SAT prep, Chemistry, ESL/ELL, Reading, Writing, Spanish) from elementary through graduate level. [VERIFIED instant-tutoring] Setup is fast ('Get started in 60 seconds') and works on phone, tablet, or computer. [VERIFIED]"
     },
     {
-      "id": "program_membership",
-      "title": "Ongoing membership",
-      "text": "The ongoing membership is the recommended way to use the service: a monthly subscription that bundles a set number of tutoring hours each month at a lower effective per-hour rate than paying session-by-session. Membership includes weekly progress tracking, the satisfaction guarantee with free tutor re-match, and the flexibility to use hours across 1:1, small-group, subject, or test-prep sessions. The membership is a recurring monthly commitment; value is framed per month, not per session."
+      "id": "program_chat_tutoring_essay_review",
+      "title": "Chat tutoring & essay review",
+      "text": "Beyond live video, Varsity Tutors offers on-demand chat tutoring for quick homework questions, test studying, and essay help, available 24/7. [VERIFIED schools snippet] On-demand essay review checks grammar, spelling, content, structure, and references, plus any other areas the student flags. [REPORTED schools snippet] These on-demand options are often bundled into school/district access and membership rather than sold as one-off sessions. [ESTIMATED]"
+    },
+    {
+      "id": "program_self_study",
+      "title": "Adaptive self-study & practice",
+      "text": "Self-study tools let learners practice independently between live sessions: adaptive practice problems, full-length practice tests, diagnostics, flashcards, and personalized AI coaching. [VERIFIED nerdy.com / sat-tutoring] Free practice tests and flashcards are available across many subjects and tests through the Varsity Tutors practice hub. [VERIFIED all-course-subjects] Self-study is positioned as a complement to live instruction, not a replacement. [ESTIMATED]"
+    },
+    {
+      "id": "program_live_learning_platform",
+      "title": "The Live Learning Platform",
+      "text": "All live sessions happen on Varsity Tutors' proprietary online Live Learning Platform, designed to feel like being in the same room. [VERIFIED member-services] It includes two-way HD video and audio, a shared interactive whiteboard, a collaborative document editor, built-in calculators, and subject-specific tools. [VERIFIED member-services] No physical materials or in-home visits are required; the student joins from a browser or app. [VERIFIED]"
+    },
+    {
+      "id": "program_recorded_sessions",
+      "title": "Recorded sessions & playback",
+      "text": "Every live session is automatically recorded, and the student gets instant video playback to rewatch the harder parts and reinforce learning. [VERIFIED nerdy.com / how-we-help] Parents can watch the recordings to follow their child's progress. [VERIFIED how-we-help] The platform also generates AI summaries of sessions so parents and (in school settings) teachers stay informed about progress and follow-up needs. [VERIFIED member-services / schools]"
+    },
+    {
+      "id": "program_tutor_matching",
+      "title": "Tutor matching",
+      "text": "After a family shares the student's needs, an educational director helps set up the account and matches the student to a tutor, using a proprietary algorithm that weighs 100+ variables against a network of 40,000+ experts. [VERIFIED how-we-help] The goal is a tutor fitted to the student's subject, level, goals, and learning style. [VERIFIED] Matching is hands-on rather than self-serve browsing, which is part of why an onboarding conversation kicks off the engagement. [ESTIMATED]"
+    },
+    {
+      "id": "program_tutor_vetting",
+      "title": "Tutor vetting at a glance",
+      "text": "Varsity Tutors vets every tutor applicant through tutoring simulations, academic and personal background checks, and interviews. [VERIFIED how-we-help] It states that only about 6% of applicants pass this process. [VERIFIED how-we-help] This selectivity is a core sales point: families are matched with screened subject-matter experts, not an open marketplace of unvetted tutors. [ESTIMATED]"
+    },
+    {
+      "id": "program_satisfaction_guarantee",
+      "title": "Satisfaction guarantee & tutor re-match",
+      "text": "Varsity Tutors offers a satisfaction guarantee: if a student isn't satisfied after the initial session, they can request a different tutor who's a better fit. [VERIFIED guarantee] Reviews report this includes a free re-match session (up to two hours) when pairing the student with a new tutor. [REPORTED third-party] Note: third-party reviews say packages lock in a set number of hours and that getting a cash refund can be difficult — flagged as [REPORTED], not a primary-page claim, and should not be stated as policy without confirmation. [REPORTED third-party]"
+    },
+    {
+      "id": "program_scheduling_flexibility",
+      "title": "Scheduling flexibility",
+      "text": "Tutoring is scheduled around the family's calendar; sessions are booked online and the student and tutor can customize the cadence. [REPORTED reviews / sat-tutoring] Purchased tutoring hours are valid for one year, so a plan can be spread out or front-loaded toward a deadline. [VERIFIED sat-tutoring] On-demand tutoring requires no scheduling at all since tutors are available 24/7. [VERIFIED instant-tutoring]"
+    },
+    {
+      "id": "program_typical_engagement",
+      "title": "How a typical engagement works",
+      "text": "A typical engagement starts with a conversation: Varsity Tutors learns where the student struggles, where they shine, and what they want to achieve, then builds a personalized learning plan. [VERIFIED how-we-help] An educational director sets up the account and matches a tutor; the student then meets the tutor on the Live Learning Platform for recurring sessions. [VERIFIED how-we-help] Progress is tracked across sessions, with recordings and summaries available for review. [VERIFIED]"
+    },
+    {
+      "id": "program_subject_math",
+      "title": "Math tutoring (full ladder)",
+      "text": "Varsity Tutors covers the full math ladder: elementary/arithmetic, pre-algebra, Algebra 1, geometry, Algebra 2, trigonometry, pre-calculus, calculus, statistics, and more advanced topics such as linear algebra and differential equations. [VERIFIED algebra/math tutor pages] Math is one of the four headline subject categories on the catalog. [VERIFIED all-course-subjects] Help can be ongoing weekly support or short-term help for a specific class, unit, or exam. [ESTIMATED]"
+    },
+    {
+      "id": "program_subject_algebra1",
+      "title": "Algebra 1 & middle-school math (in depth)",
+      "text": "Algebra 1 is a core 1-on-1 subject and also offered as a live, expert-led class. The Algebra 1 curriculum covers the fundamentals — expressions, equations, inequalities, exponents, and roots — teaching not just the rule but why it holds and when to use it. [VERIFIED algebra class page] For students approaching the course, a 'Jump Start to Algebra 1' class reviews building-block pre-algebra skills and previews early Algebra 1 concepts. [VERIFIED course page] Middle-school math, pre-algebra, and elementary math are all supported, so a student can get help right at their current level. [VERIFIED math tutor pages]"
+    },
+    {
+      "id": "program_subject_geometry_precalc",
+      "title": "Geometry, Algebra 2 & pre-calculus",
+      "text": "Geometry, Algebra 2, trigonometry, and pre-calculus are all standard 1-on-1 subjects, bridging Algebra 1 to calculus. [VERIFIED math tutor pages] Tutors help students see patterns, connect topics, and build problem-solving strategies that transfer across problem types rather than memorizing isolated steps. [VERIFIED algebra tutor page] These can be taken as ongoing weekly support or as targeted help before a specific test or unit. [ESTIMATED]"
+    },
+    {
+      "id": "program_subject_calculus_stats",
+      "title": "Calculus & statistics (high school + college)",
+      "text": "Calculus and statistics are offered for both high-school and college/adult learners, alongside college-level math coursework. [VERIFIED how-we-help / math tutor pages] College students can get help with calculus, statistics, and economics-style quantitative coursework. [VERIFIED how-we-help] These map to AP Calculus and AP Statistics test prep as well (see the AP section). [VERIFIED]"
+    },
+    {
+      "id": "program_subject_science",
+      "title": "Science tutoring",
+      "text": "Science is a headline category covering Biology, Chemistry, Physics, Environmental Science, Anatomy, Physiology, and more. [VERIFIED science tutor page] Tutors help with conceptual understanding plus lab report writing, data analysis, experimental design, and problem-solving. [REPORTED science tutor page] They also prepare students for AP science exams (AP Biology, AP Chemistry, AP Physics), state science assessments, and college placement exams. [VERIFIED science tutor page]"
+    },
+    {
+      "id": "program_subject_english_reading_writing",
+      "title": "English, reading & writing",
+      "text": "English / Language Arts is a headline category spanning reading, writing, literature, grammar, and composition. [VERIFIED all-course-subjects] For younger students this includes phonics and foundational reading; for older students it includes essay writing and literary analysis. [VERIFIED how-we-help] On-demand essay review (grammar, structure, content, references) complements live writing tutoring. [VERIFIED schools snippet]"
+    },
+    {
+      "id": "program_subject_languages",
+      "title": "World languages",
+      "text": "Languages is a headline category with a wide range offered, including Spanish, French, German, Mandarin Chinese, Japanese, Italian, Latin, Greek, and others. [VERIFIED languages tutor page] Each engagement is tailored to the learner's language, current level, and goal — conversational, academic, or professional fluency. [VERIFIED languages page] ESL/ELL support is also available, including through on-demand tutoring. [VERIFIED instant-tutoring]"
+    },
+    {
+      "id": "program_subject_social_studies_humanities",
+      "title": "Social studies & humanities",
+      "text": "Social Studies and Humanities are listed catalog categories, covering history, the study of human society, and related liberal-arts subjects. [VERIFIED all-course-subjects] Subjects range from art history and filmmaking through general humanities coursework. [REPORTED catalog snippet] These are available as 1-on-1 tutoring and, for some topics, as classes. [ESTIMATED]"
+    },
+    {
+      "id": "program_subject_tech_coding",
+      "title": "Technology, coding & STEM enrichment",
+      "text": "Technology & Coding is a listed catalog category: students can learn to code, build apps, and explore robotics and animation. [VERIFIED all-course-subjects] University-level tech and engineering subjects are also covered for college/adult learners. [VERIFIED catalog snippet] These sit alongside enrichment offerings like art and music. [VERIFIED all-course-subjects]"
+    },
+    {
+      "id": "program_subject_business",
+      "title": "Business & professional subjects",
+      "text": "Business is a listed catalog category, with university-level business subjects available for college and adult learners. [VERIFIED all-course-subjects / catalog] This connects to graduate and professional test prep (e.g., GMAT for business school) and professional certifications (e.g., CPA, CFA). [VERIFIED test-prep pages] Adult/professional learners are explicitly part of the served audience. [VERIFIED how-we-help]"
+    },
+    {
+      "id": "program_subject_learning_differences_enrichment",
+      "title": "Learning differences & enrichment",
+      "text": "The catalog includes a 'Learning Differences' category plus enrichment subjects such as Music and Art. [VERIFIED all-course-subjects] Enrichment also appears in the live class lineup (academic support, test prep, and enrichment classes), including celebrity-led 'StarCourse' classes. [REPORTED schools/classes snippet] These broaden the platform beyond core academics into interest-driven learning. [ESTIMATED]"
+    },
+    {
+      "id": "program_testprep_overview",
+      "title": "Test prep overview & formats",
+      "text": "Varsity Tutors offers structured test prep across K-12 admissions, college admissions, AP, graduate, and professional/certification exams. [VERIFIED test-prep / graduate pages] Test prep is delivered as 1-on-1 tutoring, live small-group prep classes, bootcamp-style intensives, and free practice tests/diagnostics. [VERIFIED test-prep] Programs are typically scoped to the student's target test date, built around a diagnostic, a study plan, official-style practice, and timing/strategy coaching. [VERIFIED test-prep]"
+    },
+    {
+      "id": "program_testprep_sat",
+      "title": "SAT prep (in depth)",
+      "text": "SAT prep combines live expert instruction with an asynchronous test-prep app (diagnostic tests, thousands of practice questions, full-length practice tests, flashcards, mobile app). [VERIFIED sat-tutoring] One-on-one packages come in 12, 24, or 36 hours — 12 for help on a particular topic, 24 to master a section, 36 to address weaknesses across all sections — and hours are valid for one year. [VERIFIED sat-tutoring] SAT prep classes run ~6-9 students with 16 hours of live small-group instruction plus an option of 4 or 8 hours of 1-on-1. [VERIFIED sat-class] Prep covers the digital SAT's Reading & Writing and Math sections, and an included SAT eBook (650+ pages) goes deeper on tricky concepts. [VERIFIED sat-class / act page]"
+    },
+    {
+      "id": "program_testprep_act",
+      "title": "ACT prep (in depth)",
+      "text": "ACT prep also pairs live expert instruction with an asynchronous app (question bank, practice tests). [VERIFIED act page] One-on-one ACT packages come in 12, 24, or 36 hours. [VERIFIED act page] It includes live prep classes, 1-on-1 expert tutoring, AI-powered diagnostics that break down strengths and weaknesses by ACT section, and a free mobile app; an included ACT eBook (650+ pages) supports deeper review. [VERIFIED act page] The ACT covers English, Math, Reading, and Science, with Writing optional. [ESTIMATED standard ACT structure]"
+    },
+    {
+      "id": "program_testprep_psat",
+      "title": "PSAT prep",
+      "text": "PSAT prep is offered as part of the college-admissions test-prep lineup. [VERIFIED test-prep] It serves students preparing for the PSAT/NMSQT and as an early on-ramp to SAT prep, sharing much of the same Reading & Writing and Math content. [ESTIMATED from SAT/PSAT alignment] Free PSAT practice resources are available through the practice hub. [VERIFIED practice hub]"
+    },
+    {
+      "id": "program_testprep_ap",
+      "title": "AP exam prep",
+      "text": "Varsity Tutors offers tutoring for AP exams across the College Board's AP catalog, including high-demand exams like AP Calculus, AP Biology, AP Chemistry, AP Physics, AP U.S. History, AP English Language, and AP Psychology. [VERIFIED AP tutor pages] Tutors often have taught AP courses, scored well themselves, or hold advanced degrees in the subject. [REPORTED AP page] AP prep is available year-round and is commonly started 8-12 weeks before the exam. [REPORTED AP page]"
+    },
+    {
+      "id": "program_testprep_k12_admissions",
+      "title": "K-12 admissions tests (ISEE, SSAT, etc.)",
+      "text": "For private-school and selective-school admissions, Varsity Tutors prepares students for the ISEE, SSAT, SHSAT, HSPT, and TACHS. [REPORTED test-prep search snippet] These are offered as 1-on-1 tutoring and prep classes scoped to the application deadline. [ESTIMATED from test-prep model] Note: these specific admissions tests appeared in search snippets and a test-prep listing rather than on the main test-prep landing page this pass, so tagged [REPORTED] pending primary-page confirmation. [REPORTED]"
+    },
+    {
+      "id": "program_testprep_graduate",
+      "title": "Graduate admissions tests (GRE, GMAT, LSAT, MCAT, DAT)",
+      "text": "Varsity Tutors prepares learners for major graduate-entrance exams: GRE, GMAT, LSAT, MCAT, and DAT, for business, law, medical, and dental school. [VERIFIED graduate test-prep page] Options mix live online classes and private tutoring; some classes run ~10 weeks (once weekly) and others are bootcamp-style (e.g., 5 days, ~4 hours/day). [REPORTED graduate page] Tutors target the specific content and test-taking strategy for each exam. [VERIFIED graduate page]"
+    },
+    {
+      "id": "program_testprep_professional",
+      "title": "Professional & certification exams",
+      "text": "Varsity Tutors offers prep for professional and licensing exams, including Bar, CPA, NCLEX, USMLE, Praxis, PMP, and finance/securities exams (CFA, CFP, CAIA, SIE, Series 7, Series 65), among others. [REPORTED test-prep / certifications snippet] This extends the platform to adult and professional learners well beyond K-12. [VERIFIED served-audience]"
+    },
+    {
+      "id": "program_testprep_state_tests",
+      "title": "State & placement tests",
+      "text": "Tutors prepare students for state assessments (e.g., end-of-course and Regents-style exams) and college placement exams, alongside subject mastery. [VERIFIED science tutor page / algebra Regents tutor page] This support is typically delivered as targeted 1-on-1 tutoring aligned to the specific test and standards. [ESTIMATED] State-test names vary by state, so the exact exam is matched to the student's location and grade. [ESTIMATED]"
+    },
+    {
+      "id": "program_vt_for_schools",
+      "title": "Varsity Tutors for Schools",
+      "text": "Varsity Tutors for Schools brings the platform to districts and schools — it has served more than 1,000 schools/districts and logged 10M+ hours of live tutoring. [VERIFIED schools page] The flagship is high-dosage tutoring: 60-90 minutes weekly in 1-on-1 or small groups with consistent tutors, using standards-aligned materials and mapped to RTI/MTSS tiers. [VERIFIED schools page] One login also unlocks 24/7 chat tutoring, live group classes, on-demand essay review, and self-study, with an Admin Portal giving educators insights by student, school, or subject. [VERIFIED schools page]"
+    },
+    {
+      "id": "program_live_ai_tools",
+      "title": "Live + AI tools",
+      "text": "Nerdy layers AI onto live instruction ('Live + AI'): adaptive practice, personalized coaching, AI-generated session summaries, and AI diagnostics that pinpoint a student's strengths and weaknesses. [VERIFIED nerdy.com / act page / member-services] In school settings, Live+AI tools (introduced for teachers and administrators) help educators review progress and prescribe follow-up support. [VERIFIED schools / Nerdy press] AI is used to enhance and inform live tutoring, not to replace the human tutor. [ESTIMATED from positioning]"
+    },
+    {
+      "id": "program_membership_packages",
+      "title": "Memberships, packages & pricing notes",
+      "text": "Tutoring is generally bought as hour packages or recurring memberships rather than à la carte, and purchased hours are typically valid for one year. [VERIFIED sat-tutoring] Subject and language memberships bundle a matched tutor plus a tailored learning plan. [VERIFIED languages membership] Pricing is not published per-hour on the primary pages; third-party reviews report roughly $50-$100/hour, which may be stale and should be treated as illustrative, not quoted. [REPORTED third-party] Confirm current pricing with a live quote before stating numbers to a customer. [ESTIMATED guidance]"
     }
   ]
 }

@@ -1,10 +1,12 @@
 # Embedding models for the KB RAG layer (plan U5). Defines the EmbeddingModel protocol
-# (embed(texts) -> list[vector] + dim) and two implementations: SentenceTransformerEmbedder
-# (real, model from EMBEDDING_MODEL env, default BAAI/bge-small-en-v1.5 @ 384-dim; sentence-
-# transformers is LAZY-IMPORTED so importing this module never requires the package) and
-# FakeEmbedder (DETERMINISTIC unit-norm vectors from text hashes — no model download, no network,
-# for tests). Both produce 384-dim vectors by default so they share migrations/002_kb.sql's
-# vector(384). No DB and no LiveKit imports here.
+# (embed(texts) for PASSAGES + embed_query(text) for a QUERY + dim) and two implementations:
+# SentenceTransformerEmbedder (real, model from EMBEDDING_MODEL env, default BAAI/bge-small-en-v1.5
+# @ 384-dim; sentence-transformers is LAZY-IMPORTED so importing this module never requires the
+# package) and FakeEmbedder (DETERMINISTIC unit-norm vectors from text hashes — no model download,
+# no network, for tests). Both produce 384-dim vectors by default so they share migrations/002_kb.sql's
+# vector(384). ASYMMETRY (critical for recall): bge-*-en-v1.5 is an s2p retriever — the QUERY must
+# carry a retrieval instruction prefix while PASSAGES get none; embed_query applies it (real model
+# only), embed does not, so retrieval matches the model's training. No DB / LiveKit imports here.
 from __future__ import annotations
 
 import hashlib
@@ -35,6 +37,11 @@ class EmbeddingModel(Protocol):
         ...
 
     def embed(self, texts: Sequence[str]) -> List[Vector]:  # pragma: no cover - structural
+        ...
+
+    def embed_query(self, text: str) -> Vector:  # pragma: no cover - structural
+        # Embed a single QUERY (may differ from embed() for asymmetric retrievers like BGE, which
+        # prefix the query with a retrieval instruction). The retriever uses this for the query side.
         ...
 
 
@@ -93,6 +100,19 @@ class FakeEmbedder:
     def embed(self, texts: Sequence[str]) -> List[Vector]:
         return [self._vector(t) for t in texts]
 
+    def embed_query(self, text: str) -> Vector:
+        # The fake is a LEXICAL stand-in, not a semantic model, so it gets NO BGE instruction prefix
+        # (those instruction words aren't in the chunks and would only add noise). A query embeds
+        # exactly like a passage, keeping the lexical-overlap retrieval tests deterministic.
+        return self._vector(text)
+
+
+# BGE v1.5 retrieval instruction — prepended to QUERIES ONLY (passages get none). bge-*-en-v1.5 is
+# trained for asymmetric query->passage retrieval; per the model card, omitting this prefix on the
+# query degrades query/passage cosine and recall collapses as the corpus grows (the bug that made a
+# 175-chunk KB retrieve worse than the 27-chunk demo).
+_BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
+
 
 class SentenceTransformerEmbedder:
     """Real embedder backed by sentence-transformers (model from EMBEDDING_MODEL env).
@@ -130,3 +150,14 @@ class SentenceTransformerEmbedder:
             list(texts), normalize_embeddings=True, convert_to_numpy=True
         )
         return [list(map(float, row)) for row in vectors]
+
+    def embed_query(self, text: str) -> Vector:
+        """Embed a QUERY. BGE-v1.5 is asymmetric: the query is prefixed with the retrieval
+        instruction while passages (embed) get none — without it the query/passage cosine degrades
+        and recall collapses on a larger corpus. Applied only for bge* models; others embed plain.
+        Passages are NOT re-embedded by this change, so no re-ingest is required."""
+        self._ensure_model()
+        assert self._model is not None
+        q = _BGE_QUERY_INSTRUCTION + text if "bge" in self._model_name.lower() else text
+        vec = self._model.encode([q], normalize_embeddings=True, convert_to_numpy=True)[0]
+        return list(map(float, vec))

@@ -1,39 +1,151 @@
 {
   "_meta": {
-    "title": "Membership pricing",
+    "title": "Pricing & payment plans",
     "kb_version": "kb_v0",
-    "note": "ILLUSTRATIVE DEMO PRICING — not a real rate card. All figures are example monthly membership tiers for grounding only. The agent frames price as a recurring monthly commitment and value-per-month (plan R28)."
+    "note": "Real-world pricing for Nerdy Inc. (NYSE: NRDY) / Varsity Tutors, retrieved 2026-06-04. CRITICAL: Nerdy does NOT publish a fixed public rate card; varsitytutors.com pricing/membership/FAQ pages show NO dollar figures and route every prospect to a free consultation for a personalized quote. So sources disagree and most concrete dollar figures here are REPORTED (reputable third-party reviews) or ESTIMATED, not VERIFIED off an official page. VERIFIED facts: (a) the membership/subscription business model and what it bundles (Nerdy investor materials + varsitytutors.com), (b) the satisfaction/pass guarantees (varsitytutors.com/guarantee), (c) Nerdy's reported consumer Average Revenue Per Member per Month (ARPM) of ~$335 (Q1'25) rising to ~$364-$374 (Q3-Q4'25) with a consumer price increase enacted Q1 2025 (Nerdy quarterly results) — this is the single most reliable anchor for 'typical monthly spend'. Contradictions were resolved by recording RANGES, preferring official/financial-filing data over review-site numbers, treating widely-repeated review figures ($349/$639 monthly, $70-$100/hr) as REPORTED, and flagging anything inferred as ESTIMATED. No price is stated as a hard guarantee; the agent should always frame exact price as 'varies by plan and confirmed in your free consultation.' Per-hour 'rates' are derived/effective figures, not a sold rate card. NEVER quote a single number as fixed truth.",
+    "sources": [
+      "https://www.varsitytutors.com/membership/overview",
+      "https://www.varsitytutors.com/membership/how-it-works",
+      "https://www.varsitytutors.com/tutoring-prices-rates-cost",
+      "https://www.varsitytutors.com/guarantee",
+      "https://www.varsitytutors.com/school-solutions/platform-access",
+      "https://investors.nerdy.com/news/news-details/2022/New-Learning-Memberships-Allow-Students-to-Receive-Learning-Support-Throughout-the-School-Year/default.aspx",
+      "https://www.businesswire.com/news/home/20250508094984/en/Nerdy-Announces-First-Quarter-2025-Financial-Results",
+      "https://www.businesswire.com/news/home/20251106455555/en/Nerdy-Announces-Third-Quarter-2025-Financial-Results",
+      "https://brighterly.com/blog/varsity-tutors-cost/",
+      "https://brighterly.com/blog/how-to-cancel-varsity-tutors/",
+      "https://prepmaven.com/blog/test-prep/varsity-tutors-review/",
+      "https://testprepinsight.com/reviews/varsity-tutors-review/",
+      "https://www.myengineeringbuddy.com/blog/varsity-tutors-reviews-alternatives-pricing-offerings/",
+      "https://www.consumeraffairs.com/education/varsity-tutors.html",
+      "https://www.learner.com/blog/wyzant-vs-varsity-tutors"
+    ]
   },
   "sections": [
     {
-      "id": "pricing_overview",
-      "title": "How pricing works",
-      "text": "Pricing is a monthly tiered membership, billed recurring each month. Each tier bundles a set number of tutoring hours per month at a lower effective per-hour rate than paying session-by-session. Hours can be used flexibly across 1:1, small-group, subject, or test-prep sessions. Members can change tiers month to month as their needs change. All prices below are illustrative demo figures, not a live rate card."
+      "id": "price_no_public_rate_card",
+      "title": "Why there is no public price list",
+      "text": "Varsity Tutors (the Nerdy consumer brand) does not publish a fixed public rate card. Its official pricing, membership, and FAQ pages describe the service and the satisfaction guarantee but show no dollar figures, instead routing every prospect to a free, no-obligation consultation where a personalized plan and quote are built (varsitytutors.com, VERIFIED). Because of this, third-party review sites disagree on exact numbers. The honest, accurate way to state price is: 'It depends on your plan and goals, and we confirm the exact monthly price in your free consultation.'"
     },
     {
-      "id": "pricing_tier_essential",
-      "title": "Essential tier (illustrative)",
-      "text": "Essential tier: about $199 per month, recurring, bundling roughly 4 hours of tutoring per month (about $50 per hour effective). Best for light, steady support in a single subject. Illustrative demo pricing."
+      "id": "price_membership_model",
+      "title": "The membership (subscription) model",
+      "text": "Nerdy/Varsity Tutors sells primarily through a monthly 'Learning Membership' subscription rather than one-off lessons (Nerdy investor materials, VERIFIED). A single recurring monthly fee bundles a set number of 1-on-1 tutoring hours per month plus unlimited live group classes, on-demand homework help, adaptive assessments, self-study tools, and celebrity-taught 'StarCourses.' Members use their hours flexibly across subjects and formats and can adjust their plan as needs change. This 'all-access, all-year' framing is how the company positions value versus paying session-by-session."
     },
     {
-      "id": "pricing_tier_core",
-      "title": "Core tier (illustrative)",
-      "text": "Core tier: about $349 per month, recurring, bundling roughly 8 hours of tutoring per month (about $44 per hour effective). The most popular tier; good for weekly support across one or two subjects or steady test-prep progress. Illustrative demo pricing."
+      "id": "price_typical_monthly_spend",
+      "title": "Typical monthly spend (most reliable anchor)",
+      "text": "The most reliable figure for 'what people actually pay' comes from Nerdy's own financial disclosures: average revenue per member per month (ARPM) for the consumer business was about $335 in Q1 2025, rising to roughly $364 to $374 by late 2025 (Nerdy quarterly results, VERIFIED as a company-reported average). Independent reviews echo a similar band, commonly citing roughly $300 to $600 per month depending on hours and plan (REPORTED). Use ~$300-$600/month as the honest range, and note Nerdy raised consumer prices in early 2025."
     },
     {
-      "id": "pricing_tier_premier",
-      "title": "Premier tier (illustrative)",
-      "text": "Premier tier: about $599 per month, recurring, bundling roughly 16 hours of tutoring per month (about $37 per hour effective). Best for intensive test prep on a deadline or multi-subject support. Illustrative demo pricing."
+      "id": "price_four_hour_plan",
+      "title": "Reported 4-hour monthly plan (~$349)",
+      "text": "The most widely repeated membership figure across review sites is a 4-hours-per-month 1-on-1 tutoring plan at about $349 per month, including unlimited live classes, essay/writing support, and on-demand help (REPORTED by multiple reviews; not confirmed on an official page). This works out to an effective ~$85+ per 1-on-1 hour before counting the bundled extras. Present this as an example tier, not a fixed quote: 'Plans commonly start around four hours a month; we confirm your exact figure in the consultation.'"
     },
     {
-      "id": "pricing_per_hour_range",
-      "title": "Per-hour ranges by program (illustrative)",
-      "text": "Pay-as-you-go per-hour ranges (illustrative): 1:1 online tutoring runs roughly $55 to $75 per hour depending on subject and level; small-group sessions run roughly $30 to $45 per hour per student; test-prep is sold as a package tied to a test date rather than purely by the hour. Membership lowers the effective per-hour cost below these pay-as-you-go ranges."
+      "id": "price_eight_hour_plan",
+      "title": "Reported 8-hour monthly plan (~$639)",
+      "text": "Reviews commonly cite an 8-hours-per-month 1-on-1 plan at about $639 per month, also including unlimited live classes and support (REPORTED; not confirmed officially). The effective per-1:1-hour cost is lower than the 4-hour plan because more hours are bundled. This higher-frequency tier is consistent with Nerdy's stated shift toward 'higher-priced and higher-frequency membership plans' as a driver of rising ARPM (Nerdy results, VERIFIED for the trend, REPORTED for the exact $639)."
     },
     {
-      "id": "pricing_test_prep_package",
-      "title": "Test-prep packages (illustrative)",
-      "text": "Test-prep is offered as a package scoped to the student's target test date rather than open-ended hours. A typical SAT/ACT package (illustrative) spans 8 to 12 weeks, includes a diagnostic, a study plan, and practice sections, and is priced as a flat package; members can apply membership hours toward it. Pricing is demo data."
+      "id": "price_lower_frequency_entry",
+      "title": "Lower-frequency / entry options (~$199-$314)",
+      "text": "Some sources cite smaller entry options, such as roughly $199/month for about 2 hours, or a ~6-hour plan around $314/month (REPORTED, with notable disagreement between reviews). These lighter plans suit families wanting steady but minimal weekly support in one subject. Treat any specific entry price as illustrative — the membership is custom-built in the consultation — and lead with the value of the bundled live classes and on-demand help that come even with a small hour allotment."
+    },
+    {
+      "id": "price_per_hour_one_on_one",
+      "title": "Per-hour 1-on-1 range (derived, not a rate card)",
+      "text": "Because Varsity Tutors sells memberships, not hourly rates, any 'per hour' figure is derived. Reputable reviews put the effective cost of 1-on-1 online tutoring at roughly $70 to $100 per hour (REPORTED), with some 2024-2025 user reports as high as $80-$173/hour for specialized or graduate subjects (REPORTED, wide spread). Lower-frequency plans have a higher effective per-hour cost; higher-hour plans bring it down. Frame this as 'effective per-hour cost depends on your plan' rather than a sold hourly rate."
+    },
+    {
+      "id": "price_per_hour_by_subject",
+      "title": "Effective per-hour varies by subject/level",
+      "text": "Effective per-hour cost rises with subject difficulty and level (REPORTED). Standardized-test tutoring (SAT/ACT) is often cited around $55 to $75 per hour, while graduate and professional exams run higher — MCAT around $70 to nearly $100/hour and GMAT near $90/hour (REPORTED, third-party estimates). These are not posted rates; they are observed effective costs inside membership or package pricing. When a parent asks 'how much per hour,' explain that it depends on subject, level, and how many hours their plan includes, then offer the consultation to get an exact figure."
+    },
+    {
+      "id": "price_commitment_discounts",
+      "title": "Longer-commitment discounts (6 / 12 / 24 months)",
+      "text": "Reviews consistently report that committing to a longer subscription (6, 12, or 24 months) lowers the monthly price versus month-to-month (REPORTED). One review cited a 4-hour plan at about $299/month on a 6-month term and about $269/month on a 12-month term, versus the higher month-to-month figure. Longer commitments lock in the lower rate but reduce flexibility. The exact discount is set in the consultation; frame it as 'committing for longer typically brings the monthly price down.'"
+    },
+    {
+      "id": "price_test_prep_packages",
+      "title": "Test-prep packages (priced separately from memberships)",
+      "text": "Standardized- and professional-test prep is often sold as fixed packages tied to a test date, separate from the monthly membership (REPORTED). Reported examples include SAT/ACT group bootcamps around $525 for ~16 hours of live class (often the same price across 1-, 4-, or 8-week formats), and graduate-exam classes around $599 (e.g., GRE, MCAT 5- or 10-week). These figures vary by exam and product and are not officially posted, so confirm any test-prep package price in the consultation."
+    },
+    {
+      "id": "price_test_prep_bundles",
+      "title": "Larger test-prep bundles (class + 1:1 tutoring)",
+      "text": "Higher-intensity test-prep bundles combine live class hours with private 1-on-1 tutoring at a flat package price (REPORTED). Cited examples include an LSAT bundle of roughly 20 hours of live class plus 12 hours of 1:1 tutoring for about $2,000, a GRE class-plus-tutoring bundle around $849, and smaller NCLEX classes around $200 with bundles near $400. These are illustrative third-party figures with wide variation by exam; present the structure (class + tutoring + practice, scoped to the test date) and defer the exact number to the quote."
+    },
+    {
+      "id": "price_on_demand_self_study",
+      "title": "On-demand, classes, and self-study value",
+      "text": "Membership includes value beyond the metered 1-on-1 hours: 24/7 on-demand chat/homework help, unlimited live group classes (the company cites 10,000+ live classes a year), adaptive diagnostic assessments, recorded/self-study content, and practice tests (Nerdy materials + varsitytutors.com, VERIFIED for inclusion). Some on-demand-only or self-study test-prep products are sold cheaply on their own (e.g., a GRE on-demand option around $149, REPORTED). For a cost-sensitive family, these bundled extras are the strongest 'you get more than just the tutoring hours' talking point."
+    },
+    {
+      "id": "price_free_consultation",
+      "title": "Free consultation (the real first step)",
+      "text": "The standard entry point is a free, no-obligation consultation: a family creates a learner profile (goals, subjects, grade) and an educational consultant builds a recommended plan and gives the personalized price (varsitytutors.com, VERIFIED). The site markets this as 'get started in ~60 seconds, no obligation.' There is no charge to get matched and quoted. This is the right call-to-action for any price question: 'The best next step is a free consultation where we map your goals and give you an exact monthly price.'"
+    },
+    {
+      "id": "price_free_trial_status",
+      "title": "Free trial — what's real vs not",
+      "text": "Varsity Tutors does not prominently advertise a standing free trial of paid 1-on-1 tutoring (REPORTED across reviews; not found on official pages, so treat 'free trial' claims as ESTIMATED/inconsistent). What is real and official is the free consultation plus a strong first-session satisfaction guarantee that effectively de-risks starting (see guarantee section). Some standalone free resources exist (free practice tests, diagnostics, sample/AI tools). Do not promise a 'free trial' of tutoring; promise the free consultation and the satisfaction guarantee instead."
+    },
+    {
+      "id": "price_tutor_satisfaction_guarantee",
+      "title": "Tutor satisfaction guarantee (de-risks the first session)",
+      "text": "Officially, if a member is not satisfied with the tutor they were matched with, Varsity Tutors helps connect them with a better-fit tutor and the next session is free of charge — up to two hours, based on the length of the initial session (varsitytutors.com/guarantee, VERIFIED). This applies to tutoring hours purchased through the platform. For a hesitant or cost-sensitive parent, this is a key reassurance: trying a tutor carries little risk because a poor match is replaced and the replacement session is free."
+    },
+    {
+      "id": "price_score_guarantee",
+      "title": "Score / personal satisfaction guarantee (test prep)",
+      "text": "For college and graduate admissions test prep, Varsity Tutors offers a personal satisfaction guarantee: if you don't get the score you want, they provide — at no additional cost — a live online course for the same exam (varsitytutors.com/guarantee, VERIFIED). This is a re-course offer, not an automatic cash refund, and is subject to eligibility terms. Use it to reassure test-prep families that the program backs its outcomes, while being careful never to promise a specific score."
+    },
+    {
+      "id": "price_pass_guarantee",
+      "title": "Pass guarantee (professional certification exams)",
+      "text": "For professional certification exams purchased on/after May 15, 2024, a Pass Guarantee applies: if a member uses at least 12 live 1-on-1 tutoring hours within 3 months, completes the required assignments, registers/takes the official exam within the stated windows, and still does not pass, they're eligible for a one-time free credit equal to the hours consumed OR a full refund of the original purchase, requestable within six months (varsitytutors.com/guarantee, VERIFIED). This is the rare offer with an actual money-back path, but it has strict conditions — state them, don't oversimplify."
+    },
+    {
+      "id": "price_billing_recurring",
+      "title": "Recurring billing & auto-renewal",
+      "text": "Memberships bill on a recurring monthly basis and renew automatically until cancelled (REPORTED across reviews and consumer feedback). Some customers have reported unexpected charges from auto-renewal or auto-scheduling they didn't feel was clearly communicated (consumeraffairs / BBB-style complaints, REPORTED). For honesty and trust, be transparent that it's a recurring subscription, confirm the renewal date and how to manage it, and never imply it's a one-time charge."
+    },
+    {
+      "id": "price_cancellation_billing",
+      "title": "Cancellation & unused-hours billing",
+      "text": "Reviews report there is no penalty/cancellation fee to stop a membership, but cancellation is generally not self-service online — you contact customer support by phone/email, and future billing stops once processed (REPORTED). Importantly, unused prepaid hours or account credits are typically forfeited rather than refunded on cancellation (REPORTED). Be upfront about this so a cost-sensitive parent isn't surprised, and suggest choosing an hour level they'll realistically use each month to avoid waste."
+    },
+    {
+      "id": "price_financing_options",
+      "title": "Financing / installment options",
+      "text": "No official Varsity Tutors financing or buy-now-pay-later partnership (e.g., Affirm) was confirmed in current sources — treat 'financing available' as UNVERIFIED and do not promise it. The practical 'payment plan' is the membership itself: spreading cost into a predictable monthly subscription rather than a large upfront lump sum, plus the option of a lower monthly rate on a longer commitment. If a family explicitly needs installment financing, route it to the consultation to confirm what, if anything, is currently offered rather than asserting it exists."
+    },
+    {
+      "id": "price_schools_vs_consumer",
+      "title": "Schools/districts vs consumer pricing",
+      "text": "There are two very different pricing worlds. Consumer families buy monthly memberships (the figures elsewhere in this file). Schools and districts contract separately through 'Varsity Tutors for Schools' via custom quotes for high-dosage tutoring and platform access (varsitytutors.com school solutions, VERIFIED that it's quote-based). Some district/state-funded programs make tutoring free to students (e.g., reported free access for certain California public-school students through 2030), while other districts pay six-figure contracts (REPORTED). District per-student pricing is not public. Don't quote consumer prices to a school buyer or vice versa."
+    },
+    {
+      "id": "price_school_free_access",
+      "title": "Free school-provided access (don't oversell)",
+      "text": "Many students can access Varsity Tutors free because their school or district (or a state program) pays for it — often 24/7 on-demand and chat-based tutoring at no cost to the family (REPORTED). If a parent mentions their child's school offers it, the honest move is to acknowledge that free school-provided access may already cover basic on-demand help, and position the paid consumer membership only where it adds value (consistent 1-on-1 hours, a dedicated matched tutor, test prep, multi-subject support). Never claim the paid plan if a free option fully meets their need."
+    },
+    {
+      "id": "price_value_framing_cost_sensitive",
+      "title": "Talking price to a cost-sensitive parent",
+      "text": "For a budget-conscious parent, anchor on value-per-month, not per-hour sticker shock: the membership bundles unlimited live classes, 24/7 on-demand help, assessments, and self-study alongside the metered 1-on-1 hours, so the effective value exceeds the raw tutoring rate. Recommend starting at a realistic hour level they'll fully use to avoid forfeited hours, mention that a longer commitment can lower the monthly price, and lean on the satisfaction guarantee to remove first-session risk. Be transparent it's a recurring subscription and that the exact number comes from the free consultation."
+    },
+    {
+      "id": "price_how_to_quote",
+      "title": "How to answer 'how much does it cost?'",
+      "text": "Never invent a precise number. The correct answer pattern: (1) explain it's a monthly membership that bundles tutoring plus live classes and on-demand help; (2) give the honest range — most families land around $300-$600/month depending on hours, with lighter plans lower; (3) note longer commitments can lower the monthly rate; (4) state the exact price is built around their goals and confirmed in a free, no-obligation consultation. This mirrors how the company actually sells and keeps every claim defensible."
+    },
+    {
+      "id": "price_source_quality_note",
+      "title": "Source reliability & contradictions (agent self-check)",
+      "text": "Reliability tiers for these facts: VERIFIED = the membership/bundle model, the guarantees, and Nerdy's reported ~$335-$374 ARPM trend with a Q1 2025 consumer price increase. REPORTED = specific dollar plans ($199/$349/$639, $70-$100/hr, package prices, commitment discounts) — credible review sites that disagree on exact figures, so always quote ranges. UNVERIFIED/ESTIMATED = standing free trial of tutoring and third-party financing. The biggest contradictions are exact monthly tier prices and per-hour rates (sources span $50 to $173/hr); resolve by quoting ranges and deferring to the consultation. If unsure, say it varies — do not state a single figure as fixed."
     }
   ]
 }

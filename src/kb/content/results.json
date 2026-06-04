@@ -1,0 +1,138 @@
+{
+  "_meta": {
+    "title": "Results & proof points",
+    "kb_version": "kb_v0",
+    "note": "Sourced, AGGREGATE proof points for Varsity Tutors (a Nerdy company) for use when a family asks 'show me proof this works' / 'can you raise his SAT score?'. NO individual student results are fabricated and NO score guarantee is invented (Varsity Tutors does not publish a score-gain guarantee; its only binding remedy is the Tutor Satisfaction Guarantee — one free replacement session up to two hours). Source tiers: VERIFIED = Varsity Tutors' / Nerdy's own pages, press releases, or SEC/IR earnings; REPORTED = reputable third party (Trustpilot, App Store, BBB, journalism); ESTIMATED = a synthesized range across sources. Typical-not-guaranteed outcomes are phrased as 'many students see…', never 'your child will…'. WHAT WE COULD NOT VERIFY: (1) any specific SAT/ACT point-gain figure attributable to Varsity Tutors itself — their SAT prep page makes no published point-gain claim and the '100-300 point' figures in search are generic industry claims, NOT Varsity Tutors data, so they are OMITTED here; (2) sample sizes, dates, and named research partners behind the '2X math proficiency' / '40% reading proficiency' efficacy figures (company states ESSA Level III and third-party studies but does not publish the underlying reports); (3) the exact current Trustpilot TrustScore (the page was access-blocked; the ~4-star / ~12.5k-review and 536-review figures appeared in search snippets and are dated/approximate). CONTRADICTIONS: review-volume and member counts differ by source and quarter — ranges and dates are given inline. Active members are DOWN year-over-year (36.9k in Q1 2026 vs ~40.5k a year prior); we report the trend honestly rather than cherry-picking. BBB letter grade varies by listed office (A+ on the accredited Clayton, MO profile; an F on a Dallas, TX listing for unanswered complaints) — both are reported. Retrieved 2026-06-04.",
+    "sources": [
+      "https://www.varsitytutors.com/reviews",
+      "https://www.varsitytutors.com/schools",
+      "https://www.varsitytutors.com/schools/high-dosage-tutoring",
+      "https://www.varsitytutors.com/school-solutions/impact",
+      "https://www.varsitytutors.com/online-tutoring",
+      "https://www.varsitytutors.com/guarantee",
+      "https://apps.apple.com/us/app/varsity-tutors-live-tutoring/id1050814379",
+      "https://www.trustpilot.com/review/varsitytutors.com",
+      "https://www.bbb.org/us/mo/clayton/profile/tutoring/varsity-tutors-llc-0734-310357898",
+      "https://www.bbb.org/us/tx/dallas/profile/tutoring/varsity-tutors-0875-91064216/overview-of-bbb-ratings",
+      "https://www.businesswire.com/news/home/20260226513294/en/Nerdy-Announces-Fourth-Quarter-2025-Financial-Results",
+      "https://www.investing.com/news/transcripts/earnings-call-transcript-nerdy-inc-meets-q1-2026-eps-forecast-revenue-surpasses-expectations-93CH-4670747",
+      "https://www.stocktitan.net/news/NRDY/",
+      "https://www.prnewswire.com/news-releases/varsity-tutors-wins-best-tutoring-solution-at-edtech-breakthrough-awards-300869965.html",
+      "https://www.businesswire.com/news/home/20220609005385/en/Varsity-Tutors-Recognized-With-EdTech-Breakthrough-Award-For-Best-Student-Personalization-Solution",
+      "https://www.businesswire.com/news/home/20250106989659/en/Winton-Woods-City-School-District-Announces-Partnership-with-Varsity-Tutors-for-Schools",
+      "https://www.varsitytutors.com/aboutus"
+    ]
+  },
+  "sections": [
+    {
+      "id": "result_how_we_prove_it",
+      "title": "How we'd show you proof in a consultation",
+      "text": "The honest answer to 'prove it works' is that tutoring outcomes depend on the student's starting point, effort, and consistency, so we don't promise a specific number. What we can show you is concrete: a free consultation where an education consultant reviews your child's current grades, recent test scores, and goals, then proposes a plan; the company's published platform-level results (satisfaction ratings, proficiency-growth data from its school programs); and ongoing progress check-ins so you can see whether it's working for your child specifically. If after the first session the tutor isn't a fit, the Tutor Satisfaction Guarantee gives you a free replacement session, so trying it carries low risk."
+    },
+    {
+      "id": "result_satisfaction_rating",
+      "title": "Customer satisfaction (97-98%)",
+      "text": "Varsity Tutors reports a 97% customer satisfaction rating and that '97% of our customers recommend us' on its public reviews page (VERIFIED, varsitytutors.com/reviews, retrieved 2026-06-04). Its school-program pages cite a closely related '98% Satisfaction' figure for districts (VERIFIED, varsitytutors.com/school-solutions/impact). These are aggregate, self-reported company figures rather than independently audited ones; the slight 97% vs 98% difference reflects the consumer page versus the schools page, both retrieved June 2026."
+    },
+    {
+      "id": "result_session_rating",
+      "title": "Average session rating (4.9 / 5)",
+      "text": "Across its tutoring platform, Varsity Tutors reports a 4.9 out of 5.0 average session rating, with the schools materials noting this is drawn from a very large base of learner ratings (VERIFIED, varsitytutors.com/schools and /school-solutions/impact, retrieved 2026-06-04). Search snippets referenced a figure of roughly 3.4 million learner ratings behind the platform average; we report the 4.9/5 score as company-published and treat the exact ratings count as approximate. This is a per-session experience rating, not a measure of test-score gains."
+    },
+    {
+      "id": "result_app_store_rating",
+      "title": "App Store rating (4.9 stars, ~39K ratings)",
+      "text": "The Varsity Tutors Live Tutoring app holds a 4.9 out of 5 rating from about 39,000 ratings on the Apple App Store (REPORTED, apps.apple.com, retrieved 2026-06-04). This is an independent, third-party-hosted rating of the product experience and is one of the stronger external satisfaction signals available, though it reflects app users rather than every tutoring customer."
+    },
+    {
+      "id": "result_trustpilot",
+      "title": "Trustpilot (third-party reviews)",
+      "text": "On Trustpilot, Varsity Tutors has historically carried an approximately 4-star rating; review-volume figures seen in mid-2026 ranged from roughly 500 to over 12,000 depending on the snapshot and page (REPORTED, trustpilot.com/review/varsitytutors.com, retrieved 2026-06-04 — the page itself was access-blocked, so these figures are from search results and should be treated as approximate and time-sensitive). Trustpilot reviews are mixed: many parents praise tutor quality and academic improvement, while recurring complaints concern billing, cancellation difficulty, and support responsiveness. We share this as a balanced, third-party signal rather than a cherry-picked positive."
+    },
+    {
+      "id": "result_bbb",
+      "title": "Better Business Bureau rating",
+      "text": "Varsity Tutors' accredited BBB profile (Clayton, Missouri headquarters) shows an A+ rating and BBB Accredited Business status since 2010 (REPORTED, bbb.org Clayton MO profile, retrieved 2026-06-04). Note the contradiction across listings: a separate Dallas, Texas BBB listing carries an F rating attributed to unanswered complaints, so the grade depends on which office record you look at. We present both honestly; the accredited headquarters profile is the most representative of the company overall."
+    },
+    {
+      "id": "result_math_proficiency",
+      "title": "Math proficiency growth (school programs)",
+      "text": "In its school programs, Varsity Tutors reports that students receiving consistent, AI-enabled high-dosage tutoring show more than 2X growth in math proficiency compared with standard academic interventions (VERIFIED as a company claim, varsitytutors.com/school-solutions/impact and /schools/high-dosage-tutoring, retrieved 2026-06-04). This figure comes from pre- and post-assessment comparisons in district programs; the company states it works with research partners but does not publish the underlying sample sizes, dates, or study reports, so treat it as a company-reported aggregate, not an independently verified result. Many students see meaningful gains with consistent dosage — it is not a guarantee for any individual."
+    },
+    {
+      "id": "result_reading_proficiency",
+      "title": "Reading proficiency growth (school programs)",
+      "text": "Alongside the math figure, Varsity Tutors reports over 40% growth in reading proficiency for students who engaged consistently with its high-dosage school tutoring (VERIFIED as a company claim, varsitytutors.com/schools/high-dosage-tutoring, retrieved 2026-06-04). As with the math figure, this is based on pre/post assessment data in district settings without published study details, so it is an aggregate company claim. Use it to illustrate that consistent tutoring tends to move proficiency, while being clear results vary by student."
+    },
+    {
+      "id": "result_essa_evidence",
+      "title": "ESSA Level III evidence alignment",
+      "text": "Varsity Tutors states its high-dosage tutoring meets ESSA (Every Student Succeeds Act) Evidence Level III, the federal tier for programs demonstrating a rationale and measurable impact via pre- and post-assessment comparisons (VERIFIED as a company claim, varsitytutors.com/schools/high-dosage-tutoring, retrieved 2026-06-04). This matters mainly to schools and districts choosing federally fundable interventions; for a parent it signals the approach is structured around measured outcomes, not that any specific score is guaranteed. We could not independently verify the specific studies behind the Level III designation."
+    },
+    {
+      "id": "result_no_score_guarantee",
+      "title": "On score guarantees — what we honestly can and can't promise",
+      "text": "Varsity Tutors does not publish a specific SAT/ACT point-gain or score guarantee, and we will not invent one — outcomes depend on the student. Their SAT prep materials describe a diagnostic-first approach (a practice test or section diagnostic to target weak areas) rather than a promised number (VERIFIED, varsitytutors.com/sat-prep, retrieved 2026-06-04). What is actually guaranteed is the Tutor Satisfaction Guarantee, not a score: if you're not satisfied with your matched tutor after the first session, the next session (up to two hours) is free (VERIFIED, varsitytutors.com/guarantee). Framing it this way keeps the conversation honest and avoids overpromising."
+    },
+    {
+      "id": "result_test_prep_approach",
+      "title": "Test prep: targeted, diagnostic-driven (SAT/ACT)",
+      "text": "For SAT/ACT prep, Varsity Tutors pairs students with vetted tutors who typically begin with a diagnostic or practice test to pinpoint exactly where points are being lost, then build a personalized study plan around those gaps (VERIFIED, varsitytutors.com/sat-prep, retrieved 2026-06-04). The credible, non-overclaiming pitch is that focused one-on-one prep targeting a student's specific weak areas — combined with consistent practice — is how score improvement happens, and that many students who put in that consistent work see gains. We deliberately avoid attaching a specific point number because the company publishes none."
+    },
+    {
+      "id": "result_scale_students_tutors",
+      "title": "Scale: 1M+ students, 40,000+ instructors, 3,000+ subjects",
+      "text": "Over its 15+ year history Varsity Tutors reports having connected more than 1 million students with a network of 40,000+ vetted instructors across 3,000+ subjects (VERIFIED as company claims, varsitytutors.com/reviews and /online-tutoring, retrieved 2026-06-04). This scale is itself a proof point: it means there is a deep pool to match a student to a tutor who fits their subject, level, and learning style, rather than whoever is locally available. These are company-published figures, presented as scale, not as outcomes."
+    },
+    {
+      "id": "result_scale_hours",
+      "title": "Scale: 10M+ hours of live instruction delivered",
+      "text": "Varsity Tutors reports having delivered over 10 million hours of live instruction across its platform, and Nerdy (its parent) has referenced more than 10 million tutoring sessions on the platform historically (VERIFIED, varsitytutors.com/reviews and /schools plus Nerdy Q1 2026 earnings commentary, retrieved 2026-06-04). This is a track-record signal — a large, established operation rather than a new or untested service. Hours and sessions are scale metrics, not a claim about any individual student's results."
+    },
+    {
+      "id": "result_largest_platform",
+      "title": "Largest live online tutoring platform in the U.S.",
+      "text": "Varsity Tutors describes itself as the largest live, virtual (online) tutoring platform in the United States, now operating for roughly 15-18 years depending on the page (VERIFIED as a company positioning claim, varsitytutors.com/schools and /school-solutions/impact, retrieved 2026-06-04). This is a market-position statement, useful for establishing credibility and longevity, but it is the company's own characterization rather than an independently certified ranking, so we frame it as such."
+    },
+    {
+      "id": "result_awards",
+      "title": "Industry awards (EdTech Breakthrough)",
+      "text": "Varsity Tutors has won EdTech Breakthrough Awards, including 'Best Tutoring Solution' (2019) and, for its schools product, 'Best Student Personalization Solution' (2022) (VERIFIED via the awarding body's announcements and PRNewswire/BusinessWire releases, retrieved 2026-06-04). The company's consumer pages also reference local recognition (e.g., CBS Local and Houston Press awards) as the basis for its 'award-winning' language. We could NOT verify a current 2024-2025 EdTech Breakthrough win for Varsity Tutors, so we cite the 2019 and 2022 awards specifically rather than claiming a recent one."
+    },
+    {
+      "id": "result_schools_partnerships",
+      "title": "Trusted by 1,000+ schools and districts",
+      "text": "Through Varsity Tutors for Schools, the company reports partnering with more than 1,000 schools and districts nationwide, reaching millions of students and families (VERIFIED, varsitytutors.com/schools and /school-solutions/impact, retrieved 2026-06-04). For a family, this institutional adoption is independent social proof: districts run formal procurement and evidence reviews before buying, so widespread school adoption is a meaningful third-party validation of the service quality. The exact partner count has grown over time, so we report the company's current '1,000+' figure with its retrieval date."
+    },
+    {
+      "id": "result_named_districts",
+      "title": "Named district partners",
+      "text": "Varsity Tutors for Schools publicly lists named district and school partners including Fairfax County, Loudoun County, Broward County, Duval County, Polk County, Ann Arbor, Garden Grove Unified, Wichita, Gadsden County, and Success Academy Charter Schools, among others (VERIFIED, partner logos on varsitytutors.com/schools, retrieved 2026-06-04). Press releases also document specific district partnerships such as Winton Woods City School District (announced January 2025) and a multi-million-dollar elementary math tutoring contract with Wichita Public Schools reported around $2.5 million for a year (VERIFIED/REPORTED via BusinessWire releases and journalism, retrieved 2026-06-04). Named institutions are strong, checkable proof points."
+    },
+    {
+      "id": "result_free_through_schools",
+      "title": "Free to many students through their school or district",
+      "text": "Because of these district partnerships, many students can access Varsity Tutors tutoring free of charge through their school — for example, Fairfax County Public Schools provides all K-12 students free online tutoring via Varsity Tutors (REPORTED/VERIFIED, district and company materials, retrieved 2026-06-04). For a price-sensitive family, this is a concrete, verifiable proof point worth checking before paying privately: the same vetted platform may already be available to them at no cost through their district."
+    },
+    {
+      "id": "result_satisfaction_guarantee",
+      "title": "Tutor Satisfaction Guarantee (the real, binding promise)",
+      "text": "The one guarantee Varsity Tutors actually publishes is the Tutor Satisfaction Guarantee: if you're not satisfied with the tutor you were matched with after your initial session, you can call and they'll work to connect you with a better-fit tutor, and your next session is free of charge (up to two hours, based on the length of the initial session) (VERIFIED, varsitytutors.com/guarantee, retrieved 2026-06-04). Be clear and honest about its limits: it covers replacing a tutor, not refunding an unused package — multiple third-party reviewers report refunds on remaining sessions are hard to get (REPORTED). This is the accurate way to address 'what if it doesn't work out.'"
+    },
+    {
+      "id": "result_nerdy_public_company",
+      "title": "Backed by a public company (Nerdy, NYSE: NRDY)",
+      "text": "Varsity Tutors is operated by Nerdy, Inc., a publicly traded company (NYSE: NRDY) that files audited results with the SEC — a transparency and stability signal versus an unregulated private operator (VERIFIED, Nerdy investor relations and SEC filings, retrieved 2026-06-04). In its most recent reported quarter (Q1 2026, ended March 31, 2026), Nerdy posted $48.7M in revenue (up 2% year-over-year) and positive non-GAAP adjusted EBITDA of about $1.0M, its second consecutive profitable quarter on that measure (VERIFIED, BusinessWire/IR and Q1 2026 earnings, retrieved 2026-06-04). For a family, the relevant point is institutional accountability, not the financials themselves."
+    },
+    {
+      "id": "result_active_members_trend",
+      "title": "Active membership scale and trend (honest context)",
+      "text": "Nerdy reported about 36,900 active Learning Members as of Q1 2026, down roughly 9% year-over-year from about 40,500 a year earlier, though the company notes the rate of decline has narrowed for three consecutive quarters and churn has improved (VERIFIED, Nerdy Q1 2026 earnings and IR commentary, retrieved 2026-06-04). We include the decline deliberately — it would be dishonest to cite only growth metrics. The takeaway for a family is that this is a large, active, paying membership base on a stabilizing trend, not that membership is exploding."
+    },
+    {
+      "id": "result_testimonial_pattern",
+      "title": "What customer testimonials consistently report (aggregate)",
+      "text": "Across Varsity Tutors' own featured testimonials and third-party reviews, the recurring positive themes — reported in aggregate, not as guarantees — are improved grades, higher test scores, better understanding of difficult subjects, and increased student confidence, often tied to having one consistent, well-matched tutor (VERIFIED/REPORTED, varsitytutors.com/reviews plus Trustpilot/ConsumerAffairs, retrieved 2026-06-04). We describe these as common patterns families report rather than inventing or quoting a specific named student, and we pair them honestly with the known complaint themes (billing and cancellation) so the picture is balanced."
+    }
+  ]
+}

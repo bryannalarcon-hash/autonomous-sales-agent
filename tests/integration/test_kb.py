@@ -91,8 +91,13 @@ async def _schema():
 async def test_ingest_loads_all_authored_chunks(embedder):
     """ingest() chunks every content/*.json section and tags them with the kb_version."""
     n = await retriever.ingest(embedder, KB_VERSION)
-    # programs(5) + pricing(6) + policies(4) + competitors(3) + objections(9) = 27 sections.
-    assert n == 27
+    # Expected count is derived from the authored corpus (single source of truth, not a hardcoded
+    # number) so the KB can grow without this test going stale — the contract is "every authored
+    # section becomes exactly one chunk." The real Nerdy KB has 175 sections across the 7 content
+    # files (programs/pricing/policies/competitors/objections/results/company); the demo had 27.
+    expected = len(retriever._load_content_chunks())
+    assert n == expected
+    assert expected > 100, f"expected the full Nerdy corpus (>100 chunks), got {expected}"
 
     from src.memory import store
 
@@ -101,7 +106,7 @@ async def test_ingest_loads_all_authored_chunks(embedder):
         count = await conn.fetchval(
             "SELECT count(*) FROM kb_chunk WHERE kb_version = $1", KB_VERSION
         )
-    assert count == 27
+    assert count == expected
 
 
 async def test_retrieve_price_question_returns_pricing_chunks(embedder):
@@ -229,8 +234,10 @@ async def test_ingest_corpus_populates_chunks_and_live_hook_retrieves(embedder):
     from src.kb.live import build_live_retrieve_hook
 
     n = await ingest_corpus(kb_version=KB_VERSION, embedder=embedder)
-    # programs(5) + pricing(6) + policies(4) + competitors(3) + objections(9) = 27 sections.
-    assert n == 27
+    # Derived from the authored corpus (single source of truth), not a hardcoded number, so the KB
+    # can grow without this test going stale. The real Nerdy KB is 175 sections; the demo was 27.
+    expected = len(retriever._load_content_chunks())
+    assert n == expected
 
     from src.memory import store
 
@@ -239,7 +246,7 @@ async def test_ingest_corpus_populates_chunks_and_live_hook_retrieves(embedder):
         count = await conn.fetchval(
             "SELECT count(*) FROM kb_chunk WHERE kb_version = $1", KB_VERSION
         )
-    assert count == 27
+    assert count == expected
 
     # The live hook (closure over the embedder + kb_version) retrieves real grounding over pgvector.
     hook = build_live_retrieve_hook(embedder, kb_version=KB_VERSION, k=4)

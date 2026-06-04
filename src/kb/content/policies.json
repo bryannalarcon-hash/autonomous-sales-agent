@@ -2,28 +2,152 @@
   "_meta": {
     "title": "Policies",
     "kb_version": "kb_v0",
-    "note": "Illustrative demo policies for grounding (scheduling, cancellation, satisfaction guarantee, refunds). Not a real terms-of-service."
+    "note": "Real Nerdy Inc. / Varsity Tutors policy facts for sales-agent grounding, retrieved 2026-06-04. Each fact is tagged in-text: VERIFIED (official varsitytutors.com / nerdy.com page), REPORTED (reputable third-party writeup of customer experience), or ESTIMATED (inference, clearly hedged). Biggest contradiction: third-party guides say 'no refunds at all on cancellation,' while the official Terms say 'all fees are nonrefundable except as required by law' AND the official Guarantee page describes a Pass Guarantee full-refund path; resolved by treating the official pages as authoritative and stating that the general membership is non-refundable while specific guarantees create refund/credit exceptions. Where an exact number is not published (e.g., a membership-level money-back window, included hours per plan, pause length), this KB says it is confirmed at signup / not publicly specified rather than inventing a figure.",
+    "sources": [
+      "https://www.varsitytutors.com/guarantee",
+      "https://www.varsitytutors.com/gb/guarantee",
+      "https://www.varsitytutors.com/terms-of-use",
+      "https://www.varsitytutors.com/privacy",
+      "https://www.varsitytutors.com/membership/overview",
+      "https://www.varsitytutors.com/classes/faq",
+      "https://member-services.varsitytutors.com/hc/en-us/articles/15489237425307-What-is-Varsity-Tutors-session-cancellation-policy",
+      "https://member-services.varsitytutors.com/hc/en-us/articles/15485696482587-How-can-I-check-my-remaining-tutoring-hours",
+      "https://www.varsitytutors.com/college-scholarship",
+      "https://www.varsitytutors.com/schools/safety-and-compliance",
+      "https://brighterly.com/blog/how-to-cancel-varsity-tutors/",
+      "https://www.joinchargeback.com/cancels/how-to-cancel-varsity-tutors"
+    ]
   },
   "sections": [
     {
-      "id": "policy_scheduling",
-      "title": "Scheduling and rescheduling",
-      "text": "Sessions are booked through the member portal at times the family and tutor both choose. A session can be rescheduled at no charge up to 12 hours before its start time. Inside the 12-hour window a reschedule uses up the scheduled hour, except for documented emergencies. There is no limit on how far in advance sessions can be booked, and recurring weekly slots can be reserved with the same tutor."
+      "id": "policy_company_brand",
+      "title": "Who provides the service",
+      "text": "Tutoring is delivered by Varsity Tutors, the consumer learning brand of Nerdy Inc. (NYSE: NRDY) (VERIFIED, nerdy.com / varsitytutors.com). All policies here govern the Varsity Tutors platform and its Learning Memberships and tutoring-hour purchases. Families interact with the service as 'members' through their online account and the Varsity Tutors live-learning platform."
     },
     {
-      "id": "policy_cancellation",
-      "title": "Cancellation terms",
-      "text": "The monthly membership can be cancelled at any time with no long-term contract and no cancellation fee. Cancelling stops the next monthly renewal; the current month's already-scheduled hours remain usable through the end of that billing period. Members can also pause the membership for one month instead of cancelling, for example over a school break."
+      "id": "policy_tutor_satisfaction_guarantee",
+      "title": "Tutor Satisfaction Guarantee",
+      "text": "Varsity Tutors offers a Tutor Satisfaction Guarantee to all purchasers of tutoring hours on the platform (VERIFIED, /guarantee). If, for any reason, you are not satisfied with the tutor you were connected with after your initial session, you can call Varsity Tutors; they will help understand why and connect you with a tutor who may be a better fit, and your next session is free of charge — up to two hours, based on the actual length of the initial session (VERIFIED). The trigger for the guarantee is dissatisfaction after the first session with a given tutor."
     },
     {
-      "id": "policy_satisfaction_guarantee",
-      "title": "Satisfaction guarantee and tutor re-match",
-      "text": "Every membership includes a satisfaction guarantee. If a student is not a good fit with their tutor, the family can request a free tutor re-match at any time and be paired with a different vetted tutor at no extra cost. If the first session with a new member is unsatisfactory, that session is credited back. The guarantee is meant to remove the risk of being stuck with a tutor who is not working out."
+      "id": "policy_tutor_rematch",
+      "title": "Changing or re-matching your tutor",
+      "text": "If a student is not a good fit with their tutor, you can request a different tutor by contacting Varsity Tutors (VERIFIED, /guarantee). Under the Tutor Satisfaction Guarantee the replacement session after a first-session mismatch is provided free (up to two hours) (VERIFIED). Outside that first-session window, members can still ask to be re-matched to a new vetted tutor through Member Services; whether additional sessions are credited beyond the guarantee is handled case by case and is not a separately published term (ESTIMATED — verify the specific terms at signup)."
     },
     {
-      "id": "policy_refund_window",
-      "title": "Refund window",
-      "text": "New members have a 14-day refund window from the first charge: if the service is not a fit within the first 14 days, the family can request a full refund of that month's membership fee. After the 14-day window, membership is non-refundable for the current month but can be cancelled to stop future renewals at any time."
+      "id": "policy_session_cancellation_notice",
+      "title": "Session cancellation and rescheduling notice",
+      "text": "A scheduled tutoring session must be canceled or rescheduled at least 24 hours in advance to avoid losing time (VERIFIED, official Member Services session-cancellation article). You can cancel or reschedule directly from your online account when you give 24 hours' notice. Tutors reserve that time specifically for the student, so late changes can affect their schedule."
+    },
+    {
+      "id": "policy_late_cancellation_penalty",
+      "title": "Late-cancellation / missed-session penalty",
+      "text": "If a session is canceled or rescheduled with less than 24 hours' notice, 30 minutes is deducted from your tutoring-hours balance (VERIFIED, official Member Services session-cancellation article; corroborated REPORTED by third-party cancellation guides). For a no-show or a within-24-hour change you generally do not get those hours back in your account. The published penalty is the 30-minute deduction rather than a separate monetary fee."
+    },
+    {
+      "id": "policy_membership_no_contract",
+      "title": "Month-to-month, no long-term contract",
+      "text": "Varsity Tutors Learning Memberships are billed as a recurring monthly subscription with no long-term contract, and members can cancel at any time (VERIFIED that you may terminate at any time per Terms of Use Section 15; REPORTED month-to-month / 'cancel anytime, no penalty' framing by third-party guides). There is no early-termination or cancellation fee (REPORTED, multiple third-party guides). Canceling stops future billing but does not, on its own, refund the current period."
+    },
+    {
+      "id": "policy_how_to_cancel",
+      "title": "How to cancel a membership",
+      "text": "Membership cancellations generally cannot be completed silently online — you contact Varsity Tutors Member Services to cancel and stop future billing, typically by phone or chat (REPORTED, multiple third-party guides; the official Terms confirm you may terminate at any time but do not specify the channel). Reported Member Services contact is US (888) 888-0446 (REPORTED). Because billing auto-renews monthly, members are advised to cancel before the next renewal date so the cancellation takes effect for the upcoming cycle (REPORTED)."
+    },
+    {
+      "id": "policy_auto_renewal",
+      "title": "Automatic monthly renewal",
+      "text": "The monthly membership renews automatically, and the card on file is charged for the next month at renewal (REPORTED, multiple third-party guides). Renewal occurs even if unused hours remain from the prior month (REPORTED; see hours-rollover policy). To avoid the next charge, cancellation should be requested before the renewal/billing date (REPORTED)."
+    },
+    {
+      "id": "policy_general_refunds",
+      "title": "General refund policy",
+      "text": "Under the official Terms of Use, except as required by law, all fees are nonrefundable, and termination of the agreement does not entitle you to a refund of charges already paid (VERIFIED, Terms of Use Section 10 / 15). Third-party guides summarize this as: there is no cancellation fee, but you will not receive a refund of any unused balance when you cancel (REPORTED). Specific guarantees (below) create the main exceptions to this general no-refund stance. A general membership-level 'money-back window' in a fixed number of days is not published by Varsity Tutors; any such trial/refund window should be confirmed at signup (ESTIMATED / not publicly specified)."
+    },
+    {
+      "id": "policy_unused_hours_no_refund",
+      "title": "Unused hours and balances",
+      "text": "Canceling does not refund an unused hours balance; third-party guides advise members to use up remaining hours before canceling (REPORTED, multiple guides). Reported customer experience indicates unused hours do not automatically carry over when the subscription renews into the next billing period (REPORTED). The general no-refund rule on the official Terms is consistent with not cashing out an unused balance (VERIFIED, Terms of Use Section 10)."
+    },
+    {
+      "id": "policy_hours_expiration",
+      "title": "Tutoring-hours redemption window",
+      "text": "Purchased tutoring hours are reported to be redeemable for up to one year (12 months) from the date of purchase (REPORTED, third-party summaries of Varsity Tutors hours). This redemption window is distinct from the monthly subscription cycle. Because rollover and expiration handling has been a source of customer confusion, members should confirm their plan's exact rollover and expiration terms with Member Services (REPORTED; ESTIMATED on plan-specific variation)."
+    },
+    {
+      "id": "policy_membership_pause",
+      "title": "Pausing a membership",
+      "text": "Pausing a membership (for example over a school break) is something members have requested through Member Services, but it is not described as a self-serve, clearly published policy (REPORTED). There have been customer complaints of being charged after believing their membership was paused, so a pause request should be confirmed in writing and verified before the billing date (REPORTED). The exact mechanics and maximum pause length are not publicly specified (ESTIMATED / not publicly specified)."
+    },
+    {
+      "id": "policy_pass_guarantee",
+      "title": "Pass Guarantee (professional certifications)",
+      "text": "For eligible professional-certification test prep (purchases after May 15, 2024), Varsity Tutors offers a Pass Guarantee (VERIFIED, /guarantee). To qualify you must purchase and use a minimum of 12 Live 1:1 Tutoring Hours within a 3-month period before the test, submit exam-registration proof within 14 days of purchase (or of registration, whichever is later), complete all assigned homework and follow the lesson plan, and take the official test within 14 days of your last 1:1 session. If you meet all requirements and do not pass, you are eligible for a one-time free credit equal to the hours you consumed OR a full refund of the original purchase, requested within six months of purchase (VERIFIED)."
+    },
+    {
+      "id": "policy_score_guarantee",
+      "title": "Score / personal satisfaction guarantee (test prep)",
+      "text": "For test prep, Varsity Tutors offers a satisfaction/score guarantee: if you don't receive the score you want — whether or not you've already taken the official exam — Varsity Tutors will provide, at no additional cost, a live online course for the same exam to help you prepare for the next attempt (VERIFIED, /guarantee). This is a make-good in the form of additional instruction rather than an automatic cash refund. It is separate from the Pass Guarantee's credit-or-refund path."
+    },
+    {
+      "id": "policy_satisfaction_overall",
+      "title": "Overall satisfaction commitment",
+      "text": "Varsity Tutors publicly frames its service around customer satisfaction and backs tutoring with the Tutor Satisfaction Guarantee and, for test prep, the score and Pass guarantees (VERIFIED, /guarantee). A blanket, unconditional '100% money-back' guarantee covering all Learning Memberships is not stated as an official term on the guarantee page (ESTIMATED — marketing language about being '100% satisfied' appears in third-party summaries, but the enforceable mechanisms are the specific guarantees above). For membership disputes, the practical remedy is the free re-match/replacement session plus cancellation of future billing."
+    },
+    {
+      "id": "policy_free_classes",
+      "title": "Free and included group classes",
+      "text": "Varsity Tutors offers free large-group online classes (for example early-reading and phonics enrichment), and Learning Membership marketing describes access to live group classes alongside 1-on-1 tutoring (VERIFIED that membership includes 'unlimited access to live classes, 1-on-1 tutoring, and self-study resources,' /classes FAQ; REPORTED for the specific free-class catalog). These group classes are distinct from paid private 1:1 tutoring hours. Class availability and which classes are free can change over time (ESTIMATED on currency)."
+    },
+    {
+      "id": "policy_free_trial",
+      "title": "Free trial / first session",
+      "text": "Varsity Tutors does not prominently advertise a standalone free-trial period for paid memberships (REPORTED). The closest 'try without risk' mechanism is the Tutor Satisfaction Guarantee, which makes the replacement session free if you're unsatisfied after your first session with a tutor (VERIFIED, /guarantee). Any introductory or promotional trial offer would be specific to a current promotion and should be confirmed at signup rather than assumed (ESTIMATED / not publicly specified)."
+    },
+    {
+      "id": "policy_scholarships",
+      "title": "Scholarships and contests",
+      "text": "Varsity Tutors runs scholarship contests rather than need-based tuition aid: a recurring essay-based scholarship contest (commonly cited around a $1,000 award, with smaller monthly awards) where entries are submitted and voted on through the Varsity Tutors site (VERIFIED that a College Scholarship contest page exists at /college-scholarship; REPORTED on specific dollar amounts and cadence). These contests are open competitions and are separate from discounts on tutoring. Exact current award amounts and rules are governed by the official scholarship page and its rules (ESTIMATED on current figures)."
+    },
+    {
+      "id": "policy_financial_assistance",
+      "title": "Financial assistance and affordability",
+      "text": "Varsity Tutors does not publish a formal need-based financial-aid program for private 1:1 tutoring; affordability is addressed mainly through multiple membership tiers/hour packages and periodic promotions (REPORTED). Some families access Varsity Tutors at no cost through school- or district-funded partnerships (Varsity Tutors for Schools), where the school, not the family, pays (VERIFIED that Varsity Tutors for Schools exists; REPORTED on free-to-family access via specific districts). Families seeking lower cost should ask Member Services about current promotions and the smallest qualifying package (ESTIMATED)."
+    },
+    {
+      "id": "policy_schools_partnerships",
+      "title": "School and district partnerships",
+      "text": "Through Varsity Tutors for Schools, districts can sponsor tutoring and on-demand help for their students, sometimes 24/7 and at no charge to the family (VERIFIED that the Schools offering exists; REPORTED on specific district arrangements like always-on access). When access is provided via a school, that school's agreement and data-protection terms govern, including FERPA handling (VERIFIED, privacy/compliance pages). Eligibility and what's included under a school partnership differ by district and are set by the school, not by the individual member (ESTIMATED on per-district variation)."
+    },
+    {
+      "id": "policy_privacy_children",
+      "title": "Children's privacy and parental control",
+      "text": "Varsity Tutors states the site is not directed at children under 13 and that it does not knowingly collect personally identifiable information from children under 13 online, collecting from a student-minor only as needed to facilitate that student's tutoring (VERIFIED, /privacy). Parents or guardians of a child under 13 may review, or have deleted, personal information collected about the child (VERIFIED). Requests can be made through Varsity Tutors' privacy request form, by emailing privacy@varsitytutors.com, or by calling (888) 888-0446 (VERIFIED)."
+    },
+    {
+      "id": "policy_privacy_rights",
+      "title": "Data rights and deletion",
+      "text": "Varsity Tutors describes complying with COPPA and, for school engagements, FERPA (VERIFIED, /privacy and schools compliance page). Residents of states with applicable privacy laws (such as California, Colorado, and Virginia) can request access, correction, and deletion of personal information using the privacy request form (VERIFIED). For school-provided (VTS) offerings, school data is deleted within 90 days of expiration or termination of the school agreement (VERIFIED)."
+    },
+    {
+      "id": "policy_session_recordings",
+      "title": "Session recordings and the online platform",
+      "text": "Tutoring takes place on Varsity Tutors' online live-learning platform, and the platform supports session features such as recordings for review (REPORTED; the official Member Services 'missed session / are recordings provided' article confirms a recordings/missed-session policy exists but its full text could not be retrieved at capture time). Because sessions and minor data are processed through the platform, recording and data handling are governed by the privacy notice (VERIFIED that privacy terms govern platform data). Parents wanting recording details for a specific session should confirm availability with Member Services (ESTIMATED on per-session availability)."
+    },
+    {
+      "id": "policy_dispute_resolution",
+      "title": "Arbitration and dispute resolution",
+      "text": "The Terms of Use include a binding-arbitration agreement and a class-action waiver: users and the company mutually waive the right to resolve disputes in court before a judge or jury (VERIFIED, Terms of Use Section 4). There is an opt-out option from arbitration if exercised within 30 days (VERIFIED). This governs how billing or service disputes are formally resolved if they cannot be settled directly with Member Services."
+    },
+    {
+      "id": "policy_company_termination",
+      "title": "Company's right to end service",
+      "text": "Varsity Tutors reserves the right to terminate the agreement at any time and for any reason upon 10 days' notice to the user, and may modify, restrict, or discontinue access (VERIFIED, Terms of Use Section 15). Users, in turn, may terminate at any time by discontinuing access (VERIFIED). Neither party's termination, by itself, creates a refund obligation beyond what the specific guarantees or applicable law require (VERIFIED)."
+    },
+    {
+      "id": "policy_what_we_dont_publish",
+      "title": "Terms confirmed at signup (not publicly specified)",
+      "text": "Several specifics are not published as fixed public terms and are instead confirmed when a family signs up or speaks with Member Services: the exact number of tutoring hours included at each membership tier, any current introductory/trial pricing or money-back window, the precise mechanics and maximum length of a membership pause, and plan-specific hours rollover/expiration handling (ESTIMATED / not publicly specified). The sales agent should never state a specific refund-day count, included-hours number, or pause duration as fact unless it is confirmed for that member's plan. When unsure, direct the family to the official guarantee/terms pages and to Member Services."
     }
   ]
 }
