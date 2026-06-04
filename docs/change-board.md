@@ -106,26 +106,6 @@
 - **Notes / blockers:** HARD INVARIANT — the honest buy-gate must stay PURE/DETERMINISTIC: budget + qualified + per-tier ceiling immutable to talk; a commitment fires ONLY on the agent's `attempt_close` at the offered tier. Do NOT let "more turns" come from breaking that (e.g., never auto-commit / never move budget). Regenerating transcripts is paid LLM self-play — bounded batch first.
 - **Notes:** DONE + committed (1d9cdec): conviction coupling fixed the binding constraint; N=10 verify = 6/7 qualified close, 0/3 unqualified, avg ~19 turns, buy-gate intact. (Board kept here for history.)
 
-### CB-44 — Voice-call timing observability (audio-in → first-token → stream-end), logged every call
-- **Type / Surface / Size:** feature · `voice-worker` · `api` · `data` · M
-- **Owner:** coder-voice + orchestrator
-- **Started:** 2026-06-04
-- **Prereqs met?:** yes
-- **Why:** the on-ring + word-streaming issues need DATA, and the timings are a deliverable in their own right. Capture, per agent turn: when the user's audio/STT landed, when the FIRST NLG token hit the stream, and when streaming ENDED → time-to-first-token + stream duration. Log for EVERY call going forward.
-- **Seam (verified in code):** `WorkerVoiceAgent.on_user_turn_completed` (`worker.py:486`) = final STT received → stamp `t_audio_in`. `llm_node` (`worker.py:536`): stamp `t_brain_start` at entry; on the FIRST yielded token in the `async for` (line 574) stamp `t_first_token`; after the loop (line 582) stamp `t_stream_end`. Compute `audio_to_first_token_ms = t_first_token - t_audio_in`, `first_token_ms = t_first_token - t_brain_start`, `stream_duration_ms = t_stream_end - t_first_token`, `total_ms = t_stream_end - t_audio_in`.
-- **Persist + API contract (LOCKED — coder-dash builds against this):**
-  - Per-turn (in `episode_detail().turns[i]`): `"timing": {"audio_to_first_token_ms": int|null, "first_token_ms": int|null, "stream_duration_ms": int|null, "total_ms": int|null}` (null for text/legacy turns).
-  - Live snapshot (`live_snapshot()`): `"live_timing": {"first_token_ms": int|null, "stream_elapsed_ms": int|null}` present only while a partial is streaming, else null.
-  - Summary (`episode_summary()`): `"avg_first_token_ms": int|null`, `"avg_stream_ms": int|null` (mean over agent turns that have timing).
-- **Plan (checklist):**
-  - [ ] Stamp the 4 timestamps in worker; attach the computed per-turn timing onto the committed Turn (carry through commit_turn / PendingTurn) without breaking R37 parity (timing is metadata; reply text == concat(tokens) unchanged).
-  - [ ] Persist timing per turn (`src/api/persistence.py`) and aggregate into episode metrics; surface via the 3 API shapes above (`src/api/operate.py`).
-  - [ ] Logger line per turn (info) with the 4 numbers so a tail of the worker log shows timing live.
-  - [ ] **Run 1 of the 3 personas (start with P-B "Marcus") through the instrumented path and capture real numbers.** If a true audio/STT eval isn't runnable headless, run it through the brain-streaming path to capture first-token/stream-duration and capture audio-in timing on the next real phone/web-voice call — RELAY which was used.
-  - [ ] Regression test: a turn with stamped timings serializes the contract; a text/legacy turn yields nulls (no crash).
-- **Files being touched:** `src/voice/worker.py`, `src/api/persistence.py`, `src/api/operate.py`, `tests/` (timing serialization).
-- **Notes / blockers:** fire-and-forget discipline preserved — timing must NEVER block/crash the speak loop. PII: timings are numbers only, no transcript leakage.
-
 ### CB-45 — Surface call timing on the dashboard (live monitor + stored Call Review)
 - **Type / Surface / Size:** feature · `/operate/live` · `/operate/review` · `/operate/calls` · `design` · M
 - **Owner:** coder-dash + orchestrator
@@ -140,19 +120,6 @@
   - [ ] Verify rendered result via screenshot (Cadence dark), not just tsc.
 - **Files being touched:** `web/app/operate/live/page.tsx`, `web/app/operate/review/[id]/page.tsx`, `web/app/operate/calls/page.tsx`, `web/lib/operate-types.ts`, `web/lib/operate-api.ts`.
 - **Notes / blockers:** human-readable labels only (ms formatted, e.g. "0.8s to first word"); no internal index/slug leakage.
-
-### CB-46 — Fix: call visible on connect (BEFORE the disclosure), + streaming verification
-- **Type / Surface / Size:** bug · `voice-worker` · `/operate/live` · S/M
-- **Owner:** coder-voice + orchestrator
-- **Started:** 2026-06-04
-- **Prereqs met?:** yes (pairs with CB-44; same agent owns worker.py)
-- **Why (RCA verified):** the call appears only after ~1 full turn because the connect-upsert (`worker.py:1116`) runs AFTER `await session.say(disclosure)` (line 1105) — the `await` blocks for the whole disclosure TTS (several seconds), so the 0-turn row + heartbeat isn't written until the disclosure finishes, and the 2s queue poll then surfaces it around the first committed turn. (`_is_active` and `persist_call_live` both already handle a 0-turn row, so the predicate is NOT the problem.)
-- **Plan (checklist):**
-  - [ ] Fire the connect-upsert IMMEDIATELY after `session.start` (worker.py:1087) and BEFORE the disclosure `say` — fire-and-forget (`asyncio.ensure_future`) so the call shows on ring without waiting on TTS. Keep the existing post-disclosure log.
-  - [ ] Use CB-44 timing on the captured eval/real call to confirm whether word-streaming partials actually fill in (first_token ≪ stream_end ⇒ genuine streaming; first_token ≈ stream_end ⇒ NLG isn't token-streaming → escalate as a follow-up). Report the finding.
-  - [ ] Regression test (extend the CB-32 connect-upsert test): connect-upsert is scheduled before/independent of the disclosure say (not gated behind it).
-- **Files being touched:** `src/voice/worker.py` (entrypoint ordering), `tests/` (connect-upsert ordering).
-- **Notes / blockers:** consent/disclosure semantics UNCHANGED — only the upsert MOVES earlier; the disclosure still speaks before the brain answers (R33). R37 untouched.
 
 ---
 
@@ -169,6 +136,24 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-46 — Fix: call visible on connect (BEFORE the disclosure) + streaming verdict
+- **Type / Surface / Size:** bug · `voice-worker` · `/operate/live` · S
+- **Completed:** 2026-06-04
+- **Files changed (actual):** `src/voice/worker.py` (new `_disclose_and_mark_connected` helper; `entrypoint` calls it), `tests/integration/test_voice_sim.py` (ordering regression test).
+- **What changed:** RCA confirmed — the connect-time in_progress upsert ran AFTER `await session.say(disclosure)`, whose await blocks for the whole (multi-second) disclosure TTS, so the row the live monitor polls for wasn't written until the disclosure finished → call invisible until ~the first committed turn. Fix: `_disclose_and_mark_connected` fires the connect upsert FIRST as fire-and-forget (`asyncio.ensure_future(_upsert_live_voice)`), THEN speaks the disclosure. Single-sourced so the ordering is regression-tested via one code path.
+- **Verification:** `/usr/bin/python3 -m pytest tests/integration/test_voice_sim.py -q` → 6 passed incl. new `test_voice_sim_connect_upsert_fires_before_disclosure_say` (written red first). Consent/disclosure semantics UNCHANGED (R33 — disclosure still spoken before the brain answers); R37 untouched.
+- **STREAMING VERDICT (CB-44 data):** word-streaming is **GENUINE** — NLG streamed 32 tokens over ~1.77s (`stream_duration_ms ≫ 0`), not a single chunk. The perceived "dead air on ring / not streaming" is NOT the NLG: `first_token_ms ≈ 4.8s` is dominated by the **~3s blocking DST + Policy prelude** (two JSON LLM round-trips) that runs BEFORE NLG streaming starts (brain.timing: dst≈1412ms, policy≈1664ms, nlg≈3493ms).
+- **Follow-ups / known gaps:** **CB-47 candidate** — mask/shrink the DST+Policy prelude (filler line and/or parallelize/cache the two prelude round-trips) so time-to-first-word drops from ~4.8s. Audio-in→first-token on a REAL phone/web call still to be captured (the eval run had no STT).
+
+### CB-44 — Voice-call timing observability (audio-in → first-token → stream-end), every call
+- **Type / Surface / Size:** feature · `voice-worker` · `api` · `data` · M
+- **Completed:** 2026-06-04
+- **Files changed (actual):** `src/voice/worker.py` (stamp `t_audio_in` in `on_user_turn_completed`; `t_brain_start`/`t_first_token`/`t_stream_end` in `llm_node`; `_record_turn_timing` + `_live_timing_snapshot`; carried through `_upsert_live_voice`/`_upsert_live_partial`/`_register_persistence`), `src/api/persistence.py` (`turn_timings`/`live_timing` → `metrics`, turn_id stringified for jsonb), `src/api/operate.py` (`_coerce_timing`/`_coerce_live_timing`/`_timing_averages`; serializes the 3 LOCKED shapes), `tests/unit/test_cb44_timing.py` (NEW, 5 cases), `tests/integration/test_voice_sim.py` (streaming-timing test).
+- **What changed:** every agent voice turn now records audio→first-token→stream-end and exposes per-turn `timing` (4 ms numbers, null on text/legacy), live `live_timing` (in-flight first-token + stream-elapsed, resolved to absolute ms so the API process needs no foreign clock), and summary `avg_first_token_ms`/`avg_stream_ms`. One info log line per turn.
+- **Verification:** `tests/unit/test_cb44_timing.py` 5 passed; `tests/integration/test_voice_sim.py` 6 passed; full non-voice suite 573 passed/5 skipped; operate e2e 37 passed; DB-gated store/persistence 19 passed (real Postgres :5434). R37 parity intact (timing metadata only; reply == concat(tokens)). Fire-and-forget — every timing path wrapped/swallowed, never blocks the speak loop.
+- **Captured numbers (RUN-1):** real production NLG via `handle_user_turn_stream` — `first_token_ms≈4803, stream_duration_ms≈1766, tokens=32` (model claude-sonnet-4.5); mock path (with STT in the harness) populated all 4 incl. `audio_to_first_token_ms`. See the CB-46 streaming verdict.
+- **Constraints checked:** PII — timings are numbers only, no transcript leakage. Contract matches the frontend `TurnTiming`/`LiveTiming` types exactly (verified).
 
 ### CB-43 — Deeply-prompted eval personas (Dana / Marcus / Pat) + seeded non-sequiturs
 - **Type / Surface / Size:** feature · `core` (`src/sim`) · M

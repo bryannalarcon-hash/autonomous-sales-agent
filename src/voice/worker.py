@@ -38,12 +38,14 @@
 # each committed agent turn _upsert_live_voice writes an in_progress Episode via persist_call_live
 # using that stable id so the Live monitor can query voice calls mid-call; _register_persistence
 # finalizes with the same id so no orphan row is created.
-# CB-32 (call visible at connect): the entrypoint also fires ONE _upsert_live_voice immediately after
-# session.start + the disclosure — a 0-turn in_progress upsert with a fresh heartbeat — so the call
-# shows in the monitor's "Connecting…" state the instant the room is up, BEFORE the first committed
-# turn (the old first upsert only fired from _capture_post_commit ← llm_node, after the brain
-# generated, so the call was invisible for several seconds). The stale-guard still drops it if the
-# caller never engages.
+# CB-32 -> CB-46 (call visible ON RING): _disclose_and_mark_connected fires ONE _upsert_live_voice
+# (fire-and-forget) the instant session.start returns — a 0-turn in_progress upsert with a fresh
+# heartbeat — THEN speaks the disclosure, so the call shows in the monitor's "Connecting…" state on
+# ring, BEFORE the (multi-second) disclosure TTS and the first committed turn. CB-46 RCA: the connect
+# upsert used to run AFTER `await session.say(disclosure)`, whose await blocks for the whole disclosure
+# TTS, so the row the monitor polls for wasn't written until the disclosure finished and the call was
+# invisible until ~the first committed turn. Consent/disclosure semantics unchanged (R33 — disclosure
+# still spoken before the brain answers). The stale-guard still drops a call the caller abandons.
 # CB-31 -> CB-41 (real-voice GENERATION streaming): llm_node now runs the WHOLE brain STREAMING via
 # voice_session.handle_user_turn_stream (RAG + DST + gated Policy + STREAMED NLG via realize_stream)
 # and YIELDS each NLG token to TTS as it generates (returns an AsyncIterator[str]; ''.join(tokens) ==
@@ -426,6 +428,20 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
         # Live AgentConfig, set by _build_brain. llm_node commits the turn (the reliable state write)
         # and needs config for _capture_post_commit (escalation handling + the live in_progress upsert).
         self._config: Optional[AgentConfig] = None
+        # CB-44 (timing observability): the monotonic loop-clock stamp of the final STT for the PENDING
+        # speech_id (set in on_user_turn_completed), keyed by sid so a barge-in / re-ordered turn can't
+        # mis-attribute it. llm_node reads + clears it to compute audio_to_first_token. None on the
+        # text/legacy path (no STT) -> audio_to_first_token serializes as null.
+        self._audio_in_by_sid: dict[str, float] = {}
+        # CB-44: the computed per-turn timing (the 4 ms numbers), keyed by the COMMITTED agent turn_id,
+        # so persistence can attach it onto episode.metrics["turn_timings"] without touching the schema
+        # Turn. A turn with no entry (text/legacy) serializes as all-null in operate._turn_to_dict.
+        self._turn_timings: dict[int, dict[str, Optional[int]]] = {}
+        # CB-44: the IN-FLIGHT timing of the active (not-yet-committed) agent turn, surfaced via
+        # live_snapshot["live_timing"] while a partial streams: {"first_token_ms", "stream_start"} where
+        # stream_start is the monotonic loop time of the first token (operate derives stream_elapsed_ms
+        # from it). Set on the first streamed token, cleared once the turn commits (None between turns).
+        self._live_timing: Optional[dict[str, float]] = None
 
     # --- SIP spoken-consent sub-flow (the no-browser phone path) --------------------------------
 
@@ -512,6 +528,14 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
         speech_id = f"t-{self._turn_counter}"
         self._pending_speech_id = speech_id
         self._pending_user_text = user_text
+        # CB-44: stamp t_audio_in = the moment the FINAL STT for this turn landed (monotonic loop clock).
+        # llm_node reads it to compute audio_to_first_token_ms. Wrapped defensively: a timing-stamp
+        # hiccup (e.g. no running loop in a degenerate test) must NEVER block/crash the turn — it just
+        # leaves audio_to_first_token null for this turn. Keyed by sid so it can't mis-attribute.
+        try:
+            self._audio_in_by_sid[speech_id] = asyncio.get_running_loop().time()
+        except Exception:  # pragma: no cover - defensive (timing must never break the turn)
+            pass
 
     async def _say_consent_line(self, text: str) -> None:
         """SPEAK a consent prompt/hand-off line via the running AgentSession (livekit), if available.
@@ -571,14 +595,30 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
         loop = asyncio.get_running_loop()
         shown = ""
         last_partial_at = 0.0
+        # CB-44 timing (metadata ONLY — never changes a decision or a token; R37 parity intact). The
+        # monotonic loop clock drives all stamps. audio_in is the final-STT stamp for THIS sid (None on
+        # the text/legacy path); brain_start is llm_node entry; first_token / stream_end bracket the NLG
+        # stream. None-defaulted so a degenerate (zero-token) stream serializes as nulls, not a crash.
+        t_audio_in = self._audio_in_by_sid.pop(sid, None)
+        t_brain_start = loop.time()
+        t_first_token: Optional[float] = None
         async for token in self.voice_session.handle_user_turn_stream(user_text, sid):
+            now = loop.time()
+            if t_first_token is None:
+                # CB-44: first NLG token reached the speak loop. Surface the in-flight timing so the live
+                # monitor can show time-to-first-token + a growing stream-elapsed on the active turn.
+                t_first_token = now
+                self._live_timing = {
+                    "first_token_ms": (t_first_token - t_brain_start) * 1000.0,
+                    "stream_start": t_first_token,
+                }
             shown += token
             yield token  # -> TTS (and the AgentSession's transcription path) at generation pace
-            now = loop.time()
             if self._config is not None and (now - last_partial_at) >= _LIVE_PARTIAL_THROTTLE_S:
                 last_partial_at = now
                 # Fire-and-forget: a partial-text upsert must never block / crash the speak loop.
                 asyncio.ensure_future(_upsert_live_partial(self, self._config, shown))
+        t_stream_end = loop.time()
         # Always flush the FINAL partial (the complete reply) before commit, so even a reply that
         # streamed faster than one throttle window still surfaces its partial text to the monitor.
         if self._config is not None and shown:
@@ -591,8 +631,57 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
         committed = self.voice_session.commit_turn(sid)
         if committed is not None:
             logger.info("turn %s committed (llm_node, streamed NLG)", sid)
+            # CB-44: record + log the per-turn timing AFTER commit (the turn_id now exists). Wrapped so a
+            # timing hiccup never crashes the speak loop — like the partial upserts (fire-and-forget
+            # discipline). The active-turn in-flight timing is cleared here (the turn is no longer live).
+            self._record_turn_timing(sid, t_audio_in, t_brain_start, t_first_token, t_stream_end)
+            self._live_timing = None
             if self._config is not None:
                 _capture_post_commit(self, committed, sid, self._config)
+
+    def _record_turn_timing(
+        self,
+        sid: str,
+        t_audio_in: Optional[float],
+        t_brain_start: float,
+        t_first_token: Optional[float],
+        t_stream_end: float,
+    ) -> None:
+        """CB-44: compute the 4 per-turn timing ms numbers, stash them by committed agent turn_id, and
+        log one info line per turn so a worker-log tail shows timing live. Pure bookkeeping — it NEVER
+        raises into the speak loop (any failure is swallowed; timing is metadata only, R37 intact).
+
+        Numbers (all monotonic-clock deltas, ms; loop.time() is seconds):
+          audio_to_first_token_ms = first_token - audio_in   (null if no STT stamp — text/legacy)
+          first_token_ms          = first_token - brain_start
+          stream_duration_ms      = stream_end  - first_token
+          total_ms                = stream_end  - audio_in    (null if no STT stamp)
+        A degenerate stream that yielded no token leaves first_token None -> first_token_ms/
+        stream_duration_ms null (no fabricated zero). Keyed by the committed AGENT turn_id so persistence
+        attaches it onto episode.metrics["turn_timings"] without touching the schema Turn."""
+        try:
+            def _ms(end: Optional[float], start: Optional[float]) -> Optional[int]:
+                if end is None or start is None:
+                    return None
+                return int(round((end - start) * 1000.0))
+
+            timing = {
+                "audio_to_first_token_ms": _ms(t_first_token, t_audio_in),
+                "first_token_ms": _ms(t_first_token, t_brain_start),
+                "stream_duration_ms": _ms(t_stream_end, t_first_token),
+                "total_ms": _ms(t_stream_end, t_audio_in),
+            }
+            agent_turn = self.voice_session.turn_for_speech_id(sid)
+            if agent_turn is not None:
+                self._turn_timings[agent_turn.turn_id] = timing
+            logger.info(
+                "CB-44 turn %s timing: audio_to_first_token_ms=%s first_token_ms=%s "
+                "stream_duration_ms=%s total_ms=%s",
+                sid, timing["audio_to_first_token_ms"], timing["first_token_ms"],
+                timing["stream_duration_ms"], timing["total_ms"],
+            )
+        except Exception:  # pragma: no cover - defensive: timing must never crash the speak loop
+            logger.warning("CB-44 turn-timing record failed for %s (call continues)", sid)
 
 
 def _passthrough_llm() -> Any:  # pragma: no cover - requires livekit-agents installed
@@ -896,6 +985,9 @@ async def _upsert_live_voice(agent: WorkerVoiceAgent, config: AgentConfig) -> No
             channel="voice",
             created_at=agent.live_created_at,
             episode_id=agent.live_episode_id,
+            # CB-44: carry the committed per-turn timings so episode_detail/summary can surface them even
+            # for an in-progress (live) call. None/absent on legacy turns -> serializes as nulls.
+            turn_timings=agent._turn_timings or None,
         )
     except Exception as exc:  # pragma: no cover - prod-only path (needs a real call + DB)
         logger.warning("voice live upsert failed (call continues): %s", type(exc).__name__)
@@ -911,7 +1003,12 @@ async def _upsert_live_partial(agent: WorkerVoiceAgent, config: AgentConfig,
     the monitor renders the words filling in BEFORE the turn commits. The committed turns themselves
     are unchanged (the partial is metadata only — it is NOT a committed Turn); once the turn commits,
     the next per-turn upsert overwrites the row with live_partial absent. Imported lazily; failures
-    are swallowed — a partial-text hiccup must never interrupt the call / the speak loop."""
+    are swallowed — a partial-text hiccup must never interrupt the call / the speak loop.
+
+    CB-44: also carries the active turn's in-flight timing (_live_timing_snapshot) — first_token_ms
+    (measured at first token) + stream_elapsed_ms (now − stream-start, snapshotted at THIS upsert) — so
+    the API process (a different monotonic clock) can surface it verbatim in live_snapshot["live_timing"]
+    without needing the worker's clock. Cleared once the turn commits (the next per-turn upsert omits it)."""
     try:
         from src.api.persistence import persist_call_live
 
@@ -919,12 +1016,82 @@ async def _upsert_live_partial(agent: WorkerVoiceAgent, config: AgentConfig,
             agent.voice_session,
             config=config,
             channel="voice",
-            created_at=agent.live_created_at,
             episode_id=agent.live_episode_id,
+            created_at=agent.live_created_at,
             live_partial=partial_text,
+            # CB-44: a SELF-CONTAINED snapshot (already in ms, no foreign-clock arithmetic in the API).
+            live_timing=_live_timing_snapshot(agent),
+            turn_timings=agent._turn_timings or None,
         )
     except Exception as exc:  # pragma: no cover - prod-only path (needs a real call + DB)
         logger.warning("voice live partial upsert failed (call continues): %s", type(exc).__name__)
+
+
+def _live_timing_snapshot(agent: WorkerVoiceAgent) -> Optional[dict[str, int]]:
+    """CB-44: build the active turn's in-flight live_timing as ABSOLUTE ms (the API process can't read
+    the worker's monotonic clock, so we resolve elapsed HERE, at the upsert moment).
+
+    Returns {"first_token_ms": int, "stream_elapsed_ms": int} from agent._live_timing (set on the first
+    streamed token: first_token_ms already measured + stream_start = the monotonic loop time of that
+    first token). stream_elapsed_ms = now − stream_start. None when no turn is streaming (so the upsert
+    omits the key and live_snapshot shows no live_timing). Defensive: never raises into the speak loop."""
+    lt = agent._live_timing
+    if not lt:
+        return None
+    try:
+        elapsed = asyncio.get_running_loop().time() - float(lt["stream_start"])
+        return {
+            "first_token_ms": int(round(float(lt["first_token_ms"]))),
+            "stream_elapsed_ms": max(0, int(round(elapsed * 1000.0))),
+        }
+    except Exception:  # pragma: no cover - defensive (timing must never crash the speak loop)
+        return None
+
+
+async def _disclose_and_mark_connected(
+    session: Any,
+    agent: WorkerVoiceAgent,
+    config: AgentConfig,
+    *,
+    gate: Any,
+    is_sip: bool,
+    room_name: str,
+) -> None:
+    """CB-46: mark the call connected on RING, THEN speak the disclosure (single-sourced ordering).
+
+    RCA (CB-46): the connect-time in_progress upsert used to run AFTER `await session.say(disclosure)`,
+    and that `await` blocks for the ENTIRE disclosure TTS (several seconds) — so the 0-turn row +
+    heartbeat (what the live monitor polls for) wasn't written until the disclosure finished, and the
+    call was invisible on the monitor until ~the first committed turn. FIX: fire the connect upsert
+    FIRST as fire-and-forget (`asyncio.ensure_future`) so the row + heartbeat land the instant the
+    session is up — BEFORE (and independent of) the disclosure say — so the call shows in the monitor's
+    "Connecting…" state on ring. Consent/disclosure semantics are UNCHANGED (R33): the disclosure is
+    still SPOKEN here, before the brain answers; only the upsert MOVED earlier. R37 untouched.
+
+    The disclosure say is still AWAITED (so a SIP call still arms spoken consent / a web call re-states
+    the disclosure before the first brain turn). Extracted from `entrypoint` so the connect-vs-disclosure
+    ordering is regression-tested via one shared code path (no duplicated ordering logic in the test)."""
+    # CB-32/CB-46: fire the connect-time 0-turn in_progress upsert IMMEDIATELY (fire-and-forget) so the
+    # call shows on the live monitor on ring, BEFORE the (blocking, multi-second) disclosure TTS. The
+    # stale-guard (operate._is_active) still drops it if the caller never engages; failures are
+    # swallowed inside _upsert_live_voice so a hiccup never interrupts the call.
+    asyncio.ensure_future(_upsert_live_voice(agent, config))
+    logger.info("CB-46: connect-time in_progress upsert scheduled on ring for room %r (episode_id=%s)",
+                room_name, agent.live_episode_id)
+
+    # DISCLOSURE BEFORE the brain answers (R33), now that the call is already marked connected.
+    if is_sip:
+        # SIP / PHONE path (no browser to click consent): speak ONE self-contained disclosure + spoken-
+        # consent ask (SIP_CONSENT_PROMPT discloses AI + recording AND asks) and ARM the capture. We
+        # deliberately do NOT also say gate.disclosure_text here — doing both double-disclosed on the
+        # live call. The FIRST user turn(s) are intercepted by handle_consent_turn (NOT the brain).
+        await session.say(agent.arm_spoken_consent(), allow_interruptions=False)
+        logger.info("SIP spoken-consent armed for room %r", room_name)
+    else:
+        # Browser/seeded path: consent was already captured in the UI -> just re-state the disclosure
+        # once (good practice); the first turn flows straight to the brain.
+        await session.say(gate.disclosure_text, allow_interruptions=True)
+    logger.info("voice disclosure spoken for room %r", room_name)
 
 
 def _register_persistence(ctx: Any, agent: WorkerVoiceAgent, config: AgentConfig,
@@ -959,6 +1126,9 @@ def _register_persistence(ctx: Any, agent: WorkerVoiceAgent, config: AgentConfig
                 escalation_logs=list(agent.escalations),
                 last_tier=agent.last_close_tier,
                 episode_id=agent.live_episode_id,
+                # CB-44: persist the committed per-turn timings onto the final Episode (metrics) so the
+                # stored Call Review surfaces them. None/absent on legacy turns -> serialize as nulls.
+                turn_timings=dict(agent._turn_timings) or None,
             )
             # CB-09 / CB-22: a disconnect must ALWAYS settle terminal (never in_progress, which the
             # Calls list filters out so the call vanishes). We map the call to its terminal outcome and
@@ -1085,37 +1255,18 @@ async def entrypoint(ctx: Any) -> None:  # pragma: no cover - requires live live
 
     try:
         await session.start(agent=agent, room=ctx.room)
-        # DISCLOSURE BEFORE the brain answers (R33): the opening turn re-states the AI + recording
-        # disclosure (good practice — the caller hears it on the call too). When the gate was SEEDED
-        # from the browser-captured consent it is ALREADY can_converse, so the first user turn flows
-        # straight to the brain (no deadlock).
-        if is_sip:
-            # SIP / PHONE path (no browser to click consent): speak ONE self-contained disclosure +
-            # spoken-consent ask (SIP_CONSENT_PROMPT discloses AI + recording AND asks) and ARM the
-            # capture. We deliberately do NOT also say gate.disclosure_text here — doing both is what
-            # disclosed + asked TWICE on the live call. The FIRST user turn(s) are intercepted by
-            # WorkerVoiceAgent.handle_consent_turn (NOT the brain): "yes" -> ready (recorded), "no" ->
-            # unrecorded/ended per policy, a minor reply -> need_parental (blocked), unclear -> re-ask
-            # once then end. Once consent resolves to can_converse, subsequent turns hit the brain.
-            await session.say(agent.arm_spoken_consent(), allow_interruptions=False)
-            logger.info("SIP spoken-consent armed for room %r", ctx.room.name)
-        else:
-            # Browser/seeded path: consent was already captured in the UI -> just re-state the
-            # disclosure once (good practice); the first turn flows straight to the brain.
-            await session.say(gate.disclosure_text, allow_interruptions=True)
+        # CB-32 + CB-46: mark the call connected on RING (fire the 0-turn in_progress upsert FIRST,
+        # fire-and-forget) THEN speak the disclosure (R33 — still before the brain answers). Single-
+        # sourced in _disclose_and_mark_connected so the connect-vs-disclosure ordering is regression-
+        # tested. Previously the connect upsert ran AFTER `await session.say(disclosure)`, whose await
+        # blocks for the whole disclosure TTS (several seconds) — so the row the monitor polls for wasn't
+        # written until the disclosure finished and the call was invisible until ~the first committed
+        # turn (CB-46 RCA). The stale-guard (operate._is_active) still drops a call the caller abandons.
+        await _disclose_and_mark_connected(
+            session, agent, config, gate=gate, is_sip=is_sip, room_name=ctx.room.name,
+        )
         logger.info("voice session started + disclosure spoken for room %r (version=%s kb_version=%s)",
                     ctx.room.name, stamp.get("version"), stamp.get("kb_version"))
-        # CB-32: upsert a 0-turn in_progress episode AT CONNECT (the instant the room is up + the
-        # disclosure is spoken), BEFORE the first user turn / first committed brain turn. Without this
-        # the first persist_call_live fired only after the first COMMITTED turn (_capture_post_commit
-        # ← llm_node), so a real call was invisible in the live monitor for several seconds. This writes
-        # the stable live_episode_id + a FRESH heartbeat so the monitor shows the call in its
-        # "Connecting…" state immediately. The stale-guard (operate._is_active) still drops it if the
-        # caller never engages (the heartbeat goes stale). Fire-and-forget like the per-turn upsert;
-        # swallowed inside _upsert_live_voice so a hiccup never interrupts the call.
-        await _upsert_live_voice(agent, config)
-        logger.info("CB-32: connect-time in_progress upsert for room %r (episode_id=%s)",
-                    ctx.room.name, agent.live_episode_id)
     except Exception as exc:
         # Clean exit on an STT/TTS/connect error — the shutdown callback (already registered) still
         # attempts to persist any committed turns. Re-raise so livekit ends the job.

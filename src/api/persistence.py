@@ -14,6 +14,11 @@
 #     metrics["live_partial"] so the monitor can render words filling in before the turn commits.
 #     CB-33: cohort defaults to "live" but reads LIVE_PERSIST_COHORT — the DB-gated tests set it to
 #     "test" so their live upserts are excluded from the operator monitor (no phantom active call).
+#     CB-44 (timing observability): an optional `turn_timings` (committed agent turn_id -> the 4 ms
+#     numbers, stamped by the voice worker) is written to metrics["turn_timings"] so operate can attach
+#     per-turn timing onto episode_detail/summary; an optional `live_timing` (first_token_ms + a stream-
+#     start stamp for the active turn) is written to metrics["live_timing"] so live_snapshot can surface
+#     the in-flight time-to-first-token + streaming elapsed. Both are metadata only (no decision change).
 #   - persist_call_end(session, ...) saves it via the store in FK-safe order (lead -> episode ->
 #     escalations) and persists per-lead memory (persist_lead_after_call, phone-hash only). The lead
 #     key is SINGLE-SOURCED server-side: raw_phone -> schema.phone_hash(raw_phone); a bound-hash call
@@ -84,6 +89,7 @@ def episode_from_session(
     last_tier: Optional[str] = None,
     created_at: Optional[datetime] = None,
     outcome_override: Optional[str] = None,
+    turn_timings: Optional[dict[int, dict[str, Any]]] = None,
 ) -> Episode:
     """Build a unified Episode from a finished VoiceSession's committed state (pure — no DB).
 
@@ -120,6 +126,11 @@ def episode_from_session(
     if created_at is not None:
         elapsed_ms = int((datetime.now(timezone.utc) - created_at).total_seconds() * 1000)
         metrics["duration_ms"] = max(0, elapsed_ms)
+    # CB-44: stamp the per-turn timing (committed agent turn_id -> the 4 ms numbers) so operate can
+    # surface "timing" on episode_detail/summary. JSON keys must be strings (jsonb round-trip), so the
+    # int turn_id is stringified here and parsed back as int in operate._turn_timings_from_metrics.
+    if turn_timings:
+        metrics["turn_timings"] = {str(tid): t for tid, t in turn_timings.items()}
 
     return Episode(
         episode_id=episode_id or f"ep-{uuid.uuid4().hex}",
@@ -147,6 +158,8 @@ async def persist_call_live(
     created_at: datetime,
     episode_id: str,
     live_partial: Optional[str] = None,
+    live_timing: Optional[dict[str, Any]] = None,
+    turn_timings: Optional[dict[int, dict[str, Any]]] = None,
 ) -> Optional[Episode]:
     """Upsert an in_progress Episode each turn so the Live monitor can query calls mid-call.
 
@@ -168,6 +181,13 @@ async def persist_call_live(
     against the shared dev Postgres set LIVE_PERSIST_COHORT="test" so their in_progress upserts are
     tagged "test" — operate._is_active excludes that cohort, so a pytest run can't flash a phantom
     "active" call on the operator monitor. Prod leaves the env unset -> "live" (unchanged behavior).
+
+    CB-44 (timing): `turn_timings` (committed agent turn_id -> the 4 ms numbers) is written to
+    metrics["turn_timings"] so the live call's already-committed turns carry timing too; `live_timing`
+    (the active streaming turn's first_token_ms + stream-start stamp) is written to metrics["live_timing"]
+    so operate.live_snapshot can surface the in-flight time-to-first-token + streaming elapsed. Both are
+    metadata only; absent (a per-turn / connect-time upsert) the keys are omitted so a committed/quiet
+    state shows no live_timing (the next upsert clears it).
     """
     try:
         from src.memory import store
@@ -191,6 +211,14 @@ async def persist_call_live(
         # connect-time upsert leaves the key absent and the monitor stops showing it once committed.
         if live_partial:
             metrics["live_partial"] = live_partial
+        # CB-44: the active streaming turn's in-flight timing (only on a mid-stream upsert) so the live
+        # monitor shows time-to-first-token + elapsed; absent on the per-turn/connect upsert (cleared
+        # once the turn commits). The committed turns' timings (so the just-committed turn's numbers are
+        # queryable on the live call too) round-trip with int turn_id stringified for jsonb.
+        if live_timing:
+            metrics["live_timing"] = live_timing
+        if turn_timings:
+            metrics["turn_timings"] = {str(tid): t for tid, t in turn_timings.items()}
 
         # CB-33: "live" in prod; the DB-gated tests set LIVE_PERSIST_COHORT="test" so their upserts are
         # tagged "test" (excluded from the live monitor by operate._is_active) — never a phantom call.
@@ -232,6 +260,7 @@ async def persist_call_end(
     episode_id: Optional[str] = None,
     created_at: Optional[datetime] = None,
     outcome_override: Optional[str] = None,
+    turn_timings: Optional[dict[int, dict[str, Any]]] = None,
 ) -> Episode:
     """Persist a finished demo call: lead -> episode -> escalations, plus per-lead memory (U2/U14/U15).
 
@@ -295,6 +324,7 @@ async def persist_call_end(
         episode_id=episode_id,
         created_at=created_at,
         outcome_override=outcome_override,
+        turn_timings=turn_timings,  # CB-44: persist the per-turn timing onto the final Episode.
     )
     # 2. Episode (the FK target for escalations).
     await store.save_episode(episode)

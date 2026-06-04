@@ -31,6 +31,12 @@
 # this a test run would flash phantom "active" calls on the operator monitor (the CB-33 false alarm).
 # Tests set LIVE_PERSIST_COHORT="test" so their live upserts land in the excluded cohort; tests/conftest
 # additionally DELETEs any rows a run created so nothing accumulates.
+# CB-44 (timing observability): the voice worker stamps per-turn timing (audio-in -> first NLG token ->
+# stream-end) and persistence stows it on metrics. This module surfaces it via the LOCKED contract:
+# episode_detail().turns[i]["timing"] (the 4 ms numbers, null for text/legacy turns; from
+# metrics["turn_timings"][turn_id]); episode_summary()["avg_first_token_ms"/"avg_stream_ms"] (means over
+# timed agent turns); live_snapshot()["live_timing"] (the active streaming turn's first_token_ms +
+# stream_elapsed_ms derived from metrics["live_timing"], present only while a partial streams).
 from __future__ import annotations
 
 import os
@@ -219,10 +225,68 @@ def _belief_to_dict(belief: Optional[BeliefSnapshot]) -> Optional[dict[str, Any]
     }
 
 
-def _turn_to_dict(turn: Turn) -> dict[str, Any]:
-    """Serialize one turn: transcript text, labeled act (agent turns), rationale, belief, and the
-    CB-28 retrieved facts that grounded a tool-use answer (None on non-tool turns so the Review page
-    only makes a turn clickable into the tool-use panel where information was actually pulled)."""
+# CB-44: the per-turn timing block shape (the LOCKED contract). All keys present, each int-or-null —
+# null when the turn carries no timing (a text/legacy turn, or a number we couldn't measure, e.g.
+# audio_to_first_token on a non-audio path). A single source so episode_detail + live can't drift.
+_TIMING_KEYS = ("audio_to_first_token_ms", "first_token_ms", "stream_duration_ms", "total_ms")
+
+
+def _null_timing() -> dict[str, Optional[int]]:
+    return {k: None for k in _TIMING_KEYS}
+
+
+def _coerce_timing(raw: Any) -> dict[str, Optional[int]]:
+    """Normalize a stored per-turn timing dict to the LOCKED shape: all 4 keys present, int-or-null.
+    A missing/odd value (or a non-dict) yields the all-null block so a legacy turn never crashes."""
+    block = _null_timing()
+    if isinstance(raw, dict):
+        for k in _TIMING_KEYS:
+            v = raw.get(k)
+            block[k] = int(v) if isinstance(v, (int, float)) else None
+    return block
+
+
+# CB-44: the live (in-flight) timing shape — first_token_ms + stream_elapsed_ms for the ACTIVE turn.
+_LIVE_TIMING_KEYS = ("first_token_ms", "stream_elapsed_ms")
+
+
+def _coerce_live_timing(raw: Any) -> Optional[dict[str, Optional[int]]]:
+    """Normalize metrics["live_timing"] to {"first_token_ms": int|null, "stream_elapsed_ms": int|null},
+    or None when absent/non-dict (no turn is streaming) so live_snapshot reports live_timing: null."""
+    if not isinstance(raw, dict):
+        return None
+    block: dict[str, Optional[int]] = {}
+    for k in _LIVE_TIMING_KEYS:
+        v = raw.get(k)
+        block[k] = int(v) if isinstance(v, (int, float)) else None
+    return block
+
+
+def _turn_timings_from_metrics(metrics: Optional[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Parse metrics["turn_timings"] (CB-44) back into {agent turn_id (int) -> raw timing dict}.
+
+    Persistence stringifies the int turn_id for jsonb; this parses it back so _turn_to_dict can look up
+    a turn by its int turn_id. A malformed/absent map yields {} so episode_detail just emits null timing.
+    """
+    raw = (metrics or {}).get("turn_timings")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    for tid, t in raw.items():
+        try:
+            out[int(tid)] = t
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def _turn_to_dict(turn: Turn, timings: Optional[dict[int, dict[str, Any]]] = None) -> dict[str, Any]:
+    """Serialize one turn: transcript text, labeled act (agent turns), rationale, belief, the CB-28
+    retrieved facts that grounded a tool-use answer (None on non-tool turns so the Review page only
+    makes a turn clickable into the tool-use panel where information was actually pulled), and the
+    CB-44 per-turn "timing" block (audio-in -> first-token -> stream-end ms; all-null for a text/legacy
+    turn with no stamped timing). `timings` maps agent turn_id -> the stored timing dict."""
+    raw_timing = (timings or {}).get(turn.turn_id)
     return {
         "turn_id": turn.turn_id,
         "speaker": turn.speaker,
@@ -233,6 +297,8 @@ def _turn_to_dict(turn: Turn) -> dict[str, Any]:
         "belief": _belief_to_dict(turn.belief),
         # CB-28: the KB facts/chunks ("[source] text") that grounded this turn's answer, or None.
         "retrieved": list(turn.retrieved) if turn.retrieved else None,
+        # CB-44: the 4 timing numbers for this turn (all-null when none were stamped — text/legacy).
+        "timing": _coerce_timing(raw_timing) if raw_timing is not None else _null_timing(),
     }
 
 
@@ -243,9 +309,37 @@ def _last_belief(ep: Episode) -> Optional[BeliefSnapshot]:
     return None
 
 
+def _timing_averages(ep: Episode) -> tuple[Optional[int], Optional[int]]:
+    """CB-44: (avg_first_token_ms, avg_stream_ms) — the mean first-token + stream-duration over the
+    AGENT turns that carry timing. Returns (None, None) when no agent turn has a measured number, so a
+    text/legacy / untimed call reports nulls (never a fabricated 0). Each average is over only the turns
+    that have THAT number (a turn missing first_token but having stream_duration still counts toward the
+    latter), matching the "mean over turns that have timing" contract."""
+    timings = _turn_timings_from_metrics(ep.metrics)
+    if not timings:
+        return None, None
+    agent_turn_ids = {t.turn_id for t in ep.turns if t.speaker == "agent"}
+    first_tokens: list[int] = []
+    streams: list[int] = []
+    for tid, raw in timings.items():
+        if tid not in agent_turn_ids:
+            continue
+        block = _coerce_timing(raw)
+        if block["first_token_ms"] is not None:
+            first_tokens.append(block["first_token_ms"])
+        if block["stream_duration_ms"] is not None:
+            streams.append(block["stream_duration_ms"])
+    avg_ft = int(round(sum(first_tokens) / len(first_tokens))) if first_tokens else None
+    avg_st = int(round(sum(streams) / len(streams))) if streams else None
+    return avg_ft, avg_st
+
+
 def episode_summary(ep: Episode) -> dict[str, Any]:
-    """Flat summary row for P3/Live tile — no transcript body, all labels applied."""
+    """Flat summary row for P3/Live tile — no transcript body, all labels applied.
+    CB-44: also carries avg_first_token_ms / avg_stream_ms (means over timed agent turns, null when
+    the call has no stamped timing) so the Calls list / Review header can show call-level timing."""
     metrics = ep.metrics or {}
+    avg_first_token_ms, avg_stream_ms = _timing_averages(ep)
     return {
         "episode_id": ep.episode_id,
         "outcome": labels.outcome_label(ep.outcome),
@@ -266,6 +360,9 @@ def episode_summary(ep: Episode) -> dict[str, Any]:
         # the "golden" indicator/toggle in Call Review reads this. coerced to bool so a missing/odd value is
         # False, never a raw truthy slug.
         "golden": bool(metrics.get("golden", False)),
+        # CB-44: call-level timing means over the agent turns that carry timing; null when none do.
+        "avg_first_token_ms": avg_first_token_ms,
+        "avg_stream_ms": avg_stream_ms,
         "created_at": ep.created_at.isoformat() if ep.created_at else None,
     }
 
@@ -277,7 +374,9 @@ def episode_detail(ep: Episode) -> dict[str, Any]:
     patience}}). Real voice/text episodes carry no prospect truth -> []. Always present so the
     frontend can check truthiness without guarding for a missing key."""
     detail = episode_summary(ep)
-    detail["turns"] = [_turn_to_dict(t) for t in ep.turns]
+    # CB-44: thread the parsed per-turn timings so each serialized turn carries its "timing" block.
+    timings = _turn_timings_from_metrics(ep.metrics)
+    detail["turns"] = [_turn_to_dict(t, timings) for t in ep.turns]
     detail["belief_trajectory"] = [_belief_to_dict(t.belief) for t in ep.turns]
     detail["disqualifier_reason"] = ep.disqualifier_reason
     detail["metrics"] = ep.metrics or {}
@@ -326,6 +425,12 @@ def live_snapshot(
         "episode": episode_detail(ep),
         # CB-31: the streaming partial of the active (uncommitted) agent turn, or None.
         "live_partial": live_partial if isinstance(live_partial, str) and live_partial else None,
+        # CB-44: the active streaming turn's in-flight timing — {first_token_ms, stream_elapsed_ms} —
+        # surfaced ONLY while the call is active AND a partial is streaming (the worker writes
+        # metrics["live_timing"] alongside live_partial and clears it once the turn commits, so a quiet
+        # between-turns / completed call reports null). The monitor shows "time to first word" + a
+        # growing streaming clock on the active turn.
+        "live_timing": _coerce_live_timing((ep.metrics or {}).get("live_timing")) if active else None,
         # The four FOREMOST signals, lifted out so the client never has to dig for them.
         "priority": {
             "trust": next(

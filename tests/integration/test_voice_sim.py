@@ -404,6 +404,7 @@ async def _run_sim(
     captured_live: Optional[list[dict[str, Any]]] = None,
     captured_chunks: Optional[list[list[str]]] = None,
     captured_events: Optional[list[tuple[str, int]]] = None,
+    captured_agent: Optional[list[Any]] = None,
 ) -> None:
     """Drive a full multi-turn simulated call through the REAL AgentSession pipeline.
 
@@ -449,6 +450,10 @@ async def _run_sim(
     )
     agent = worker_mod.WorkerVoiceAgent(base)
     agent._config = config
+    # CB-44: expose the worker agent so a test can read agent._turn_timings (the per-turn timing the
+    # llm_node stamped) after the run, to assert real first_token/stream_duration numbers were captured.
+    if captured_agent is not None:
+        captured_agent.append(agent)
 
     # Override tts_node on the agent instance: yield one silence frame immediately.
     # This bypasses the real TTS so SpeechHandles complete without audio hardware.
@@ -923,3 +928,153 @@ async def test_voice_sim_first_token_forwarded_before_full_reply() -> None:
     )
     logger.info("PASS CB-41 (d): first forward @%d < last produce @%d; events=%s",
                 first_forward_idx, last_produce_idx, events)
+
+
+# --------------------------------------------------------------------------------------------------
+# CB-46: the connect-time in_progress upsert must be SCHEDULED before the disclosure say completes, so
+# the call shows on the live monitor on RING — not only after the (multi-second) disclosure TTS ends.
+# --------------------------------------------------------------------------------------------------
+class _SlowSayRecordingSession:
+    """A fake AgentSession whose say() blocks (like a multi-second disclosure TTS) and records when it
+    starts/ends — so a test can prove the connect-upsert is scheduled BEFORE say() returns (CB-46)."""
+
+    def __init__(self, events: list[str], say_delay: float = 0.3) -> None:
+        self._events = events
+        self._say_delay = say_delay
+
+    async def say(self, text: str, *, allow_interruptions: bool = True) -> None:
+        self._events.append("say_start")
+        await asyncio.sleep(self._say_delay)  # models the disclosure TTS playing out (several seconds)
+        self._events.append("say_end")
+
+
+@pytest.mark.asyncio
+async def test_voice_sim_connect_upsert_fires_before_disclosure_say() -> None:
+    """CB-46 (RCA): the connect-time _upsert_live_voice must be SCHEDULED before the disclosure say
+    blocks, so the 0-turn in_progress row + heartbeat lands on RING (not after the disclosure TTS).
+
+    Drives the entrypoint's post-start ordering helper (_disclose_and_mark_connected) with a fake
+    session whose say() sleeps (modeling the multi-second disclosure TTS). _upsert_live_voice is patched
+    to record WHEN it ran. The regression (the upsert AFTER `await session.say(...)`) would record the
+    upsert only after "say_end"; the fix records it BEFORE "say_end" (it is fired fire-and-forget the
+    instant the session is up). We assert the upsert is observed before the disclosure say returns.
+    """
+    import src.voice.worker as worker_mod
+    from src.voice.agent import build_voice_agent
+
+    config = load_config("champion_v0")
+    gate = ConsentGate(jurisdiction="", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
+    gate.acknowledge_ai()
+    gate.grant_recording()
+    base = build_voice_agent(
+        config, _agent_mock(act="ask", reply="hi"), FakeEmbedder(),
+        kb_chunks_or_retrieve_hook=_make_retrieve_hook(), consent_gate=gate,
+    )
+    agent = worker_mod.WorkerVoiceAgent(base)
+    agent._config = config
+
+    events: list[str] = []
+
+    import src.api.persistence as persistence_mod
+
+    async def _recording_upsert(vs: Any, *, config: Any, channel: str,
+                                created_at: Any = None, episode_id: Any = None,
+                                live_partial: Any = None, **kwargs: Any) -> Any:
+        events.append("connect_upsert")
+        return None
+
+    original = persistence_mod.persist_call_live
+    persistence_mod.persist_call_live = _recording_upsert  # type: ignore[assignment]
+    try:
+        session = _SlowSayRecordingSession(events, say_delay=0.3)
+        # The entrypoint's post-start ordering block, single-sourced as a helper so the ordering is
+        # testable AND the entrypoint uses the SAME code (no duplicated ordering logic in the test).
+        await worker_mod._disclose_and_mark_connected(
+            session, agent, config, gate=gate, is_sip=False, room_name="test-room",
+        )
+        # Let the fire-and-forget connect upsert run to completion (it was scheduled, not awaited).
+        await asyncio.sleep(0.05)
+    finally:
+        persistence_mod.persist_call_live = original  # type: ignore[assignment]
+
+    assert "connect_upsert" in events, "the connect-time upsert never fired"
+    assert "say_start" in events and "say_end" in events, "the disclosure say did not run"
+    connect_idx = events.index("connect_upsert")
+    say_end_idx = events.index("say_end")
+    assert connect_idx < say_end_idx, (
+        "CB-46: the connect-time in_progress upsert must be SCHEDULED/observed BEFORE the disclosure "
+        f"say completes (so the call shows on ring), but the order was: {events}"
+    )
+    logger.info("PASS CB-46: connect_upsert @%d < say_end @%d; order=%s",
+                connect_idx, say_end_idx, events)
+
+
+# --------------------------------------------------------------------------------------------------
+# CB-44: the worker stamps per-turn timing (brain_start -> first NLG token -> stream_end) in llm_node
+# and records it onto agent._turn_timings keyed by the committed agent turn_id. With genuine token
+# streaming (the _OrderRecordingBrainLLM yields word-by-word with a checkpoint between tokens),
+# first_token_ms < stream_duration_ms — the streaming-genuine signal CB-46 needs.
+# --------------------------------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_voice_sim_llm_node_stamps_per_turn_timing() -> None:
+    """CB-44 (brain-streaming path): llm_node stamps the per-turn timing onto agent._turn_timings, and
+    with GENUINE token streaming first_token_ms < stream_duration_ms (the call's NLG actually streams).
+
+    The audio-in stamp lands in on_user_turn_completed (final STT) THROUGH the real pipeline, so
+    audio_to_first_token_ms + total_ms are also populated. We assert the 4 numbers are present, non-
+    negative, internally consistent (total ~= audio_to_first_token + stream_duration), and that
+    first_token_ms < stream_duration_ms (genuine streaming, not return-the-whole-reply-at-once)."""
+    config = load_config("champion_v0")
+    reply = "Absolutely, here is exactly how our tutors help your learner build real momentum today."
+    events: list[tuple[str, int]] = []
+    brain_llm = _OrderRecordingBrainLLM(reply=reply, events=events, act="ask")
+    captured_episode: list[Any] = []
+    captured_chunks: list[list[str]] = []
+    captured_agent: list[Any] = []
+
+    await _run_sim(
+        caller_lines=["Hi, I'm looking for math tutoring for my daughter."],
+        config=config,
+        brain_llm=brain_llm,
+        captured_episode=captured_episode,
+        captured_chunks=captured_chunks,
+        captured_agent=captured_agent,
+    )
+
+    assert captured_agent, "the worker agent was not captured"
+    agent = captured_agent[0]
+    assert agent._turn_timings, (
+        f"CB-44: llm_node must record per-turn timing; agent._turn_timings is empty. "
+        f"committed turns={[t.turn_id for t in agent.voice_session.state.turns]}"
+    )
+    # The single committed agent turn's timing (there's exactly one caller line).
+    (_tid, timing), = list(agent._turn_timings.items())
+    logger.info("CB-44 captured timing (brain-streaming path): %s", timing)
+
+    for k in ("first_token_ms", "stream_duration_ms", "total_ms", "audio_to_first_token_ms"):
+        assert k in timing, f"CB-44 contract key missing: {k}"
+
+    # first_token + stream are always measurable on the streaming path; audio_in lands via the real STT
+    # pipeline so audio_to_first_token + total are populated here too.
+    assert timing["first_token_ms"] is not None and timing["first_token_ms"] >= 0
+    assert timing["stream_duration_ms"] is not None and timing["stream_duration_ms"] >= 0
+    assert timing["audio_to_first_token_ms"] is not None and timing["audio_to_first_token_ms"] >= 0
+    assert timing["total_ms"] is not None and timing["total_ms"] >= 0
+
+    # Internal consistency: total ~= audio_to_first_token + stream_duration (within rounding slack).
+    assert abs(timing["total_ms"] - (timing["audio_to_first_token_ms"]
+                                     + timing["stream_duration_ms"])) <= 3, timing
+
+    # THE CB-46 diagnostic: genuine streaming means the first token lands well before the stream ends —
+    # first_token_ms is small relative to the full stream_duration (which accrued the per-token
+    # checkpoints). If the NLG returned the whole reply at once, first_token ~= stream_end and
+    # stream_duration ~= 0, which this asserts does NOT hold.
+    assert timing["first_token_ms"] < timing["stream_duration_ms"], (
+        f"CB-44/CB-46: genuine streaming requires first_token_ms < stream_duration_ms, got {timing}"
+    )
+    logger.info(
+        "PASS CB-44: first_token_ms=%d < stream_duration_ms=%d (genuine streaming); "
+        "audio_to_first_token_ms=%d total_ms=%d",
+        timing["first_token_ms"], timing["stream_duration_ms"],
+        timing["audio_to_first_token_ms"], timing["total_ms"],
+    )
