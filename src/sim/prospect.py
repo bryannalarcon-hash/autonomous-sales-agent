@@ -6,6 +6,12 @@
 # PURE, DETERMINISTIC numeric gate on the TRUE hidden drivers + the offered tier + the persona's hard
 # ceiling (R31). budget and qualified/disqualifier are STRUCTURAL FACTS the LLM may NEVER mutate by
 # talking — so a no_budget prospect can never cross the budget gate no matter how fluent the agent is.
+# CB-43: when a DEEPLY-PROMPTED named persona (Dana/Marcus/Pat from personas.py) is driven, its rich
+# `behavior_prompt` is prepended to the in-character prompt so THIS specific personality speaks, and
+# its `non_sequiturs` are injected OCCASIONALLY — the simulator rolls its OWN SEEDED rng (~1-in-
+# _NON_SEQUITUR_EVERY_N turns, never the global random) and, on a hit, tells the LLM to weave in one
+# chosen curveball line. These curveballs stress wrong-phase / repeat-question / prescriptiveness
+# handling without becoming constant noise; they touch only the TALK prompt, never the pure buy_gate.
 # CB-03 depth tuning makes the call REALISTICALLY LONG (15-40 turns) WITHOUT faking: the prompt/
 # rubric makes the prospect surface a FEW DISTINCT objections before it warms, warming deltas are
 # throttled (asymmetric clamp: gradual to earn, sharp to lose — _MAX_WARMING_DELTA vs _MAX_DELTA),
@@ -102,6 +108,15 @@ _MAX_DISTINCT_OBJECTIONS = 3
 # After this many honest budget/disqualifier exchanges, an UNQUALIFIED prospect should firmly signal
 # it can't proceed (the release signal) so the agent can let it go in ~6-10 turns, not loop 30+.
 _DISQUALIFIER_RELEASE_AFTER = 2
+
+# CB-43 — seeded, OCCASIONAL non-sequitur injection for the deeply-prompted named personas. On each
+# turn the simulator rolls its OWN seeded rng; with probability ~1/_NON_SEQUITUR_EVERY_N it picks one
+# of the persona's `non_sequiturs` and tells the sim LLM to weave it in this turn. This is a CURVEBALL,
+# not constant noise — most turns get none. The prompt seam labels an injected turn with the marker
+# _CURVEBALL_MARKER so the message construction (and tests) can tell a curveball turn apart. Touches
+# only the TALK prompt; the pure buy_gate never sees it.
+_NON_SEQUITUR_EVERY_N = 4            # ~1-in-4 turns gets a curveball (occasional, seed-driven)
+_CURVEBALL_MARKER = "CURVEBALL"     # appears in the prompt ONLY on an injected turn (test seam)
 
 # Heuristic theme classifier (the sim text is in-character; this catches the natural phrasings the
 # rubric asks for, so state-tracking of "which themes were raised" works even with a mocked LLM).
@@ -336,13 +351,20 @@ def _build_sim_messages(
     state: ProspectState,
     agent_utterance: str,
     agent_act: Optional[str],
+    non_sequitur: Optional[str] = None,
 ) -> list[Message]:
     """Assemble the in-character sim prompt. Unqualified personas get an explicit instruction to
     NATURALLY surface their structural disqualifier (e.g. 'I don't really have a budget for this'),
     so the agent has an honest chance to detect it — but voicing it never changes the structural
     fact itself. CB-03 iter2: also surfaces the ALREADY_RAISED objection themes (so the LLM rotates
     to a NEW concern instead of repeating one) and, once enough honest disqualifier exchanges have
-    happened, an explicit RELEASE nudge so an unqualified prospect resolves rather than loops."""
+    happened, an explicit RELEASE nudge so an unqualified prospect resolves rather than loops.
+
+    CB-43: for a deeply-prompted NAMED persona, `persona.behavior_prompt` (the rich backstory +
+    objection script/timing + walk/convert triggers) is prepended to the profile so THIS personality
+    speaks. `non_sequitur` (chosen by the SEEDED caller on ~1-in-N turns; None otherwise) is woven in
+    as a one-off CURVEBALL line — a realistic tangent/off-topic/wrong-answer the agent must handle —
+    marked with _CURVEBALL_MARKER. Neither field touches the pure buy_gate."""
     disq_hint = ""
     if not persona.qualified and persona.disqualifier:
         human = {
@@ -379,7 +401,24 @@ def _build_sim_messages(
     else:
         objection_hint = ""
 
+    # CB-43: a deeply-prompted named persona leads with its rich behavioral script (who you are +
+    # objection script/timing + walk/convert triggers), so the generic archetype line below just
+    # backs it up. Template-jitter personas have an empty behavior_prompt -> unchanged behavior.
+    backstory = f"YOU ARE: {persona.behavior_prompt}\n\n" if persona.behavior_prompt else ""
+
+    # CB-43: a one-off CURVEBALL for THIS turn (the caller injects it on ~1-in-N seeded turns). It is
+    # a realistic tangent/off-topic/wrong-answer to weave in naturally — a stress test for the agent's
+    # wrong-phase / repeat-question handling, NOT a change to your underlying feelings or the gate.
+    curveball_hint = ""
+    if non_sequitur:
+        curveball_hint = (
+            f"\n{_CURVEBALL_MARKER}: This turn, naturally weave in this off-script aside in your own "
+            f"voice (a realistic tangent — do NOT drop your concerns or warm because of it): "
+            f"{non_sequitur!r}"
+        )
+
     profile = (
+        f"{backstory}"
         f"ARCHETYPE: {persona.archetype}\n"
         f"STYLE: {persona.style} (talk this way)\n"
         f"OBJECTION_PROPENSITIES: {persona.resistance}\n"
@@ -389,6 +428,7 @@ def _build_sim_messages(
         f"patience={round(state.patience,2)}"
         f"{objection_hint}"
         f"{disq_hint}"
+        f"{curveball_hint}"
     )
     user = (
         f"{profile}\n\n"
@@ -472,10 +512,29 @@ class ProspectSimulator:
             decay += _PATIENCE_PRESSURE_PENALTY
         self.state.patience = _clamp01(self.state.patience - decay)
 
+    def _maybe_non_sequitur(self) -> Optional[str]:
+        """CB-43: with probability ~1/_NON_SEQUITUR_EVERY_N, pick one of the persona's curveball lines
+        for THIS turn (else None). Uses the simulator's OWN seeded rng (never the global random), so a
+        fixed seed reproduces the exact schedule of curveball turns AND which line each one uses. A
+        persona with no non_sequiturs (the template-jitter archetypes) always returns None — unchanged
+        behavior. Occasional by design: most turns get None, so curveballs are stress, not noise."""
+        if not self.persona.non_sequiturs:
+            return None
+        if self.rng.random() >= (1.0 / _NON_SEQUITUR_EVERY_N):
+            return None
+        return self.rng.choice(self.persona.non_sequiturs)
+
     def _sim_messages(self, agent_utterance: str, agent_act: Optional[str]) -> list[Message]:
         """The sim-LLM chat messages for this turn. A thin instance seam over the module-level
-        builder so a subclass (GenerativeTwin) can override the prompt cleanly — no monkey-patching."""
-        return _build_sim_messages(self.persona, self.state, agent_utterance, agent_act)
+        builder so a subclass (GenerativeTwin) can override the prompt cleanly — no monkey-patching.
+        CB-43: rolls the seeded rng for an occasional non-sequitur and threads it into the builder."""
+        return _build_sim_messages(
+            self.persona,
+            self.state,
+            agent_utterance,
+            agent_act,
+            non_sequitur=self._maybe_non_sequitur(),
+        )
 
     async def respond(
         self,

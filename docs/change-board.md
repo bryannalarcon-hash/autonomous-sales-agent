@@ -106,6 +106,54 @@
 - **Notes / blockers:** HARD INVARIANT — the honest buy-gate must stay PURE/DETERMINISTIC: budget + qualified + per-tier ceiling immutable to talk; a commitment fires ONLY on the agent's `attempt_close` at the offered tier. Do NOT let "more turns" come from breaking that (e.g., never auto-commit / never move budget). Regenerating transcripts is paid LLM self-play — bounded batch first.
 - **Notes:** DONE + committed (1d9cdec): conviction coupling fixed the binding constraint; N=10 verify = 6/7 qualified close, 0/3 unqualified, avg ~19 turns, buy-gate intact. (Board kept here for history.)
 
+### CB-44 — Voice-call timing observability (audio-in → first-token → stream-end), logged every call
+- **Type / Surface / Size:** feature · `voice-worker` · `api` · `data` · M
+- **Owner:** coder-voice + orchestrator
+- **Started:** 2026-06-04
+- **Prereqs met?:** yes
+- **Why:** the on-ring + word-streaming issues need DATA, and the timings are a deliverable in their own right. Capture, per agent turn: when the user's audio/STT landed, when the FIRST NLG token hit the stream, and when streaming ENDED → time-to-first-token + stream duration. Log for EVERY call going forward.
+- **Seam (verified in code):** `WorkerVoiceAgent.on_user_turn_completed` (`worker.py:486`) = final STT received → stamp `t_audio_in`. `llm_node` (`worker.py:536`): stamp `t_brain_start` at entry; on the FIRST yielded token in the `async for` (line 574) stamp `t_first_token`; after the loop (line 582) stamp `t_stream_end`. Compute `audio_to_first_token_ms = t_first_token - t_audio_in`, `first_token_ms = t_first_token - t_brain_start`, `stream_duration_ms = t_stream_end - t_first_token`, `total_ms = t_stream_end - t_audio_in`.
+- **Persist + API contract (LOCKED — coder-dash builds against this):**
+  - Per-turn (in `episode_detail().turns[i]`): `"timing": {"audio_to_first_token_ms": int|null, "first_token_ms": int|null, "stream_duration_ms": int|null, "total_ms": int|null}` (null for text/legacy turns).
+  - Live snapshot (`live_snapshot()`): `"live_timing": {"first_token_ms": int|null, "stream_elapsed_ms": int|null}` present only while a partial is streaming, else null.
+  - Summary (`episode_summary()`): `"avg_first_token_ms": int|null`, `"avg_stream_ms": int|null` (mean over agent turns that have timing).
+- **Plan (checklist):**
+  - [ ] Stamp the 4 timestamps in worker; attach the computed per-turn timing onto the committed Turn (carry through commit_turn / PendingTurn) without breaking R37 parity (timing is metadata; reply text == concat(tokens) unchanged).
+  - [ ] Persist timing per turn (`src/api/persistence.py`) and aggregate into episode metrics; surface via the 3 API shapes above (`src/api/operate.py`).
+  - [ ] Logger line per turn (info) with the 4 numbers so a tail of the worker log shows timing live.
+  - [ ] **Run 1 of the 3 personas (start with P-B "Marcus") through the instrumented path and capture real numbers.** If a true audio/STT eval isn't runnable headless, run it through the brain-streaming path to capture first-token/stream-duration and capture audio-in timing on the next real phone/web-voice call — RELAY which was used.
+  - [ ] Regression test: a turn with stamped timings serializes the contract; a text/legacy turn yields nulls (no crash).
+- **Files being touched:** `src/voice/worker.py`, `src/api/persistence.py`, `src/api/operate.py`, `tests/` (timing serialization).
+- **Notes / blockers:** fire-and-forget discipline preserved — timing must NEVER block/crash the speak loop. PII: timings are numbers only, no transcript leakage.
+
+### CB-45 — Surface call timing on the dashboard (live monitor + stored Call Review)
+- **Type / Surface / Size:** feature · `/operate/live` · `/operate/review` · `/operate/calls` · `design` · M
+- **Owner:** coder-dash + orchestrator
+- **Started:** 2026-06-04
+- **Prereqs met?:** builds against CB-44's LOCKED API contract (can develop in parallel)
+- **Why:** "push that information somewhere onto the dash and everywhere where you would be reviewing calls (live AND stored call)."
+- **Plan (checklist):**
+  - [ ] Live monitor: on the active agent turn / header, show live time-to-first-token + streaming elapsed from `snap.live_timing` (Cadence tokens; no raw keys).
+  - [ ] Stored Call Review (`review/[id]`): per-turn timing chips (first-token / stream duration) from `turns[i].timing`; a small call-level summary (avg first-token, avg stream) in the header.
+  - [ ] Calls list (`/operate/calls`): optional avg-first-token column or drawer field from `avg_first_token_ms`.
+  - [ ] Types in `web/lib/operate-types.ts` + fetchers in `web/lib/operate-api.ts` extended for the new fields.
+  - [ ] Verify rendered result via screenshot (Cadence dark), not just tsc.
+- **Files being touched:** `web/app/operate/live/page.tsx`, `web/app/operate/review/[id]/page.tsx`, `web/app/operate/calls/page.tsx`, `web/lib/operate-types.ts`, `web/lib/operate-api.ts`.
+- **Notes / blockers:** human-readable labels only (ms formatted, e.g. "0.8s to first word"); no internal index/slug leakage.
+
+### CB-46 — Fix: call visible on connect (BEFORE the disclosure), + streaming verification
+- **Type / Surface / Size:** bug · `voice-worker` · `/operate/live` · S/M
+- **Owner:** coder-voice + orchestrator
+- **Started:** 2026-06-04
+- **Prereqs met?:** yes (pairs with CB-44; same agent owns worker.py)
+- **Why (RCA verified):** the call appears only after ~1 full turn because the connect-upsert (`worker.py:1116`) runs AFTER `await session.say(disclosure)` (line 1105) — the `await` blocks for the whole disclosure TTS (several seconds), so the 0-turn row + heartbeat isn't written until the disclosure finishes, and the 2s queue poll then surfaces it around the first committed turn. (`_is_active` and `persist_call_live` both already handle a 0-turn row, so the predicate is NOT the problem.)
+- **Plan (checklist):**
+  - [ ] Fire the connect-upsert IMMEDIATELY after `session.start` (worker.py:1087) and BEFORE the disclosure `say` — fire-and-forget (`asyncio.ensure_future`) so the call shows on ring without waiting on TTS. Keep the existing post-disclosure log.
+  - [ ] Use CB-44 timing on the captured eval/real call to confirm whether word-streaming partials actually fill in (first_token ≪ stream_end ⇒ genuine streaming; first_token ≈ stream_end ⇒ NLG isn't token-streaming → escalate as a follow-up). Report the finding.
+  - [ ] Regression test (extend the CB-32 connect-upsert test): connect-upsert is scheduled before/independent of the disclosure say (not gated behind it).
+- **Files being touched:** `src/voice/worker.py` (entrypoint ordering), `tests/` (connect-upsert ordering).
+- **Notes / blockers:** consent/disclosure semantics UNCHANGED — only the upsert MOVES earlier; the disclosure still speaks before the brain answers (R33). R37 untouched.
+
 ---
 
 ## Done
@@ -121,6 +169,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-43 — Deeply-prompted eval personas (Dana / Marcus / Pat) + seeded non-sequiturs
+- **Type / Surface / Size:** feature · `core` (`src/sim`) · M
+- **Completed:** 2026-06-04
+- **Files changed (actual):** `src/sim/personas.py` (3 named builders `build_dana/marcus/pat` + `NAMED_PERSONAS` registry + `named_persona()`; `Persona` gains `name`/`behavior_prompt`/`non_sequiturs`), `src/sim/prospect.py` (per-persona behavior prompt wired into `_build_sim_messages`; seeded `_maybe_non_sequitur()` ~1-in-4 from the simulator's own `random.Random`, never global), `src/sim/eval_personas.py` (NEW runner + CLI: `build_eval_cohort`/`run_named_eval`/`transcript_lines`), `tests/unit/test_personas.py` (NEW, 17 cases).
+- **What changed:** 3 orchestrator-locked personas — Dana (qualified hard-to-close), Marcus (qualified fast/prickly), Pat (UNqualified no_authority/callback) — each with a rich behavioral prompt + in-character curveball lines injected occasionally on a seeded schedule (measured 12 curveballs / 40 turns). Curveballs touch only the TALK prompt; the pure buy-gate never sees them.
+- **Verification:** `.venv/bin/python -m pytest tests/unit/test_personas.py -q` → 17 passed; sim units (prospect+twin+personas) → 44 passed; full non-voice suite → 573 passed / 5 skipped. TDD held (red on missing `NAMED_PERSONAS` → green).
+- **Constraints checked:** buy-gate PURITY — Pat's `buy_gate` returns None for enrollment/trial/consultation even with all true drivers pinned to 1.0, caps at callback; buy-gate code untouched. Cohort = `experiment_eval_personas_<name>` (never `live`, so it can't flood the operator Calls log). Stubs NOT deleted. File headers updated.
+- **Follow-ups / known gaps:** a real-model bounded self-play batch was NOT spent by the agent (mock client only); the orchestrator runs one bounded real eval (P-B Marcus) at integration. The deeply-prompted set begins at 3; expand later if the eval proves trustworthy.
 
 ### CB-42 — [EXPERIMENT, contained on `cb42-ml-distill`] Distill DST + Policy LLMs to local ML — EVALUATED, NOT MERGED
 - **Completed (evaluated):** 2026-06-03 · on the isolated `cb42-ml-distill` worktree/branch (commits `78e5820`, `806f8ba`); **NOT merged to main** (did not clear the "better" gate).
