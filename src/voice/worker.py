@@ -57,6 +57,15 @@
 # persist_call_live(live_partial=...) so the monitor renders the words filling in at generation pace
 # (CB-38). handle_user_turn_stream buffers the PendingTurn; the turn COMMITS exactly once at the END.
 # (_word_chunks remains a pure stdlib helper, no longer on the llm_node path — kept for its unit test.)
+# CB-47 (perceived-latency mask): the SEQUENTIAL DST(~1.4s)->Policy(~1.7s) prelude runs before NLG can
+# stream (Policy needs the post-DST belief — a hard data dependency the brain can't parallelize), so a
+# caller hears ~3-5s of dead air at the start of each turn (CB-44 first-word ≈ 4.8s). _maybe_speak_filler
+# masks it: scheduled at llm_node entry, it speaks a SHORT, varied backchannel (rotated by turn index,
+# allow_interruptions=True) via session.say ONLY if the first NLG token hasn't arrived within
+# VOICE_FILLER_DELAY_MS (default 700) — and is CANCELLED/SKIPPED the instant the first real token lands
+# (no double-speak, no filler on fast turns). It is worker-only TTS, NOT a committed Turn: it never
+# touches the streamed tokens, the committed reply (R37: reply == concat(tokens)), or the CB-44 stamps.
+# Disable-able via VOICE_FILLER_ENABLED.
 #
 # HEAVY-IMPORT ISOLATION: the livekit-agents CORE imports are import-guarded (so this module imports
 # cleanly in the livekit-FREE test suite/CI, with Agent aliased to object and WorkerVoiceAgent still
@@ -164,6 +173,34 @@ _LIVE_PARTIAL_THROTTLE_S = float(os.environ.get("VOICE_LIVE_PARTIAL_THROTTLE_S",
 # progressively. Each yielded chunk keeps its trailing whitespace so the concatenation is byte-for-byte
 # the original reply (no parity drift).
 _STREAM_WORDS_PER_CHUNK = max(1, int(os.environ.get("VOICE_STREAM_WORDS_PER_CHUNK", "3")))
+
+# --- CB-47: DELAYED, CONDITIONAL perceived-latency filler (worker-only TTS, NOT a committed turn) --
+# CB-44 measured first-word ≈ 4.8s on a real call, dominated by the SEQUENTIAL DST (~1.4s) -> Policy
+# (~1.7s) prelude that MUST run before NLG streams (Policy reads the post-DST belief — a hard data
+# dependency the brain cannot parallelize, and reasoning effort is already pinned `minimal`). So the
+# caller hears ~3-5s of dead air at the start of each turn. The fix is a worker-side MASK: when a
+# turn enters llm_node we schedule a SHORT, natural backchannel that is spoken via session.say ONLY
+# if the first real NLG token has NOT arrived within VOICE_FILLER_DELAY_MS (default 700ms). If the
+# first token arrives first, the filler is CANCELLED/SKIPPED (no double-speak) — so a fast turn gets
+# no awkward filler and a slow turn is masked within <1s. R37-safe: the filler is audio ONLY — it
+# never touches the streamed tokens, the committed reply text, or the CB-44 timing stamps.
+_VOICE_FILLER_ENABLED = os.environ.get("VOICE_FILLER_ENABLED", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+# How long to wait for the first NLG token before speaking a filler (perceived-latency budget). 700ms
+# keeps a fast turn (first token < delay) filler-free while masking the ~3s slow-prelude turns.
+_VOICE_FILLER_DELAY_MS = max(0, int(os.environ.get("VOICE_FILLER_DELAY_MS", "700")))
+# A small rotation of short, varied, natural acknowledgments. We pick by turn index (NOT random) so the
+# behavior is deterministic-ish/testable yet never feels robotic (it doesn't repeat the same line back
+# to back across turns). Kept brief so the streamed reply can talk over/after it cleanly.
+_VOICE_FILLER_LINES = (
+    "Sure—",
+    "Got it,",
+    "Okay, one sec—",
+    "Mm, let me see—",
+    "Right—",
+    "Of course,",
+)
 
 # --- SIP spoken-consent: the IVR prompts + the deterministic reply classifier --------------------
 # A PSTN caller has NO browser to click consent, so the worker captures recording consent BY VOICE.
@@ -442,6 +479,14 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
         # stream_start is the monotonic loop time of the first token (operate derives stream_elapsed_ms
         # from it). Set on the first streamed token, cleared once the turn commits (None between turns).
         self._live_timing: Optional[dict[str, float]] = None
+        # CB-47 (perceived-latency filler): the sid whose first real NLG token has arrived — the filler
+        # coroutine checks this AFTER its delay and SKIPS speaking if the real reply already started for
+        # this sid (no double-speak). Set the instant the first token is yielded in llm_node; reset per
+        # turn. Keyed by sid so a re-ordered/barge-in turn can't cancel a different turn's filler.
+        self._filler_first_token_sid: Optional[str] = None
+        # The in-flight filler task for the active turn (so llm_node can cancel it the instant the first
+        # token arrives). None between turns. Cancellation is a hard guarantee on top of the sid check.
+        self._filler_task: Optional[Any] = None
 
     # --- SIP spoken-consent sub-flow (the no-browser phone path) --------------------------------
 
@@ -557,6 +602,55 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
         except Exception:  # pragma: no cover - defensive: a TTS hiccup must not crash the call
             logger.warning("failed to speak consent line")
 
+    def _filler_line_for_turn(self) -> str:
+        """CB-47: pick a SHORT backchannel by turn index (deterministic-ish — NOT random) so it never
+        repeats the same line back-to-back yet stays testable. The turn counter (set in
+        on_user_turn_completed before llm_node runs) indexes the rotation."""
+        idx = max(0, self._turn_counter - 1) % len(_VOICE_FILLER_LINES)
+        return _VOICE_FILLER_LINES[idx]
+
+    async def _maybe_speak_filler(self, sid: str) -> None:
+        """CB-47: DELAYED, CONDITIONAL perceived-latency mask. Sleep VOICE_FILLER_DELAY_MS, then speak a
+        short natural backchannel via session.say ONLY if the first real NLG token for THIS sid has not
+        arrived yet — masking the slow DST+Policy prelude with a sub-1s acknowledgment instead of dead
+        air. Cancelled by llm_node the instant the first token arrives; the sid check is a second guard
+        so a race (token landing exactly at the delay boundary) still can't double-speak.
+
+        WORKER-ONLY TTS, NOT a committed turn: this never touches the streamed tokens, the committed
+        reply text (R37 — reply == concat(tokens)), or the CB-44 timing stamps. Spoken with
+        allow_interruptions=True so the streamed reply can talk over/after it naturally. Fully defensive:
+        a cancellation (fast turn) or a TTS hiccup is swallowed so it can never interrupt the call."""
+        try:
+            await asyncio.sleep(_VOICE_FILLER_DELAY_MS / 1000.0)
+            # The real reply already started streaming for this sid -> skip (no double-speak).
+            if self._filler_first_token_sid == sid:
+                return
+            try:
+                session = self.session  # real livekit Agent: property; raises if not running
+            except Exception:  # no running AgentSession (tests / pre-start) -> nothing to speak through
+                return
+            say = getattr(session, "say", None)
+            if say is None:  # pragma: no cover - exercised only with a live AgentSession attached
+                return
+            line = self._filler_line_for_turn()
+            # Re-check immediately before speaking: the token may have landed during the awaits above.
+            if self._filler_first_token_sid == sid:
+                return
+            await say(line, allow_interruptions=True)
+        except asyncio.CancelledError:
+            # Fast turn: llm_node saw the first token and cancelled us — by design, swallow it.
+            return
+        except Exception:  # pragma: no cover - defensive: a filler TTS hiccup must not crash the call
+            logger.warning("CB-47 filler say failed (call continues)")
+
+    def _cancel_filler(self) -> None:
+        """CB-47: cancel the in-flight filler task (called the instant the first NLG token arrives, and
+        defensively at turn end). Idempotent + swallows any error so it never breaks the speak loop."""
+        task = self._filler_task
+        self._filler_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
     async def llm_node(
         self, chat_ctx: Any, tools: Any, model_settings: Any
     ) -> "AsyncIterator[str]":
@@ -602,9 +696,23 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
         t_audio_in = self._audio_in_by_sid.pop(sid, None)
         t_brain_start = loop.time()
         t_first_token: Optional[float] = None
+        # CB-47: schedule the DELAYED, CONDITIONAL perceived-latency filler for THIS turn. It speaks a
+        # short backchannel ONLY if the first NLG token hasn't arrived within VOICE_FILLER_DELAY_MS
+        # (masking the slow DST+Policy prelude). The first-token branch below cancels it (no double-
+        # speak). Worker-only TTS — it does NOT touch the token stream, the committed reply, or the
+        # CB-44 stamps. Disable-able via VOICE_FILLER_ENABLED. Reset the per-turn first-token marker
+        # first so a prior turn's value can't make us skip.
+        self._filler_first_token_sid = None
+        if _VOICE_FILLER_ENABLED:
+            self._filler_task = asyncio.ensure_future(self._maybe_speak_filler(sid))
         async for token in self.voice_session.handle_user_turn_stream(user_text, sid):
             now = loop.time()
             if t_first_token is None:
+                # CB-47: the real reply has started for this sid — mark it (so a filler mid-delay skips)
+                # and cancel the pending filler task. Done BEFORE the yield so the cancel races ahead of
+                # any further awaits; the marker is the belt-and-suspenders guard if cancel loses a race.
+                self._filler_first_token_sid = sid
+                self._cancel_filler()
                 # CB-44: first NLG token reached the speak loop. Surface the in-flight timing so the live
                 # monitor can show time-to-first-token + a growing stream-elapsed on the active turn.
                 t_first_token = now
@@ -619,6 +727,12 @@ class WorkerVoiceAgent(Agent):  # type: ignore[misc,valid-type]
                 # Fire-and-forget: a partial-text upsert must never block / crash the speak loop.
                 asyncio.ensure_future(_upsert_live_partial(self, self._config, shown))
         t_stream_end = loop.time()
+        # CB-47: stream finished — defensively cancel any still-pending filler. Covers the degenerate
+        # zero-token stream (the loop's first-token branch never ran, so the filler was never cancelled
+        # there). Marking the sid first means even if the filler wakes between here and cancellation it
+        # SKIPS (a finished/empty stream needs no backchannel either).
+        self._filler_first_token_sid = sid
+        self._cancel_filler()
         # Always flush the FINAL partial (the complete reply) before commit, so even a reply that
         # streamed faster than one throttle window still surfaces its partial text to the monitor.
         if self._config is not None and shown:

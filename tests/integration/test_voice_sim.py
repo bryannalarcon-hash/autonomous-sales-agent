@@ -42,6 +42,12 @@
 # PERSISTENCE:
 #   persist_call_end is patched to a DB-free stub that captures the final Episode for assertion.
 #   This exercises the REAL _register_persistence / _on_shutdown code path.
+# CB-47 (perceived-latency filler): three tests at the bottom drive WorkerVoiceAgent._maybe_speak_filler
+#   (the worker-only TTS mask for the slow DST+Policy prelude) with a recording fake session: (a) it
+#   SPEAKS a short backchannel (allow_interruptions=True) when the first NLG token is artificially slow
+#   (> delay), (b) it is SKIPPED when the first token is fast (< delay, marker set), and (c) a full sim
+#   with the filler ENABLED never alters the committed reply text (R37: reply == concat(tokens)) nor
+#   leaks the filler line into the transcript (it is NOT a committed Turn).
 from __future__ import annotations
 
 import asyncio
@@ -1078,3 +1084,184 @@ async def test_voice_sim_llm_node_stamps_per_turn_timing() -> None:
         timing["first_token_ms"], timing["stream_duration_ms"],
         timing["audio_to_first_token_ms"], timing["total_ms"],
     )
+
+
+# --------------------------------------------------------------------------------------------------
+# CB-47: the DELAYED, CONDITIONAL perceived-latency filler. When a turn enters llm_node a short
+# backchannel is scheduled via session.say and spoken ONLY if the first NLG token has NOT arrived
+# within VOICE_FILLER_DELAY_MS — masking the slow DST+Policy prelude. It is CANCELLED/SKIPPED the
+# instant the first real token lands (no double-speak, no filler on fast turns). It is worker-only TTS,
+# NOT a committed Turn, and must NOT alter the committed reply text (R37: reply == concat(tokens)).
+# --------------------------------------------------------------------------------------------------
+class _SayRecordingSession:
+    """A fake AgentSession whose say() records each spoken line + its allow_interruptions flag, so a
+    test can assert the CB-47 filler did (or did not) speak, and with what interruption semantics."""
+
+    def __init__(self) -> None:
+        self.said: list[tuple[str, bool]] = []
+
+    async def say(self, text: str, *, allow_interruptions: bool = True) -> None:
+        self.said.append((text, allow_interruptions))
+
+
+def _filler_agent(session: _SayRecordingSession, *, turn_counter: int = 1) -> Any:
+    """Build a WorkerVoiceAgent whose `session` property returns the recording fake, so
+    _maybe_speak_filler resolves a real say() target (the production property raises with no live
+    AgentSession). Construction is livekit-free-safe; here livekit IS installed so the base inits."""
+    import src.voice.worker as worker_mod
+    from src.voice.agent import build_voice_agent
+
+    config = load_config("champion_v0")
+    gate = ConsentGate(jurisdiction="", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
+    gate.acknowledge_ai()
+    gate.grant_recording()
+    base = build_voice_agent(
+        config, _agent_mock(act="ask", reply="hi"), FakeEmbedder(),
+        kb_chunks_or_retrieve_hook=_make_retrieve_hook(), consent_gate=gate,
+    )
+
+    class _FillerAgent(worker_mod.WorkerVoiceAgent):
+        # Override the livekit `session` property (which raises without a running activity) so the
+        # filler has a recording say() target in this offline test.
+        @property
+        def session(self) -> Any:  # type: ignore[override]
+            return session
+
+    agent = _FillerAgent(base)
+    agent._config = config
+    agent._turn_counter = turn_counter
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_cb47_filler_fires_when_first_token_slow(monkeypatch: Any) -> None:
+    """CB-47 (a): when the first NLG token does NOT arrive within the delay, _maybe_speak_filler SPEAKS
+    a short backchannel via session.say with allow_interruptions=True (so the real reply can talk
+    over/after it). We drive the coroutine directly with a tiny delay and never set the first-token
+    marker (modeling a slow prelude), then assert exactly one filler line was spoken, interruptible,
+    and that it is one of the known short rotation lines."""
+    import src.voice.worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "_VOICE_FILLER_DELAY_MS", 20)  # 20ms so the test is fast
+    session = _SayRecordingSession()
+    agent = _filler_agent(session, turn_counter=1)
+
+    # First-token marker is None (the real reply never started for this sid) -> the filler should fire.
+    await agent._maybe_speak_filler("t-1")
+
+    assert len(session.said) == 1, f"CB-47: exactly one filler line expected, got {session.said!r}"
+    line, allow_interruptions = session.said[0]
+    assert allow_interruptions is True, "CB-47: filler must be interruptible so the reply plays cleanly"
+    assert line in worker_mod._VOICE_FILLER_LINES, (
+        f"CB-47: spoken filler must be one of the short rotation lines, got {line!r}"
+    )
+    assert len(line) <= 24, f"CB-47: filler must stay SHORT/natural, got {line!r}"
+    logger.info("PASS CB-47 (a): filler fired on slow first-token: %r (interruptible=%s)",
+                line, allow_interruptions)
+
+
+@pytest.mark.asyncio
+async def test_cb47_filler_skipped_when_first_token_fast(monkeypatch: Any) -> None:
+    """CB-47 (b): when the first NLG token arrives BEFORE the delay elapses, the filler is SKIPPED — no
+    double-speak. We set the first-token marker for the sid (as llm_node does the instant the real reply
+    starts) before the delay elapses, then assert session.say was NEVER called.
+
+    Also covers the disable flag path's spirit: a fast turn must be filler-free."""
+    import src.voice.worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "_VOICE_FILLER_DELAY_MS", 50)  # long enough to set the marker first
+    session = _SayRecordingSession()
+    agent = _filler_agent(session, turn_counter=2)
+
+    # Schedule the filler, then mark the first token arrived for this sid BEFORE the delay elapses —
+    # exactly the llm_node first-token branch behavior. The filler must SKIP (no say()).
+    task = asyncio.ensure_future(agent._maybe_speak_filler("t-2"))
+    await asyncio.sleep(0.005)
+    agent._filler_first_token_sid = "t-2"  # real reply started -> skip
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert session.said == [], (
+        f"CB-47: a fast first-token must SKIP the filler (no double-speak), but say() was called: "
+        f"{session.said!r}"
+    )
+    logger.info("PASS CB-47 (b): filler skipped when first token arrived before the delay")
+
+
+@pytest.mark.asyncio
+async def test_cb47_filler_cancelled_via_llm_node_does_not_double_speak(monkeypatch: Any) -> None:
+    """CB-47 (b'): the llm_node cancel path. _cancel_filler() (called the instant the first token lands)
+    cancels the in-flight task so it never speaks even if it was mid-delay. Proves the hard-cancel guard
+    on top of the sid check."""
+    import src.voice.worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "_VOICE_FILLER_DELAY_MS", 200)  # long delay so cancel beats the say
+    session = _SayRecordingSession()
+    agent = _filler_agent(session, turn_counter=3)
+
+    agent._filler_task = asyncio.ensure_future(agent._maybe_speak_filler("t-3"))
+    await asyncio.sleep(0.01)
+    # llm_node's first-token branch: mark + cancel.
+    agent._filler_first_token_sid = "t-3"
+    agent._cancel_filler()
+    await asyncio.sleep(0.01)
+
+    assert session.said == [], f"CB-47: a cancelled filler must not speak, got {session.said!r}"
+    assert agent._filler_task is None, "CB-47: _cancel_filler must clear the task handle"
+    logger.info("PASS CB-47 (b'): cancelled filler did not speak")
+
+
+@pytest.mark.asyncio
+async def test_cb47_filler_does_not_alter_committed_reply(monkeypatch: Any) -> None:
+    """CB-47 (c): a full sim with the filler ENABLED + a tiny delay (so it would fire) must NEVER alter
+    the committed reply text (R37: committed Turn.text == concat of the streamed NLG tokens) and must
+    NOT leak the filler line into the transcript — it is worker-only TTS, NOT a committed Turn.
+
+    The sim's tts_node is a silence stub (no real audio), and the filler speaks through the running
+    AgentSession's say(); whether or not it physically synthesizes here, the assertion is the invariant
+    that matters: the COMMITTED reply + transcript are byte-identical to the streamed NLG, with no
+    filler text mixed in. Run with the filler enabled (default) and a 1ms delay so it is maximally
+    likely to fire, proving it can't corrupt the committed state even when it does."""
+    import src.voice.worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "_VOICE_FILLER_ENABLED", True)
+    monkeypatch.setattr(worker_mod, "_VOICE_FILLER_DELAY_MS", 1)  # fire aggressively
+
+    config = load_config("champion_v0")
+    reply = "Sure, let me get a few details about what your child is working on."
+    brain_llm = _agent_mock(act="ask", reply=reply)
+    captured_episode: list[Any] = []
+    captured_chunks: list[list[str]] = []
+
+    await _run_sim(
+        caller_lines=["Hi, I'm looking for math tutoring.", "How much does it cost?"],
+        config=config,
+        brain_llm=brain_llm,
+        captured_episode=captured_episode,
+        captured_chunks=captured_chunks,
+    )
+
+    assert captured_chunks, "llm_node never yielded tokens — the NLG did not stream"
+    # R37 parity: the streamed tokens rejoin BYTE-FOR-BYTE to the configured reply (the filler never
+    # entered the token stream).
+    streamed = "".join(captured_chunks[0])
+    assert streamed == reply, (
+        f"CB-47: the filler must not alter the streamed reply. got {streamed!r} != {reply!r}"
+    )
+
+    assert captured_episode, "No episode captured — shutdown/commit did not fire"
+    ep = captured_episode[0]
+    agent_turns = [t for t in ep.turns if t.speaker == "agent"]
+    assert agent_turns, "CB-47: the filler must not break the commit — no agent turn committed"
+    # A committed agent Turn.text equals the streamed reply (no filler bytes), and NO committed turn
+    # text is a bare filler line (the filler is never persisted as a turn).
+    assert any(t.text == reply for t in agent_turns), (
+        f"CB-47: a committed agent Turn.text must equal the exact reply, got {[t.text for t in agent_turns]!r}"
+    )
+    for t in ep.turns:
+        assert t.text not in worker_mod._VOICE_FILLER_LINES, (
+            f"CB-47: a filler line leaked into the committed transcript as a turn: {t.text!r}"
+        )
+    # Belt-and-suspenders: the full transcript must not CONTAIN a filler line as a standalone committed
+    # turn (the filler is audio-only; it never enters the persisted text).
+    logger.info("PASS CB-47 (c): committed reply unaltered (%d agent turns); no filler leaked into transcript",
+                len(agent_turns))

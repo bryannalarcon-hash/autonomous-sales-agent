@@ -70,6 +70,24 @@
 - **Refs:** `src/api/operate.py::live_snapshot` + `live_ep`; LiveKit Agents room/participant model + SIP dispatch (`scripts/setup_sip_dispatch.py`, rule `SDR_hKYQYAwz96uA`); the disabled take-over control (`web/app/operate/live/page.tsx`); R37 in `src/core/respond.py`.
 - **Take-over spec (user, 2026-06-02) — refines CB-01.c:** on "Take over", the AI must (1) be INTERRUPTED mid-conversation and (2) speak a DEFAULT TTS hand-off line (e.g. "Let me bring in a specialist to help — one moment. They may type some of their responses, so there might be a brief pause between answers."). Then the OPERATOR talks into their own device (browser mic / WebRTC into the call's LiveKit room) and is heard by the caller through the phone — operator audio is published as a room participant, NOT a dial-in (presume the operator is NOT calling from their own phone number, so no SIP bridge / caller-ID concerns). The agent stops auto-generating; the operator may ALSO TYPE responses that are TTS'd to the caller ("the agent might be typing their responses"). So take-over = interrupt + disclosure TTS + operator mic→room audio + optional operator-typed→TTS, with the AI yielded. Consent/recording state must carry over; respect R37 (don't fork the brain — the brain just stops).
 
+### CB-49 — Seed the KB with concrete Algebra/SAT proof points (so "show me results" can be answered)
+- **Type / Surface / Size:** feature · `data` (KB) · `core` (`src/core` retrieval) · M
+- **Prereqs:** — *(independent; pairs well with CB-48 — directness can't help if there's nothing concrete to retrieve)*
+- **Important files (candidates):** the KB content/source the RAG retriever indexes (find via `answer_via_kb` retrieval path + the KB ingestion script), `src/core/nlg.py` grounding block.
+- **Current:** the Dana eval (2026-06-04) showed the agent asked for concrete proof/success stories 5× and DEFLECTED every time ("families often share…", "I don't have specific numbers right now") — because the KB carries no concrete, citable Algebra/SAT outcome facts to retrieve. No brain tuning can fix an empty shelf.
+- **Desired:** the KB holds a handful of concrete, TRUE, compliance-safe proof points (e.g. aggregate score-lift ranges with the right hedging, representative anonymized Algebra turnaround patterns) that `answer_via_kb` can surface so the agent answers a proof demand with substance instead of deflecting. Must NOT fabricate specific student results (compliance) — use only verifiable/aggregate claims.
+- **Acceptance:** re-running Dana, the agent answers her proof demand with a concrete retrieved fact at least once (not pure deflection); no fabricated specifics; KB tests green.
+- **Refs:** Dana baseline transcript (episode `sp-1517ff84…`, cohort `experiment_eval_personas_dana`); CB-48 directness pass.
+
+### CB-50 — No-authority gatekeeper should route to a callback, not escalate to a human on turn 1
+- **Type / Surface / Size:** change · `core` (`src/core` gates/policy) · S/M
+- **Prereqs:** —
+- **Important files (candidates):** `src/core/gates.py` (escalation/advance gates), `src/core/policy.py` (act selection for a no-authority/disqualified read), the disqualify→callback path.
+- **Current:** the Pat eval (2026-06-04) showed the agent ESCALATED a no-authority, vaguely-curious gatekeeper to a live specialist in ONE turn (outcome=escalated) — wasting a human on an unqualified lead instead of politely capturing the decision-maker's info / booking a callback for the actual parent.
+- **Desired:** on a no_authority read, prefer a low-touch CALLBACK offer (capture how/when to reach the decision-maker) over a live-human escalation; escalate only on a genuine escalation trigger, not merely because the caller isn't the decision-maker.
+- **Acceptance:** re-running Pat, the outcome is a callback (or graceful disqualify), NOT a turn-1 human escalation; the buy-gate/disqualify invariants hold; existing escalation tests stay green.
+- **Refs:** Pat baseline transcript (episode `sp-102ff1bd…`, cohort `experiment_eval_personas_pat`); `src/core/gates.py` escalation path.
+
 ---
 
 ## In Progress
@@ -106,6 +124,20 @@
 - **Notes / blockers:** HARD INVARIANT — the honest buy-gate must stay PURE/DETERMINISTIC: budget + qualified + per-tier ceiling immutable to talk; a commitment fires ONLY on the agent's `attempt_close` at the offered tier. Do NOT let "more turns" come from breaking that (e.g., never auto-commit / never move budget). Regenerating transcripts is paid LLM self-play — bounded batch first.
 - **Notes:** DONE + committed (1d9cdec): conviction coupling fixed the binding constraint; N=10 verify = 6/7 qualified close, 0/3 unqualified, avg ~19 turns, buy-gate intact. (Board kept here for history.)
 
+### CB-48 — Production-brain directness + anti-repetition (the failures all 3 eval personas exposed)
+- **Type / Surface / Size:** change · `core` (`src/core`) · M/L
+- **Owner:** coder-brain + orchestrator
+- **Started:** 2026-06-04
+- **Prereqs met?:** yes (CB-43 personas are the regression harness)
+- **Why (measured, all 3 baselines):** Marcus hedged "can you move his score in 5 weeks?" 4× and got asked a discovery question after "no fluff" (walked); Dana asked for concrete proof 5× and was deflected every time while the agent pushed "free consultation" 5× (shallow win); Pat (no-authority) was escalated to a human in 1 turn. Cluster: (1) REPETITION — NLG restates the same line/offer because it sees no turn history / no own prior line; (2) EVADES the core question — closes/deflects instead of answering the recurring open_question/objection; (3) over-discovers under impatience.
+- **Plan (checklist) — conservative, minimal-change, full-suite-green each step:**
+  - [ ] **Anti-repetition (NLG own prior line):** thread the agent's last 1–2 spoken lines into `nlg._build_messages` (via `respond.py` / `respond_stream`, which have `history`) with an instruction: "do NOT restate a point/offer you already made; if the decided act repeats your last line, rephrase substantively or advance." Preserves the distillation (own line only — NOT the caller transcript; no new inventable facts). Update `realize` AND `realize_stream`.
+  - [ ] **Directness:** make `address_direct_input` (or a sibling gate) ALSO fire when the prospect has a RECURRING unanswered open_question/objection or is impatient (high bail_risk / low decision_confidence), so the agent answers it before re-pushing a close; and suppress a discovery `ask`/`confirm_known` when bail_risk is high (don't slot-fill a hot, impatient prospect). Investigate WHY Marcus's challenge-questions and Dana's proof-demands weren't classified as `open_question` (DST) — fix the classification if that's the gap.
+  - [ ] TDD: add a regression test reproducing the Marcus pattern (repeated hedge / discovery-under-impatience) — red first; then green. Keep the FULL non-voice suite green (573) — if a directness change breaks the pitch/close tests, NARROW it, don't paper over.
+  - [ ] Re-run Marcus + Dana evals; report whether repetition drops + the core question gets answered + outcomes hold/improve (don't break Pat's disqualify path).
+- **Files being touched:** `src/core/nlg.py`, `src/core/respond.py`, `src/core/policy.py`, `src/core/gates.py`, possibly `src/core/dst.py` (objection/question classification); `tests/unit/` regression.
+- **Notes / blockers:** R37 parity — `respond()` and `respond_stream()` stay in lock-step (reply == concat(tokens)); the own-line context goes to BOTH. Buy-gate stays pure. This is delicate, behavior-changing core work: minimal change, verify the full suite + re-run the eval, loop coder→verify→review ≤3 rounds. The concrete-PROOF gap (Dana) is likely a KB-content shortfall (no success-story facts to retrieve) — that's CB-49 (data), NOT this brain pass.
+
 ---
 
 ## Done
@@ -130,6 +162,15 @@
 - **Verification:** `cd web && npx tsc --noEmit` clean (exit 0). Cadence dark tokens reused (no new visual language); human phrases only, no raw key/slug renders. Screenshot via a temp mock harness (backend wasn't up) confirmed all four phrases render — `tests/e2e/shots/cb45_timing.png`; harness deleted after capture.
 - **Constraints checked:** no internal-index/slug leak in rendered timing; null-tolerant so it shipped independent of CB-44 landing. Contract field names match the backend exactly (verified against operate.py).
 - **Follow-ups / known gaps:** real-data render (vs mock harness) to be eyeballed once a live/stored call carries timing.
+
+### CB-47 — Perceived-latency filler masks the DST+Policy prelude (no more dead air on ring)
+- **Type / Surface / Size:** feature · `voice-worker` · S
+- **Completed:** 2026-06-04
+- **Files changed (actual):** `src/voice/worker.py` (env consts `VOICE_FILLER_ENABLED`/`VOICE_FILLER_DELAY_MS` + 6-line rotation; `_filler_line_for_turn`/`_maybe_speak_filler`/`_cancel_filler`; wired in `llm_node`), `tests/integration/test_voice_sim.py` (4 new tests).
+- **What changed:** at brain-start `llm_node` schedules a delayed backchannel that speaks via `session.say(allow_interruptions=True)` ONLY if the first NLG token hasn't arrived within `VOICE_FILLER_DELAY_MS` (default 700ms); the first-token branch marks the sid + cancels the task (belt-and-suspenders, before any await) so a fast turn gets NO filler and there's no double-speak. Line rotates deterministically by turn counter ("Sure—", "Got it,", …). So the caller hears a natural ack within <1s instead of ~3-5s of dead air.
+- **Verification:** `/usr/bin/python3 -m pytest tests/integration/test_voice_sim.py -q` → 10 passed (6 original + 4 new: slow→fires, fast→skips, llm_node-cancel→no double-speak, full-sim→committed reply/transcript byte-for-byte unaltered). TDD red-first verified.
+- **Constraints checked:** R37 — brain UNCHANGED; filler is worker-only TTS, never a committed Turn, never touches the streamed reply or CB-44 timing stamps. NOT parallelizing DST+Policy (data dependency — correctness risk), per the measured RCA.
+- **Follow-ups / known gaps:** prompt-caching bonus SKIPPED (implicit OpenAI caching needs ≥1024-token prefixes the short DST/Policy prompts don't reach; explicit Anthropic caching discounts prefill, not the round-trip latency that dominates) — correct call, not half-implemented. Real (not just perceived) prelude latency is still ~3s → revisit only if needed.
 
 ### CB-46 — Fix: call visible on connect (BEFORE the disclosure) + streaming verdict
 - **Type / Surface / Size:** bug · `voice-worker` · `/operate/live` · S
