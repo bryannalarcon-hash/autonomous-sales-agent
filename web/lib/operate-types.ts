@@ -11,6 +11,11 @@
 // Additions (CB-30): EpisodeSummary/EpisodeDetail gain optional `golden` (the calibration-set flag);
 // the golden set is fetched via fetchGoldenEpisodes and toggled via setEpisodeGolden in operate-api.
 // lib/operate-api.ts types against these.
+// Additions (CB-45, against CB-44's LOCKED API contract): per-agent-turn voice timing on Turn.timing
+// (audio-in → first-token → stream-end, all nullable on text/legacy turns); LiveSnapshot.live_timing
+// (first-token + stream-elapsed, present ONLY while a partial streams); and EpisodeSummary
+// avg_first_token_ms / avg_stream_ms (means over agent turns that carry timing). All are number|null
+// and rendered as human phrases (e.g. "0.8s to first word") — never as raw ms keys.
 
 /** One belief-state driver signal at a turn, already labeled (e.g. "Walk-away risk"). */
 export interface DriverSignal {
@@ -41,6 +46,20 @@ export interface BeliefSnapshot {
   trends: Record<string, number>;
 }
 
+/** CB-44/CB-45: voice-call timing for ONE agent turn (audio-in → first NLG token → stream-end).
+ *  Every field is nullable: text turns, legacy turns, and turns recorded before CB-44 carry nulls
+ *  (the UI shows "—" / omits the chip — it never derives a label from these raw ms numbers). */
+export interface TurnTiming {
+  /** ms from the user's final STT landing to the first streamed NLG token (the felt "dead air"). */
+  audio_to_first_token_ms: number | null;
+  /** ms the brain took to emit its first token after starting to compose. */
+  first_token_ms: number | null;
+  /** ms spent streaming the reply (first token → stream end) — roughly how long the agent "spoke". */
+  stream_duration_ms: number | null;
+  /** ms end-to-end from audio-in to stream-end. */
+  total_ms: number | null;
+}
+
 /** One transcript turn + its decision trace (agent turns carry decision_label + rationale). */
 export interface Turn {
   turn_id: number;
@@ -53,6 +72,9 @@ export interface Turn {
   // CB-28: the KB facts ("[source] text") that grounded a tool-use answer; null on non-tool turns.
   // When present, the Review page makes the turn clickable into a panel of what was pulled.
   retrieved?: string[] | null;
+  // CB-44/CB-45: per-turn voice timing (null on text/legacy turns). The Review page renders it as
+  // first-token / spoke-for chips beside the decision trace; null timing shows nothing (no crash).
+  timing?: TurnTiming | null;
 }
 
 /** A summary row for the Calls list (P3) / Live tile — no transcript body. */
@@ -74,6 +96,11 @@ export interface EpisodeSummary {
   /** CB-30: true when this call is tagged into the golden calibration set (metrics['golden']). The
    *  Review page shows a golden indicator + a "Mark golden / Golden ✓" toggle that flips this. */
   golden?: boolean;
+  /** CB-44/CB-45: mean time-to-first-token across this call's agent turns that carry timing, in ms;
+   *  null when no turn has timing (text/legacy call). Surfaced as "0.8s to first word" in the UI. */
+  avg_first_token_ms?: number | null;
+  /** CB-44/CB-45: mean stream duration across this call's timed agent turns, in ms; null when none. */
+  avg_stream_ms?: number | null;
   created_at: string | null;
 }
 
@@ -101,6 +128,16 @@ export interface EpisodeListResponse {
   count: number;
 }
 
+/** CB-44/CB-45: live timing for the turn currently STREAMING on a real voice call. Present on the
+ *  snapshot ONLY while a partial is in flight (mirrors live_partial); null/absent otherwise. The
+ *  monitor shows it near the active agent turn as "0.8s to first word · speaking 1.2s". */
+export interface LiveTiming {
+  /** ms to the first NLG token of the in-progress turn (null until the first token lands). */
+  first_token_ms: number | null;
+  /** ms elapsed since the first token — how long the agent has been speaking this turn so far. */
+  stream_elapsed_ms: number | null;
+}
+
 /** The P1 Live monitor snapshot: the most-recent call + the hoisted prioritized belief IA. */
 export interface LiveSnapshot {
   active: boolean;
@@ -111,6 +148,9 @@ export interface LiveSnapshot {
    *  call — present ONLY while active, so the monitor renders the words filling in on the active
    *  turn near-real-time. null/absent once the turn commits or on an inactive/sample call. */
   live_partial?: string | null;
+  /** CB-44/CB-45: timing for that same in-progress streamed turn (first-token + stream-elapsed);
+   *  present only while a partial streams, null/absent otherwise. */
+  live_timing?: LiveTiming | null;
   episode: EpisodeDetail | null;
   priority?: {
     trust: number | null;

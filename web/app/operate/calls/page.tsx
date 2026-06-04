@@ -9,12 +9,14 @@
 // pre-translated by the backend; the raw persona archetype + version slugs are humanized client-side
 // via @/lib/labels (archetypeLabel/versionLabel), and the raw call id is muted/secondary — never a
 // headline (internal indices must not render as operator-facing labels).
+// CB-45: the drawer also shows the call's average time-to-first-word (from EpisodeSummary
+// avg_first_token_ms via fmtMsShort), omitted when the call has no voice timing.
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
-import { fetchEpisodes, fmtDuration, fmtTimeAgo } from '@/lib/operate-api';
+import { fetchEpisodes, fmtDuration, fmtMsShort, fmtTimeAgo } from '@/lib/operate-api';
 import { archetypeLabel, versionLabel } from '@/lib/labels';
 import type { EpisodeSummary } from '@/lib/operate-types';
 
@@ -49,12 +51,17 @@ function outcomeClass(key: string | null): string {
 function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
   const router = useRouter();
   const cls = outcomeClass(c.outcome_key);
+  // CB-45: the call's mean time-to-first-word (avg_first_token_ms), shown as a human duration. Only
+  // included when the call carries voice timing (fmtMsShort('' on null) — a text/legacy call omits it
+  // rather than showing a placeholder).
+  const firstWord = fmtMsShort(c.avg_first_token_ms);
   const facts: [string, string][] = [
     ['Duration', fmtDuration(c.duration_ms)],
     ['Channel', c.channel === 'voice' ? 'Web-voice' : c.channel],
     ['When', fmtTimeAgo(c.created_at)],
     ['Qualified', c.qualified == null ? '—' : c.qualified ? 'Yes' : 'No'],
     ['Ladder tier', c.ladder_label],
+    ...(firstWord ? ([['Time to first word', firstWord]] as [string, string][]) : []),
     ['Call ID', c.episode_id],
   ];
   return (

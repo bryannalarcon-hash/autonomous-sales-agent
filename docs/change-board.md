@@ -106,21 +106,6 @@
 - **Notes / blockers:** HARD INVARIANT — the honest buy-gate must stay PURE/DETERMINISTIC: budget + qualified + per-tier ceiling immutable to talk; a commitment fires ONLY on the agent's `attempt_close` at the offered tier. Do NOT let "more turns" come from breaking that (e.g., never auto-commit / never move budget). Regenerating transcripts is paid LLM self-play — bounded batch first.
 - **Notes:** DONE + committed (1d9cdec): conviction coupling fixed the binding constraint; N=10 verify = 6/7 qualified close, 0/3 unqualified, avg ~19 turns, buy-gate intact. (Board kept here for history.)
 
-### CB-45 — Surface call timing on the dashboard (live monitor + stored Call Review)
-- **Type / Surface / Size:** feature · `/operate/live` · `/operate/review` · `/operate/calls` · `design` · M
-- **Owner:** coder-dash + orchestrator
-- **Started:** 2026-06-04
-- **Prereqs met?:** builds against CB-44's LOCKED API contract (can develop in parallel)
-- **Why:** "push that information somewhere onto the dash and everywhere where you would be reviewing calls (live AND stored call)."
-- **Plan (checklist):**
-  - [ ] Live monitor: on the active agent turn / header, show live time-to-first-token + streaming elapsed from `snap.live_timing` (Cadence tokens; no raw keys).
-  - [ ] Stored Call Review (`review/[id]`): per-turn timing chips (first-token / stream duration) from `turns[i].timing`; a small call-level summary (avg first-token, avg stream) in the header.
-  - [ ] Calls list (`/operate/calls`): optional avg-first-token column or drawer field from `avg_first_token_ms`.
-  - [ ] Types in `web/lib/operate-types.ts` + fetchers in `web/lib/operate-api.ts` extended for the new fields.
-  - [ ] Verify rendered result via screenshot (Cadence dark), not just tsc.
-- **Files being touched:** `web/app/operate/live/page.tsx`, `web/app/operate/review/[id]/page.tsx`, `web/app/operate/calls/page.tsx`, `web/lib/operate-types.ts`, `web/lib/operate-api.ts`.
-- **Notes / blockers:** human-readable labels only (ms formatted, e.g. "0.8s to first word"); no internal index/slug leakage.
-
 ---
 
 ## Done
@@ -136,6 +121,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-45 — Surface call timing on the dashboard (live + review + calls)
+- **Type / Surface / Size:** feature · `/operate/live` · `/operate/review` · `/operate/calls` · `design` · M
+- **Completed:** 2026-06-04
+- **Files changed (actual):** `web/lib/operate-types.ts` (`TurnTiming`, `Turn.timing?`, `LiveTiming`, `LiveSnapshot.live_timing?`, `EpisodeSummary.avg_first_token_ms?`/`avg_stream_ms?`), `web/lib/operate-api.ts` (`fmtMsShort`/`fmtFirstToken`/`fmtSpoke`), `web/app/operate/live/page.tsx`, `web/app/operate/review/[id]/page.tsx`, `web/app/operate/calls/page.tsx`.
+- **What changed:** timing surfaces everywhere a call is reviewed — Live monitor active turn shows "⚡ 0.8s to first word · speaking 1.2s" from `snap.live_timing`; Review shows per-turn chips ("0.7s to first word · spoke for 1.4s") + a call-level "Voice timing" stat from the avg fields; Calls drawer shows "Time to first word". Built against CB-44's locked contract; all fields nullable → omit/"—" on text/legacy turns, never crash.
+- **Verification:** `cd web && npx tsc --noEmit` clean (exit 0). Cadence dark tokens reused (no new visual language); human phrases only, no raw key/slug renders. Screenshot via a temp mock harness (backend wasn't up) confirmed all four phrases render — `tests/e2e/shots/cb45_timing.png`; harness deleted after capture.
+- **Constraints checked:** no internal-index/slug leak in rendered timing; null-tolerant so it shipped independent of CB-44 landing. Contract field names match the backend exactly (verified against operate.py).
+- **Follow-ups / known gaps:** real-data render (vs mock harness) to be eyeballed once a live/stored call carries timing.
 
 ### CB-46 — Fix: call visible on connect (BEFORE the disclosure) + streaming verdict
 - **Type / Surface / Size:** bug · `voice-worker` · `/operate/live` · S

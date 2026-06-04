@@ -19,6 +19,10 @@
 // golden calibration set via POST /api/episodes/{id}/golden (round-trips through metrics['golden'],
 // re-hydrated from ep.golden so it survives reload); a "Golden" pill shows when flagged. The existing
 // Export already yields the full transcript+belief+outcome record for the tagged set.
+// CB-45 (call timing): per agent turn, the decision trace shows voice-timing chips from
+// turns[i].timing — "0.8s to first word" + "spoke for 1.4s" (omitted on text/legacy turns). A
+// call-level "Voice timing" stat in the outcome strip surfaces avg_first_token_ms / avg_stream_ms
+// (absent when the call carries no timing). Human phrases only — no raw ms key renders.
 'use client';
 
 import { useMemo, useState } from 'react';
@@ -26,9 +30,33 @@ import { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { Ring } from '@/components/cadence/Spark';
-import { fetchEpisode, fmtDuration, setEpisodeGolden } from '@/lib/operate-api';
+import { fetchEpisode, fmtDuration, fmtFirstToken, fmtMsShort, fmtSpoke, setEpisodeGolden } from '@/lib/operate-api';
 import { archetypeLabel, humanizeRationale, versionLabel } from '@/lib/labels';
-import type { BeliefSnapshot, EpisodeDetail, ProspectTurnState } from '@/lib/operate-types';
+import type { BeliefSnapshot, EpisodeDetail, ProspectTurnState, TurnTiming } from '@/lib/operate-types';
+
+// CB-45: per-agent-turn voice-timing chips for the decision trace. Renders up to two small muted
+// chips — "0.8s to first word" (time-to-first-token) and "spoke for 1.4s" (stream duration) — from
+// turns[i].timing. Returns null on a turn with no timing or all-null fields (text/legacy turn), so
+// nothing renders and the trace never crashes. Reuses .rv-lat sizing; a bolt icon flags it as timing.
+function TurnTimingChips({ timing }: { timing: TurnTiming | null | undefined }) {
+  if (!timing) return null;
+  const ftLabel = fmtFirstToken(timing.audio_to_first_token_ms ?? timing.first_token_ms);
+  const spoke = fmtSpoke(timing.stream_duration_ms);
+  if (!ftLabel && !spoke) return null;
+  return (
+    <span
+      className="rv-lat"
+      data-testid="turn-timing"
+      style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
+      title="Voice timing for this turn"
+    >
+      <Icon name="bolt" size={11} style={{ color: 'var(--accent)' }} />
+      {ftLabel ? <span>{ftLabel}</span> : null}
+      {ftLabel && spoke ? <span style={{ opacity: 0.45 }}>·</span> : null}
+      {spoke ? <span>{spoke}</span> : null}
+    </span>
+  );
+}
 
 function driverValue(b: BeliefSnapshot | null, key: string): number | null {
   return b?.primary_drivers.find((d) => d.key === key)?.value ?? null;
@@ -530,6 +558,10 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
   const total = ep.turns.length;
   const denom = total - 1 || 1;
   const active = ep.turns[cur];
+  // CB-45: call-level timing summary from the LOCKED contract (means over agent turns that have
+  // timing). Both are nullable — a text/legacy call carries no timing and the stat is omitted.
+  const avgFirstToken = ep.avg_first_token_ms ?? null;
+  const avgStream = ep.avg_stream_ms ?? null;
   const togglePlay = () => {
     if (playing) {
       setPlaying(false);
@@ -581,6 +613,26 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
             <div className="l">Turns</div>
             <div className="v">{ep.turn_count}</div>
           </div>
+          {/* CB-45: call-level voice timing — mean time-to-first-token + mean stream duration over
+              this call's timed agent turns. Shown only when the call carries timing (avg fields are
+              non-null); a text/legacy call simply omits the stat. Human phrases, no raw ms key. */}
+          {avgFirstToken != null || avgStream != null ? (
+            <div className="rv-stat" data-testid="call-timing">
+              <div className="l">Voice timing</div>
+              <div
+                className="v"
+                style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                title="Average time-to-first-word and reply duration across this call's agent turns"
+              >
+                <Icon name="bolt" size={13} style={{ color: 'var(--accent)' }} />
+                {avgFirstToken != null ? `${fmtMsShort(avgFirstToken)} to first word` : null}
+                {avgFirstToken != null && avgStream != null ? (
+                  <span style={{ opacity: 0.45 }}>·</span>
+                ) : null}
+                {avgStream != null ? `${fmtMsShort(avgStream)} avg reply` : null}
+              </div>
+            </div>
+          ) : null}
           <div className="rv-stat">
             <div className="l">Version</div>
             <div className="v">
@@ -691,6 +743,11 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
                       </span>
                       {t.rationale ? <span className="rv-rat">{`"${humanizeRationale(t.rationale)}"`}</span> : null}
                       {latency ? <span className="rv-lat">{latency}</span> : null}
+                      {/* CB-45: voice-timing chips for this agent turn (omitted when the turn has no
+                          timing — text/legacy). first-token = how long until the agent started
+                          speaking; spoke-for = how long the reply streamed. Human phrases only. */}
+                      <TurnTimingChips timing={t.timing} />
+                      {/* end CB-45 */}
                       {/* CB-28: clickable affordance — this turn looked something up; reveal what. */}
                       {pulled ? (
                         <button

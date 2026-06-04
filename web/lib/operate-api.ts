@@ -9,6 +9,9 @@
 // fetchActiveCalls (/api/live/active), fetchLive now accepts an optional episodeId param, and
 // fetchSampleCall (/api/live/sample) for the "Show sample call" toggle in the empty state. CB-30 also
 // adds fetchGoldenEpisodes (GET /api/episodes/golden) to enumerate/export the golden set.
+// CB-45 display helpers: fmtMsShort (raw ms -> "0.8s"/"120ms"), fmtFirstToken ("0.8s to first word")
+// and fmtSpoke ("spoke for 1.4s") format the nullable CB-44 timing numbers into human phrases — they
+// never render a raw ms key and return "" on null so callers can omit the chip entirely.
 import { ApiError, API_BASE } from './api';
 import type {
   ActiveCallsResponse,
@@ -200,6 +203,32 @@ export function fmtTimeAgo(iso: string | null | undefined): string {
   if (hrs < 24) return `${hrs} hr ago`;
   const days = Math.round(hrs / 24);
   return days === 1 ? 'Yesterday' : `${days} days ago`;
+}
+
+/** CB-44/CB-45 timing -> a compact human duration. Sub-second reads as ms ("420ms"); ≥1s reads as
+ *  seconds with one decimal ("0.8s" is reserved for <1s already covered, so this is "1.4s"/"12s").
+ *  Null/0/negative -> "" so a caller can OMIT the chip rather than print a placeholder. Never shows
+ *  a raw ms integer with no unit, and never an internal key. */
+export function fmtMsShort(ms: number | null | undefined): string {
+  if (ms == null || ms <= 0) return '';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const secs = ms / 1000;
+  // ≥10s: no decimal (already coarse); otherwise one decimal so "0.8s"/"1.4s" read naturally.
+  return secs >= 10 ? `${Math.round(secs)}s` : `${secs.toFixed(1)}s`;
+}
+
+/** Time-to-first-token as a sentence-fragment label, e.g. "0.8s to first word". Null -> "". The
+ *  "first word" wording keeps it human (this is when the agent started speaking), not "first token". */
+export function fmtFirstToken(ms: number | null | undefined): string {
+  const t = fmtMsShort(ms);
+  return t ? `${t} to first word` : '';
+}
+
+/** Stream duration as a human phrase, e.g. "spoke for 1.4s" (how long the agent's reply streamed).
+ *  Null -> "". Used for both per-turn stream_duration_ms and a call's avg_stream_ms summary. */
+export function fmtSpoke(ms: number | null | undefined): string {
+  const t = fmtMsShort(ms);
+  return t ? `spoke for ${t}` : '';
 }
 
 /** Person/company name -> up-to-2-char initials for an avatar tile. */

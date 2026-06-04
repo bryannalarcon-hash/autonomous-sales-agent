@@ -39,14 +39,17 @@
 // is active, and ActiveAgentTurn renders snap.live_partial on the active turn (taking precedence over
 // the spinner/dots), so the words fill in near-real-time and the partial clears once the turn commits.
 // Both reuse the existing `.lv-speak` dots + inline styles (no new cadence.css tokens).
+// CB-45 (live timing): when the voice worker is streaming a turn it also carries snap.live_timing
+// (first-token + stream-elapsed). ActiveAgentTurn renders a small human timing readout in its header
+// ("0.8s to first word · speaking 1.2s") beside the "speaking…" label — Cadence tokens, no raw ms key.
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
-import { fetchActiveCalls, fetchLive, fetchSampleCall, fmtDuration, initials } from '@/lib/operate-api';
+import { fetchActiveCalls, fetchLive, fetchSampleCall, fmtDuration, fmtFirstToken, fmtMsShort, initials } from '@/lib/operate-api';
 import { archetypeLabel, versionLabel } from '@/lib/labels';
-import type { ActiveCallSummary, ActiveCallsResponse, BeliefSnapshot, LiveSnapshot, Turn } from '@/lib/operate-types';
+import type { ActiveCallSummary, ActiveCallsResponse, BeliefSnapshot, LiveSnapshot, LiveTiming, Turn } from '@/lib/operate-types';
 import { ApiError, API_BASE, startAutoDemo } from '@/lib/api';
 
 // Queue poll cadence. The 0-turn connect upsert (CB-32) makes a call appear the instant the room is
@@ -167,12 +170,16 @@ function ActiveAgentTurn({
   generating,
   streamReveal,
   livePartial,
+  liveTiming,
   lastAgentText,
 }: {
   generating: boolean;
   streamReveal: { text: string; seq: number } | null;
   // CB-31: the in-progress reply being streamed to TTS on a real voice call (snap.live_partial).
   livePartial?: string | null;
+  // CB-45: timing for the in-progress streamed turn (first-token + stream-elapsed), present only
+  // while a partial is in flight; rendered as a small human readout in the header.
+  liveTiming?: LiveTiming | null;
   // The text of the last committed agent turn in the snapshot — when it already equals the reveal
   // text, the snapshot has caught up so we stop revealing (no duplicate bubble).
   lastAgentText?: string | null;
@@ -190,11 +197,31 @@ function ActiveAgentTurn({
   const showLivePartial =
     !!livePartial && livePartial.length > 0 && lastAgentText !== livePartial;
 
+  // CB-45: live timing readout for the in-progress turn — "0.8s to first word" once the first token
+  // has landed, then "· speaking 1.2s" as the reply streams. Both pieces are independently nullable
+  // (first_token_ms can be null before the first token), so each clause is conditional; nothing shows
+  // until there's a real number. Only meaningful while the turn is actually streaming (showLivePartial).
+  const ftLabel = fmtFirstToken(liveTiming?.first_token_ms);
+  const elapsed = fmtMsShort(liveTiming?.stream_elapsed_ms);
+  const showLiveTiming = showLivePartial && (ftLabel !== '' || elapsed !== '');
+
   return (
     <div className="lv-turn a" data-testid="active-agent-turn">
       <div className="lv-th">
         Alex (agent)<span>·</span>
         {showLivePartial ? 'speaking…' : generating ? 'generating…' : 'now'}
+        {showLiveTiming ? (
+          <span
+            className="lv-lat"
+            data-testid="live-timing"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 5, marginLeft: 2 }}
+          >
+            <Icon name="bolt" size={11} style={{ color: 'var(--accent)' }} />
+            {ftLabel}
+            {ftLabel && elapsed ? <span style={{ opacity: 0.5 }}>·</span> : null}
+            {elapsed ? `speaking ${elapsed}` : null}
+          </span>
+        ) : null}
       </div>
       {showLivePartial ? (
         // CB-31: the real voice reply streamed so far (the SAME text the brain decided, surfaced as
@@ -421,6 +448,9 @@ function CallMonitor({
   // CB-31: the real voice worker's in-progress streamed reply for the active turn, carried on the
   // live snapshot (only present while active). Rendered on ActiveAgentTurn as the words it speaks.
   const livePartial = snap.live_partial ?? null;
+  // CB-45: timing for that same in-progress turn (first-token + stream-elapsed), present only while
+  // a partial streams. Rendered as a small human readout in the active turn's header.
+  const liveTiming = snap.live_timing ?? null;
   const ep = snap.episode!;
   const lastBelief = [...ep.turns].reverse().find((t) => t.belief)?.belief ?? null;
   const escalationImminent = snap.priority?.escalation_imminent ?? lastBelief?.escalation_imminent ?? false;
@@ -569,6 +599,7 @@ function CallMonitor({
                   generating={!!generating}
                   streamReveal={streamReveal ?? null}
                   livePartial={livePartial}
+                  liveTiming={liveTiming}
                   lastAgentText={
                     [...ep.turns].reverse().find((t) => t.speaker === 'agent')?.text ?? null
                   }
