@@ -106,9 +106,15 @@ async def _main(name: str, seed: int, max_turns: int, noise: float, persist: boo
     # Imported here so importing the module (for the programmatic helpers/tests) needs no network env.
     from dotenv import load_dotenv
 
+    from src.core import cost
     from src.core.llm import OpenRouterClient
 
     load_dotenv()
+    # CB-52: per-run cost tracking. reset() zeroes the in-process accumulator so the printed total is
+    # THIS run's spend; LLM_COST_LOG (default the gitignored eval log) makes every LLM call append a
+    # per-call line to a durable cross-process ledger (feeds docs/eval-budget-ledger.md).
+    cost.reset()
+    os.environ.setdefault("LLM_COST_LOG", "docs/eval-cost-log.jsonl")
     agent_model = os.environ.get("AGENT_MODEL", "anthropic/claude-sonnet-4.5")
     sim_model = os.environ.get("SIM_MODEL", "openai/gpt-4o")
     config = load_config("champion_v0")
@@ -154,6 +160,7 @@ async def _main(name: str, seed: int, max_turns: int, noise: float, persist: boo
         f"turns={result['turn_count']} qualified={result['qualified']} "
         f"disqualifier={result['disqualifier']} cohort={result['cohort']}"
     )
+    print(cost.format_snapshot())  # CB-52: this run's measured OpenRouter spend, per model
     return 0
 
 

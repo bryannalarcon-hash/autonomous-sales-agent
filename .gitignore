@@ -42,3 +42,7 @@ auto-sales-agent.zip
 
 # Playwright E2E screenshots (regenerable, not repo content)
 tests/e2e/shots/
+
+# Local OpenRouter spend ledger (per-machine ops doc, not repo content)
+docs/eval-budget-ledger.md
+docs/eval-cost-log.jsonl

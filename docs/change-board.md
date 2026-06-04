@@ -131,6 +131,15 @@
 - **Constraints checked:** no internal-index/slug leak in rendered timing; null-tolerant so it shipped independent of CB-44 landing. Contract field names match the backend exactly (verified against operate.py).
 - **Follow-ups / known gaps:** real-data render (vs mock harness) to be eyeballed once a live/stored call carries timing.
 
+### CB-52 — Per-call LLM cost accounting (automatic spend ledger)
+- **Type / Surface / Size:** feature · `core` (`src/core`) · `sim` · M
+- **Completed:** 2026-06-04
+- **Files changed (actual):** `src/core/cost.py` (NEW — in-process accumulator + optional JSONL ledger + `python -m src.core.cost` rollup), `src/core/llm.py` (request `usage:{include:true}`; record `usage.cost` from `complete` + the stream's final usage chunk via new `_sse_usage`), `src/sim/eval_personas.py` (reset + set `LLM_COST_LOG` + print `RUN COST` per run), `tests/unit/test_cost.py` (NEW, 6), `.gitignore` (eval-cost-log.jsonl + eval-budget-ledger.md). Feeds `docs/eval-budget-ledger.md`.
+- **What changed:** replaced hand-estimated spend (which was ~10–17× off) with REAL per-call cost. OpenRouter returns `usage.cost` when asked; the client now records it per call into a thread-safe accumulator (grand total + per-model + tokens) and, when `LLM_COST_LOG` is set, appends one JSONL line per call. Each eval run prints `RUN COST: $X over N calls — <by model>`. Best-effort — `record_usage` NEVER raises into the call path; the mock client + tests stay at $0 with no file writes.
+- **Verification:** test_cost 6 passed; llm + streaming-parity 30 passed; full non-voice suite **613 passed/5 skipped**. Real Marcus run printed `RUN COST: $0.0397 over 24 LLM calls` (sonnet NLG $0.0358 = ~90%, gpt-5-mini $0.0024, gpt-4o-mini $0.0011, gpt-5-nano $0.0005); JSONL rollup matched exactly. Token-stream PARITY preserved (the usage-only final chunk has empty choices → never yielded; `complete()`==concat(stream) tests green). R37: cost is metadata only, brain decision untouched.
+- **Constraints checked:** R37 (no decision change; reply==concat(tokens)); never raises into the call path; API key never logged; ledger files gitignored.
+- **Follow-ups / known gaps:** capture is wired in the OpenRouterClient, so it's automatic for ANY entry point that sets `LLM_COST_LOG` (eval CLI does by default); the API server / voice worker could opt in too. `usage_daily` lags the per-call sum — trust RUN COST / the JSONL rollup.
+
 ### CB-51 — Widen anti-repetition window + honest-pivot rule (Dana stat-cycling)
 - **Type / Surface / Size:** change · `core` (`src/core`) · S
 - **Completed:** 2026-06-04

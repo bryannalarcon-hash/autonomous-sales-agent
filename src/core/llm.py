@@ -31,6 +31,8 @@ from typing import (
 import httpx
 from dotenv import load_dotenv
 
+from src.core import cost  # CB-52: per-call cost accounting sink (best-effort, never raises)
+
 # Messages are OpenAI-style chat dicts: {"role": "system"|"user"|"assistant", "content": str}.
 Message = dict[str, str]
 
@@ -114,6 +116,25 @@ def _sse_content_delta(data_line: str) -> Optional[str]:
     except (AttributeError, IndexError, TypeError):
         return None
     return content if isinstance(content, str) else None
+
+
+def _sse_usage(data_line: str) -> Optional[dict[str, Any]]:
+    """Parse ONE SSE `data:` payload for a top-level `usage` object, or None (CB-52). With
+    usage:{include:true}, OpenRouter sends a FINAL chunk carrying `usage` (cost + token counts) and
+    empty `choices` — _sse_content_delta returns None for it (no content), so token parity is intact;
+    this picks the usage out so the cost sink can record it. Cheap pre-check on the `"usage"` substring
+    avoids json-parsing every content chunk."""
+    line = (data_line or "").strip()
+    if line.startswith("data:"):
+        line = line[len("data:"):].strip()
+    if not line or line == "[DONE]" or '"usage"' not in line:
+        return None
+    try:
+        obj = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    usage = obj.get("usage") if isinstance(obj, dict) else None
+    return usage if isinstance(usage, dict) else None
 
 
 @runtime_checkable
@@ -238,6 +259,8 @@ class OpenRouterClient(_JsonHelperMixin):
         body: dict[str, Any] = {
             "model": model or self.model,
             "messages": list(messages),
+            # CB-52: ask OpenRouter to include real per-call cost (credits) in the response usage block.
+            "usage": {"include": True},
             **opts,
         }
         if response_format is not None:
@@ -259,6 +282,8 @@ class OpenRouterClient(_JsonHelperMixin):
                     )
                     resp.raise_for_status()
                     data = resp.json()
+                # CB-52: record this call's real cost (best-effort; record_usage never raises).
+                cost.record_usage(body["model"], data.get("usage"))
                 return data["choices"][0]["message"]["content"]
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
@@ -301,6 +326,8 @@ class OpenRouterClient(_JsonHelperMixin):
             "model": model or self.model,
             "messages": list(messages),
             "stream": True,
+            # CB-52: include cost in the final usage chunk of the stream (empty choices -> not a token).
+            "usage": {"include": True},
             **opts,
         }
         if response_format is not None:
@@ -325,6 +352,12 @@ class OpenRouterClient(_JsonHelperMixin):
                             if token:
                                 yielded_any = True
                                 yield token
+                                continue
+                            # CB-52: the non-content final chunk carries usage (cost) — record it,
+                            # never yield it (token parity: concat(yielded) == complete() reply).
+                            usage = _sse_usage(raw_line)
+                            if usage is not None:
+                                cost.record_usage(body["model"], usage)
                 return
             except httpx.HTTPStatusError as exc:
                 # If a status surfaced we have not started yielding (raise_for_status runs before the
