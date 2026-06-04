@@ -21,6 +21,11 @@
 # CB-35: after the gated decision, respond() records the asked discovery slot on new_belief.meta
 # (asked_slots count + pending_ask_slot) so the no-repeat guard drops over-asked slots and the next
 # turn's DST grade-extraction knows the grade was just asked. Carried across the call by BeliefState.copy().
+# CB-48 (anti-repetition): respond/respond_stream extract the agent's OWN last 1-2 spoken lines from
+# `history` and thread them to NLG (realize/realize_stream, in lock-step) so the prompt can forbid
+# restating the same hedge/offer. ONLY the agent's lines are passed (never the caller transcript) — the
+# distillation-preserving choice (no new inventable facts). Public respond/respond_stream signatures are
+# unchanged (history is already a param), so the voice worker is unaffected.
 from __future__ import annotations
 
 import logging
@@ -76,6 +81,29 @@ def _last_agent_act(history: Optional[Sequence[Any]]) -> Optional[str]:
             act = turn.get("act")
             return str(act) if act is not None else None
     return None
+
+
+def _own_last_lines(history: Optional[Sequence[Any]], n: int = 2) -> list[str]:
+    """The agent's OWN last `n` spoken lines from history, oldest-first (CB-48 anti-repetition).
+
+    Scans history most-recent-first for agent turns (role in assistant/agent) and collects their
+    spoken text (the selfplay/voice shape writes it under "text"; older fixtures used "content"),
+    skipping blanks, until `n` are gathered. ONLY the agent's lines are returned — the caller
+    transcript is intentionally excluded so threading these into NLG cannot introduce a new fact
+    (distillation-preserving). Returned oldest->newest so the prompt reads chronologically."""
+    if not history:
+        return []
+    collected: list[str] = []
+    for turn in reversed(list(history)):
+        if not isinstance(turn, dict) or turn.get("role") not in ("assistant", "agent"):
+            continue
+        text = str(turn.get("text", turn.get("content", "")) or "").strip()
+        if not text:
+            continue
+        collected.append(text)
+        if len(collected) >= n:
+            break
+    return list(reversed(collected))
 
 
 @dataclass
@@ -235,7 +263,9 @@ async def respond(
     )
 
     reply_text = await realize(
-        decision, new_belief, config, llm_client, retrieved_facts=retrieved_facts
+        decision, new_belief, config, llm_client,
+        retrieved_facts=retrieved_facts,
+        own_last_lines=_own_last_lines(history),  # CB-48: no-restate context (own lines only)
     )
     t3 = time.perf_counter()
 
@@ -277,9 +307,13 @@ async def respond_stream(
     holder.decision = decision
     holder.new_belief = new_belief
 
+    # CB-48: the SAME own-line context the blocking path threads (R37 parity — respond + respond_stream
+    # feed NLG identical YOUR_LAST_LINES, so the streamed prompt cannot drift the no-restate guidance).
+    own_lines = _own_last_lines(history)
     parts: list[str] = []
     async for token in realize_stream(
-        decision, new_belief, config, llm_client, retrieved_facts=retrieved_facts
+        decision, new_belief, config, llm_client,
+        retrieved_facts=retrieved_facts, own_last_lines=own_lines,
     ):
         parts.append(token)
         yield token

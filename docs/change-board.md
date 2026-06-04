@@ -124,20 +124,6 @@
 - **Notes / blockers:** HARD INVARIANT — the honest buy-gate must stay PURE/DETERMINISTIC: budget + qualified + per-tier ceiling immutable to talk; a commitment fires ONLY on the agent's `attempt_close` at the offered tier. Do NOT let "more turns" come from breaking that (e.g., never auto-commit / never move budget). Regenerating transcripts is paid LLM self-play — bounded batch first.
 - **Notes:** DONE + committed (1d9cdec): conviction coupling fixed the binding constraint; N=10 verify = 6/7 qualified close, 0/3 unqualified, avg ~19 turns, buy-gate intact. (Board kept here for history.)
 
-### CB-48 — Production-brain directness + anti-repetition (the failures all 3 eval personas exposed)
-- **Type / Surface / Size:** change · `core` (`src/core`) · M/L
-- **Owner:** coder-brain + orchestrator
-- **Started:** 2026-06-04
-- **Prereqs met?:** yes (CB-43 personas are the regression harness)
-- **Why (measured, all 3 baselines):** Marcus hedged "can you move his score in 5 weeks?" 4× and got asked a discovery question after "no fluff" (walked); Dana asked for concrete proof 5× and was deflected every time while the agent pushed "free consultation" 5× (shallow win); Pat (no-authority) was escalated to a human in 1 turn. Cluster: (1) REPETITION — NLG restates the same line/offer because it sees no turn history / no own prior line; (2) EVADES the core question — closes/deflects instead of answering the recurring open_question/objection; (3) over-discovers under impatience.
-- **Plan (checklist) — conservative, minimal-change, full-suite-green each step:**
-  - [ ] **Anti-repetition (NLG own prior line):** thread the agent's last 1–2 spoken lines into `nlg._build_messages` (via `respond.py` / `respond_stream`, which have `history`) with an instruction: "do NOT restate a point/offer you already made; if the decided act repeats your last line, rephrase substantively or advance." Preserves the distillation (own line only — NOT the caller transcript; no new inventable facts). Update `realize` AND `realize_stream`.
-  - [ ] **Directness:** make `address_direct_input` (or a sibling gate) ALSO fire when the prospect has a RECURRING unanswered open_question/objection or is impatient (high bail_risk / low decision_confidence), so the agent answers it before re-pushing a close; and suppress a discovery `ask`/`confirm_known` when bail_risk is high (don't slot-fill a hot, impatient prospect). Investigate WHY Marcus's challenge-questions and Dana's proof-demands weren't classified as `open_question` (DST) — fix the classification if that's the gap.
-  - [ ] TDD: add a regression test reproducing the Marcus pattern (repeated hedge / discovery-under-impatience) — red first; then green. Keep the FULL non-voice suite green (573) — if a directness change breaks the pitch/close tests, NARROW it, don't paper over.
-  - [ ] Re-run Marcus + Dana evals; report whether repetition drops + the core question gets answered + outcomes hold/improve (don't break Pat's disqualify path).
-- **Files being touched:** `src/core/nlg.py`, `src/core/respond.py`, `src/core/policy.py`, `src/core/gates.py`, possibly `src/core/dst.py` (objection/question classification); `tests/unit/` regression.
-- **Notes / blockers:** R37 parity — `respond()` and `respond_stream()` stay in lock-step (reply == concat(tokens)); the own-line context goes to BOTH. Buy-gate stays pure. This is delicate, behavior-changing core work: minimal change, verify the full suite + re-run the eval, loop coder→verify→review ≤3 rounds. The concrete-PROOF gap (Dana) is likely a KB-content shortfall (no success-story facts to retrieve) — that's CB-49 (data), NOT this brain pass.
-
 ---
 
 ## Done
@@ -162,6 +148,16 @@
 - **Verification:** `cd web && npx tsc --noEmit` clean (exit 0). Cadence dark tokens reused (no new visual language); human phrases only, no raw key/slug renders. Screenshot via a temp mock harness (backend wasn't up) confirmed all four phrases render — `tests/e2e/shots/cb45_timing.png`; harness deleted after capture.
 - **Constraints checked:** no internal-index/slug leak in rendered timing; null-tolerant so it shipped independent of CB-44 landing. Contract field names match the backend exactly (verified against operate.py).
 - **Follow-ups / known gaps:** real-data render (vs mock harness) to be eyeballed once a live/stored call carries timing.
+
+### CB-48 — Production-brain directness + anti-repetition (verified against the 3 eval personas)
+- **Type / Surface / Size:** change · `core` (`src/core`) · M
+- **Completed:** 2026-06-04
+- **Files changed (actual):** `src/core/nlg.py` (`_build_messages`/`realize`/`realize_stream` accept `own_last_lines` → `YOUR_LAST_LINES` block + no-restate instruction), `src/core/respond.py` (`_own_last_lines(history)` threaded into BOTH `respond` and `respond_stream`), `src/core/gates.py` (`_question_recurs` content-word recurrence; `address_direct_input` answers a recurring question even over pitch/close + suppresses discovery `ask`/`confirm_known` at high bail_risk; `advance_to_close` recurring-question guard), `tests/unit/test_cb48_directness.py` (NEW, 13 cases).
+- **What changed:** (1) ANTI-REPETITION — NLG now sees the agent's OWN last 1-2 lines (not the caller transcript → distillation preserved, no new inventable facts) and is told not to restate; threaded identically to `realize` + `realize_stream`. (2) DIRECTNESS — a RECURRING unanswered question (content-word overlap with an earlier turn) forces `answer_via_kb` before any pitch/close; a discovery ask under high bail_risk (≥ pushiness cap) is redirected to answer/advance. A genuinely NEW question keeps the reactive-loop escape (so the agent isn't trapped answering forever).
+- **Verification:** full non-voice suite **586 passed / 5 skipped** (573 baseline + 13 new, zero existing tests broken/adjusted); R37 parity `test_respond_stream`+`test_respond_timing` 8 passed; voice integration 10 passed. TDD red-first (8 failed → green). Orchestrator re-verified all suites + read the gates/respond/nlg diffs.
+- **Eval re-runs (real models, before → after):** **Marcus** — repetition gone (every turn a distinct framing), ZERO discovery questions (was asking "his score?" under pressure), answered the core "5 weeks?" with a concrete "50–100 points"; still walks t6 (he demands a yes/no guarantee an honest agent won't give → CB-49 proof gap). **Dana** — the verbatim "free consultation ×5" is gone; agent varies + directly engages the proof demand (honestly reframes to trial + progress tracking); the remaining "no concrete Algebra proof" is the CB-49 KB gap. **Pat** — disqualify path INTACT (escalated t2, qualified=False/no_authority, no false close).
+- **Constraints checked:** R37 parity (both paths thread the same own-lines — asserted by test; reply == concat(tokens)); buy-gate pure + untouched; own-lines only (not caller transcript). Headers updated. One assertion in coder's OWN new test scoped to the YOUR_LAST_LINES block (caller question legitimately still appears under brain-derived PROSPECT_ASKED) — no existing test modified.
+- **Follow-ups / known gaps:** the residual on Marcus/Dana is the **concrete-proof KB gap → CB-49** (data, not brain). Pat over-escalation → CB-50 still open.
 
 ### CB-47 — Perceived-latency filler masks the DST+Policy prelude (no more dead air on ring)
 - **Type / Surface / Size:** feature · `voice-worker` · S

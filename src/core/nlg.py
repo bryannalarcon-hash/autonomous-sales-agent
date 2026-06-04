@@ -17,6 +17,11 @@
 # CB-36 (no invented conversational context): a second hard rule forbids referencing any objection,
 # topic, or concern the prospect did NOT raise, and requires acknowledging a disclosure/complaint
 # before any pitch. Both rules are appended LAST so an authored config prompt can't override them.
+# CB-48 (anti-repetition): _build_messages now also accepts own_last_lines — the agent's OWN last 1-2
+# SPOKEN turns (threaded from respond/respond_stream, which hold the history). When present they are
+# surfaced as YOUR_LAST_LINES with an instruction NOT to restate a point/offer already made (rephrase
+# substantively or advance). ONLY the agent's own lines are passed — never the caller transcript — so
+# the distillation is preserved (no new inventable facts). realize + realize_stream stay in lock-step.
 from __future__ import annotations
 
 from typing import Any, AsyncIterator, Optional, Sequence
@@ -128,13 +133,46 @@ def _grounding_block(retrieved_facts: Optional[Sequence[Any]]) -> str:
     )
 
 
+# CB-48 (anti-repetition): the instruction that accompanies YOUR_LAST_LINES — do NOT restate a point
+# or offer already made; if the decided act would repeat the last line, rephrase substantively or move
+# the conversation forward. Kept as a named constant so realize/realize_stream share the exact wording.
+_NO_RESTATE_INSTRUCTION = (
+    "Do NOT restate a point or offer you already made in YOUR_LAST_LINES; if the decided act would "
+    "repeat what you just said, either rephrase it substantively (a genuinely new angle, not the same "
+    "sentence reworded) or move the conversation forward."
+)
+
+
+def _own_lines_block(own_last_lines: Optional[Sequence[Any]]) -> str:
+    """Render the agent's OWN last 1-2 spoken lines into a YOUR_LAST_LINES block, or "" if none (CB-48).
+
+    ONLY the agent's own lines are surfaced (the caller transcript is intentionally never passed in) so
+    the distillation is preserved — no new inventable facts enter the prompt, only what the agent itself
+    already said, so the model can avoid restating it. Empty/blank lines are dropped; nothing is shown
+    when there is no prior agent line (turn 1), keeping the opening turn's prompt unchanged."""
+    if not own_last_lines:
+        return ""
+    lines = [str(s).strip() for s in own_last_lines if str(s).strip()]
+    if not lines:
+        return ""
+    rendered = "\n".join(f"- {ln}" for ln in lines)
+    return "YOUR_LAST_LINES (your own recent turns — do not repeat them):\n" + rendered
+
+
 def _build_messages(
     decision: Any,
     belief: BeliefState,
     config: AgentConfig,
     retrieved_facts: Optional[Sequence[Any]],
+    *,
+    own_last_lines: Optional[Sequence[Any]] = None,
 ) -> list[Message]:
-    """Assemble persona + act-specific + grounding messages for the realization call."""
+    """Assemble persona + act-specific + grounding messages for the realization call.
+
+    own_last_lines (CB-48) are the agent's OWN last 1-2 spoken turns (threaded from respond/
+    respond_stream). When present they are surfaced as YOUR_LAST_LINES plus a do-not-restate
+    instruction so NLG stops repeating the same hedge/offer; only the agent's own lines are passed
+    (never the caller transcript), preserving the distillation."""
     guidance = _ACT_GUIDANCE.get(decision.act, "Respond helpfully and warmly.")
     if decision.act == "attempt_close" and decision.tier in _TIER_GUIDANCE:
         guidance = f"{guidance} {_TIER_GUIDANCE[decision.tier]}"
@@ -147,6 +185,7 @@ def _build_messages(
     # Surface what the prospect actually asked so answer_via_kb answers THAT (not "remind me what you
     # wanted to know") and handle_objection addresses the specific objection.
     open_q = getattr(belief, "open_question", None)
+    own_block = _own_lines_block(own_last_lines)
     parts = [
         f"NEXT_ACT: {decision.act}",
         f"TARGET_SLOT: {decision.target_slot}" if decision.target_slot else "",
@@ -155,6 +194,10 @@ def _build_messages(
         f"PROSPECT_ASKED: {open_q!r}" if open_q else "",
         f"KNOWN_SO_FAR: {known}" if known else "",
         f"ACTIVE_OBJECTION: {belief.active_objection}" if belief.active_objection else "",
+        # CB-48: the agent's own prior lines + a no-restate instruction (only when there are lines, so
+        # the opening turn's prompt is unchanged).
+        own_block,
+        _NO_RESTATE_INSTRUCTION if own_block else "",
         _grounding_block(retrieved_facts),
         "Write ONLY the agent's next spoken line (1-3 short sentences). No prefaces, no quotes.",
     ]
@@ -172,16 +215,20 @@ async def realize(
     llm_client: LLMClient,
     *,
     retrieved_facts: Optional[Sequence[Any]] = None,
+    own_last_lines: Optional[Sequence[Any]] = None,
 ) -> str:
     """Realize a gated Decision into one persona-consistent, voice-shaped reply string.
 
     The decision has ALREADY passed the gates (policy returns the gated decision), so NLG only has
     to phrase it. When retrieved_facts is supplied (U5 KB grounding) the prompt constrains the reply
-    to those facts. The reply is whitespace-trimmed; a blank LLM reply — OR any call failure (a real
-    OpenRouter 429/5xx/timeout that outlived the client's bounded retry, FINDING 2) — degrades to a
-    safe filler so the caller always gets a non-empty turn instead of a crash.
+    to those facts. own_last_lines (CB-48) carries the agent's own last 1-2 spoken turns so the prompt
+    can forbid restating them. The reply is whitespace-trimmed; a blank LLM reply — OR any call failure
+    (a real OpenRouter 429/5xx/timeout that outlived the client's bounded retry, FINDING 2) — degrades
+    to a safe filler so the caller always gets a non-empty turn instead of a crash.
     """
-    messages = _build_messages(decision, belief, config, retrieved_facts)
+    messages = _build_messages(
+        decision, belief, config, retrieved_facts, own_last_lines=own_last_lines
+    )
     try:
         text = await llm_client.complete(messages)
     except Exception:
@@ -200,6 +247,7 @@ async def realize_stream(
     llm_client: LLMClient,
     *,
     retrieved_facts: Optional[Sequence[Any]] = None,
+    own_last_lines: Optional[Sequence[Any]] = None,
 ) -> AsyncIterator[str]:
     """STREAM a gated Decision into a persona-consistent reply, yielding tokens as they generate.
 
@@ -207,6 +255,8 @@ async def realize_stream(
     produces (so the decided content is identical to the blocking path) and yields each content token
     from llm_client.complete_stream in order. The concatenation of every yielded token is the reply
     (the voice worker accumulates them and the committed Turn.text is that assembly — R37 parity).
+    own_last_lines (CB-48) is threaded identically to realize() so the streamed prompt forbids the same
+    restatement (R37: respond + respond_stream pass the SAME own-lines).
 
     Robustness mirrors realize(): if the stream errors before ANY token is produced — or produces only
     whitespace — we yield the SAME safe filler the blocking path falls back to, so the caller always
@@ -215,7 +265,9 @@ async def realize_stream(
     trimmed so the reply does not start with stray spaces (matching realize()'s .strip() on the head),
     while interior/trailing whitespace is preserved so the assembled text reads naturally.
     """
-    messages = _build_messages(decision, belief, config, retrieved_facts)
+    messages = _build_messages(
+        decision, belief, config, retrieved_facts, own_last_lines=own_last_lines
+    )
     produced_any = False
     seen_nonspace = False
     try:

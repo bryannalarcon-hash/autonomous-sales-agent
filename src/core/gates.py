@@ -16,14 +16,21 @@
 #                         tiers, instead of looping or releasing. Runs LAST (final say).
 #   address_direct_input— a live objection or a direct question (from the DST intent classifier)
 #                         pre-empts a discovery/pitch act (-> handle_objection / answer_via_kb) so the
-#                         agent never ignores what the prospect just asked — BUT once it has answered
-#                         it lets a `pitch` ADVANCE (escapes the reactive answer-loop; never blocks close).
+#                         agent never ignores what the prospect just asked — BUT once it has answered a
+#                         NEW question it lets a `pitch` ADVANCE (escapes the reactive answer-loop).
+#                         CB-48: a RECURRING unanswered question (the prospect re-asking the SAME thing
+#                         after an answer attempt) is ANSWERED again — even over a proposed pitch OR a
+#                         close — so the agent stops evading the core concern; AND a discovery ask/
+#                         confirm under HIGH bail_risk is suppressed (answer/advance, never slot-fill a
+#                         hot, impatient prospect).
 #   must_clear_objection— forbid pivot-to-close while active_objection is set (-> handle_objection).
 #   price_gate          — don't open price/budget before a trust event (prospect asked unprompted
 #                         OR a value-ack/trust threshold OR required discovery slots filled).
 #   advance_to_close    — once the belief is closeable (no objection, warmed trust, enough turns),
 #                         convert a reactive act into attempt_close so the agent ASKS for the sale
-#                         instead of answering questions forever (the can't-close fix).
+#                         instead of answering questions forever (the can't-close fix). CB-48: it will
+#                         NOT take close-initiative over a RECURRING unanswered question (don't re-
+#                         convert address_direct_input's answer back into a close on a warm prospect).
 #   close_floor         — CB-29: forbid a PAID close (consultation/trial/enrollment) until real
 #                         discovery (min turns + enough filled discovery slots), applied to a directly
 #                         LLM-PROPOSED close too — kills the premature/pushy close. callback is exempt.
@@ -35,6 +42,7 @@
 # (gates copy + mutate the incoming Decision) so there is no import cycle with policy.py.
 from __future__ import annotations
 
+import re
 from typing import Any, Optional, Sequence
 
 from src.config.settings import AgentConfig
@@ -311,6 +319,18 @@ def offer_low_commitment_on_budget(decision: Any, belief: BeliefState, config: A
 # Discovery/pitch acts that must yield to an unanswered question or a live objection (R35 discovery
 # is good, but never at the cost of ignoring what the prospect just said).
 _DEFERRABLE_ACTS = frozenset({"ask", "confirm_known", "pitch"})
+# Discovery acts the agent must NOT use to slot-fill a hot, impatient prospect (CB-48: suppress under
+# high bail). pitch is excluded — re-anchoring on value is a legitimate move on a hot prospect, and
+# the recurring-question / objection checks already redirect a pitch when there's something to address.
+_DISCOVERY_ACTS = frozenset({"ask", "confirm_known"})
+# Stop-words stripped before comparing two questions for recurrence (CB-48): they carry no topical
+# signal, so two questions are "the same" when their CONTENT words substantially overlap.
+_RECUR_STOPWORDS = frozenset({
+    "the", "a", "an", "to", "of", "in", "on", "for", "and", "or", "is", "are", "do", "does", "did",
+    "can", "could", "you", "your", "i", "we", "he", "she", "it", "they", "me", "my", "him", "her",
+    "this", "that", "what", "how", "when", "why", "who", "which", "will", "would", "so", "just",
+    "not", "or", "really", "actually", "tell", "give", "with", "at", "be", "have", "has", "out",
+})
 
 
 def _prev_agent_act(history: Optional[Sequence[Any]]) -> Optional[str]:
@@ -323,6 +343,38 @@ def _prev_agent_act(history: Optional[Sequence[Any]]) -> Optional[str]:
             act = turn.get("act")
             return str(act) if act is not None else None
     return None
+
+
+def _content_words(text: Optional[str]) -> set[str]:
+    """Lower-cased alphanumeric content words of a question, minus stop-words (CB-48 recurrence)."""
+    if not text:
+        return set()
+    words = re.findall(r"[a-z0-9']+", str(text).lower())
+    return {w for w in words if w not in _RECUR_STOPWORDS and len(w) > 1}
+
+
+def _question_recurs(belief: BeliefState, history: Optional[Sequence[Any]]) -> bool:
+    """True when the prospect's CURRENT open_question substantially repeats one they asked EARLIER in
+    the call (CB-48). This is the "Marcus asked 4x and got evaded" signal: the same challenge re-asked
+    after an answer attempt. We compare CONTENT-word overlap (stop-words stripped) between the current
+    open_question and each PRIOR user turn; >=2 shared content words (or a near-total overlap of a
+    short question) counts as a recurrence. Conservative: a brand-new question won't match, so the
+    reactive-loop escape still fires for genuinely new questions."""
+    if not history:
+        return False
+    current = _content_words(getattr(belief, "open_question", None))
+    if len(current) < 2:
+        return False  # too thin to judge recurrence reliably; treat as new (don't trap the agent)
+    # Look at PRIOR user turns only (skip the latest, which mirrors the current open_question).
+    user_turns = [t for t in history if isinstance(t, dict) and t.get("role") == "user"]
+    for turn in user_turns[:-1] if user_turns else []:
+        prior = _content_words(turn.get("text", turn.get("content", "")))
+        if not prior:
+            continue
+        shared = current & prior
+        if len(shared) >= 2 or (shared and len(shared) >= max(1, len(current) - 1)):
+            return True
+    return False
 
 
 def address_direct_input(
@@ -339,11 +391,40 @@ def address_direct_input(
     routes a discovery/pitch proposal: handle_objection when an objection is live, answer_via_kb when
     they asked a question. BUT a prospect who asks a question every single turn would otherwise pin
     the agent to answer_via_kb forever and it would never advance to a close (the reactive-loop bug).
-    So if the agent ALREADY answered last turn, a proposed `pitch` is allowed to ADVANCE this turn
-    instead of answering yet again; `ask`/`confirm_known` still defer (answer before MORE discovery —
-    M2). Acts that already address the prospect (answer_via_kb/handle_objection) or advance/close/
-    escalate/disqualify are left to the close-path + escalation gates (attempt_close is never deferred
-    here, so the policy can always close)."""
+    So if the agent ALREADY answered a NEW question last turn, a proposed `pitch` is allowed to ADVANCE
+    this turn instead of answering yet again; `ask`/`confirm_known` still defer (answer before MORE
+    discovery — M2).
+
+    CB-48 (directness — Marcus/Dana failures):
+      • RECURRING unanswered question: when the prospect re-asks the SAME thing (content-word overlap
+        with an earlier turn), the agent was EVADING it — the pitch-escape fired and even a close got
+        pushed over the unanswered challenge. So a recurring open_question forces answer_via_kb even
+        over a proposed `pitch` AND a proposed `attempt_close` (answer the core concern before re-
+        pushing). A genuinely NEW question keeps the reactive-loop escape (pitch may advance).
+      • HIGH bail_risk suppresses discovery: a discovery `ask`/`confirm_known` proposed while bail_risk
+        is at/above the pushiness cap (a hot, impatient prospect — "no fluff") is redirected to answer
+        their open question if any, else a value pitch. We do NOT slot-fill someone about to walk.
+
+    Acts that already address the prospect (answer_via_kb/handle_objection) or escalate/disqualify are
+    left to the close-path + escalation gates."""
+    recurring_q = (
+        bool(belief.open_question)
+        and belief.last_user_act in ("question", "price_inquiry")
+        and _question_recurs(belief, history)
+    )
+    # CB-48: a RECURRING unanswered question must be answered BEFORE a close — pre-empt a proposed
+    # attempt_close (which is otherwise never deferred here) so the agent stops re-pushing over it.
+    if recurring_q and decision.act == "attempt_close":
+        out = decision.copy()
+        out.act = "answer_via_kb"
+        out.tier = None
+        out.target_slot = None
+        out.rationale = (
+            "address_direct_input: prospect re-asked an unanswered question; answering it before any "
+            "close attempt (CB-48 directness)"
+        )
+        return out
+
     if decision.act not in _DEFERRABLE_ACTS:
         return decision
     if belief.active_objection:
@@ -357,15 +438,32 @@ def address_direct_input(
         )
         return out
     if belief.open_question and belief.last_user_act in ("question", "price_inquiry"):
-        # Escape the answer-loop: if we just answered, let a pitch advance the sale rather than
-        # answering the next question too (otherwise an inquisitive prospect blocks every close).
-        if decision.act == "pitch" and _prev_agent_act(history) == "answer_via_kb":
+        # Escape the answer-loop ONLY for a genuinely NEW question: if we just answered and the prospect
+        # asked something DIFFERENT, let a pitch advance the sale (an inquisitive prospect shouldn't
+        # block every close). A RECURRING, still-unanswered question does NOT escape — keep answering it
+        # (CB-48: Marcus asked the same challenge 4x and got pitched at instead of answered).
+        if decision.act == "pitch" and _prev_agent_act(history) == "answer_via_kb" and not recurring_q:
             return decision
         out = decision.copy()
         out.act = "answer_via_kb"
         out.tier = None
         out.rationale = "address_direct_input: prospect asked a direct question; answering before more discovery"
         return out
+    # CB-48: suppress a discovery ask/confirm on a HOT, impatient prospect (high bail) — don't slot-fill
+    # someone about to walk. With nothing to answer (no open question handled above), advance with a
+    # value pitch instead of pushing another discovery question. Tight: only fires at/above the cap.
+    if decision.act in _DISCOVERY_ACTS:
+        bail = float(belief.drivers.get("bail_risk", 0.0))
+        if bail >= _threshold(config, "pushiness_cap"):
+            out = decision.copy()
+            out.act = "pitch"
+            out.target_slot = None
+            out.tier = None
+            out.rationale = (
+                f"address_direct_input: bail_risk {bail:.2f} high; not slot-filling an impatient "
+                "prospect — re-anchoring on value instead (CB-48 directness)"
+            )
+            return out
     return decision
 
 
@@ -421,6 +519,16 @@ def advance_to_close(
     acknowledges what they asked (not a dodge). Runs BEFORE pushiness_cap (which can veto an over-
     aggressive close) and offer_low_commitment_on_budget."""
     if int(belief.turn_count) < int(_threshold(config, "min_turns_before_close")):
+        return decision
+    # CB-48: never take close-initiative OVER a RECURRING unanswered question (the prospect re-asking
+    # the same challenge). address_direct_input already routes such a turn to answer_via_kb; without
+    # this guard advance_to_close would re-convert that answer back into a close on a warm prospect,
+    # silently undoing the directness fix (answer the core concern before re-pushing the close).
+    if (
+        belief.open_question
+        and belief.last_user_act in ("question", "price_inquiry")
+        and _question_recurs(belief, history)
+    ):
         return decision
     objection_open = bool(belief.active_objection)
     breakthrough = objection_open and _recent_objection_handles(history) >= _BREAKTHROUGH_OBJECTION_HANDLES
