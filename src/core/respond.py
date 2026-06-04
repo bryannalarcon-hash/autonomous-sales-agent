@@ -83,8 +83,12 @@ def _last_agent_act(history: Optional[Sequence[Any]]) -> Optional[str]:
     return None
 
 
-def _own_last_lines(history: Optional[Sequence[Any]], n: int = 2) -> list[str]:
+def _own_last_lines(history: Optional[Sequence[Any]], n: int = 4) -> list[str]:
     """The agent's OWN last `n` spoken lines from history, oldest-first (CB-48 anti-repetition).
+
+    CB-51: widened 2 -> 4 because a thin-proof persona (Dana) restated the SAME stat several turns
+    apart and a 2-line window missed it; 4 lines covers the recent cycle the model tends to loop on
+    without bloating the prompt (still only the agent's OWN lines — no caller transcript).
 
     Scans history most-recent-first for agent turns (role in assistant/agent) and collects their
     spoken text (the selfplay/voice shape writes it under "text"; older fixtures used "content"),

@@ -131,6 +131,15 @@
 - **Constraints checked:** no internal-index/slug leak in rendered timing; null-tolerant so it shipped independent of CB-44 landing. Contract field names match the backend exactly (verified against operate.py).
 - **Follow-ups / known gaps:** real-data render (vs mock harness) to be eyeballed once a live/stored call carries timing.
 
+### CB-51 — Widen anti-repetition window + honest-pivot rule (Dana stat-cycling)
+- **Type / Surface / Size:** change · `core` (`src/core`) · S
+- **Completed:** 2026-06-04
+- **Files changed (actual):** `src/core/respond.py` (`_own_last_lines` n 2→4), `src/core/nlg.py` (`_NO_RESTATE_INSTRUCTION` strengthened).
+- **What changed:** the CB-48 anti-repetition window was the agent's own last 2 lines, which missed a stat restated a few turns apart (Dana cycled "97% satisfaction" 3×). Widened to 4 lines and rewrote the no-restate instruction to explicitly forbid re-citing the same statistic/offer and to add: "if the prospect keeps pressing for something you honestly cannot give, say so plainly once and pivot to the next step — never loop."
+- **Verification:** full non-voice suite 607 passed/5 skipped; R37 parity + CB-48 directness 19 passed; voice 10 passed. Real-model eval — Dana seed 7 went from escalated t5 (97% repeated 3×) to **callback_scheduled t10** (stat dropped after 2 mentions; agent acknowledged "I've shared every angle I can" then closed); Marcus seed 7 unchanged (walked t6, honest). Actual cost of the 3 verify runs: $0.11 (OpenRouter usage_daily delta).
+- **Constraints checked:** R37 (own-lines only, no caller transcript; reply == concat(tokens)); distillation preserved.
+- **Follow-ups / known gaps:** Dana's MIDDLE turns still loop on "a specialist can show you the algebra data" because she demands concrete Algebra case studies that genuinely don't exist publicly — a KB-content ceiling (the honest agent won't fabricate), not a code defect. A close-sooner policy nudge could shorten it but risks pushiness; left as-is.
+
 ### CB-50 — No-authority gatekeeper → callback, and no triggerless terminal escalation
 - **Type / Surface / Size:** change · `core` (`src/core` gates) · M
 - **Completed:** 2026-06-04

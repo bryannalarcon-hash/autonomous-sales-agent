@@ -137,9 +137,12 @@ def _grounding_block(retrieved_facts: Optional[Sequence[Any]]) -> str:
 # or offer already made; if the decided act would repeat the last line, rephrase substantively or move
 # the conversation forward. Kept as a named constant so realize/realize_stream share the exact wording.
 _NO_RESTATE_INSTRUCTION = (
-    "Do NOT restate a point or offer you already made in YOUR_LAST_LINES; if the decided act would "
-    "repeat what you just said, either rephrase it substantively (a genuinely new angle, not the same "
-    "sentence reworded) or move the conversation forward."
+    "Do NOT repeat a statistic, fact, claim, or offer you already gave in YOUR_LAST_LINES — re-citing "
+    "the same number (e.g. a satisfaction percentage) or re-offering the same thing reads as evasive. "
+    "If you have already made a point, do NOT say it again in different words; instead add genuinely "
+    "NEW substance (a different, concrete proof or detail) or move the conversation forward with a "
+    "concrete next step. If the prospect keeps pressing for something you honestly cannot give, say so "
+    "plainly once and pivot to the most useful next step — never loop."
 )
 
 
