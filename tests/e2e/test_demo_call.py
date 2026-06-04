@@ -499,15 +499,23 @@ def _grant(client: TestClient, sid: str) -> None:
 def test_chat_done_flag_reflects_terminal_act(act, tier, expected_done):
     """`done` is True ONLY for a terminal act: an enrollment close, an escalate, or a disqualify. A
     non-enrollment close (trial) and ordinary discovery (ask) keep the call open (done False). This
-    replaces the prior vacuous `done in (True, False)` assertion with the exact contract."""
+    replaces the prior vacuous `done in (True, False)` assertion with the exact contract.
+
+    CB-50: a triggerless `escalate` is no longer terminal — the escalate_only_if_warranted gate
+    redirects an escalate with NO genuine reason to a non-terminal selling act (the agent must not
+    bail to a human as a default move). So the escalate case sends a GENUINE human request, which
+    WARRANTS the escalate and keeps it terminal — preserving this test's actual intent (a warranted
+    terminal escalate sets done=True) without re-encoding the old over-eager-escalate behavior."""
     app = create_app(llm_client_factory=lambda: _agent_mock(act=act, tier=tier), live_rag=False)
     client = TestClient(app)
     sid = _start(client, channel="text")["session_id"]
     _grant(client, sid)
     # A neutral prospect STATEMENT (not a question/objection) so a discovery `ask` proposal is not
     # legitimately rerouted by the address_direct_input gate — this test pins the done-flag per
-    # forced act, not the question/objection routing (covered by test_respond's M2 tests).
-    r = client.post("/api/chat", json={"session_id": sid, "text": "I'd like to keep going."})
+    # forced act, not the question/objection routing (covered by test_respond's M2 tests). The
+    # escalate case needs a GENUINE escalation trigger (CB-50) so its escalate is warranted, not bailed.
+    text = "I want a human now." if act == "escalate" else "I'd like to keep going."
+    r = client.post("/api/chat", json={"session_id": sid, "text": text})
     assert r.status_code == 200, r.text
     payload = r.json()
     assert payload["decision_act"] == act

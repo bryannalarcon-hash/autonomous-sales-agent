@@ -11,6 +11,16 @@
 #   establish_who_first — CB-34: a learner-specific ask first establishes WHO the tutoring is for
 #                         (belief.meta["learner_established"]/["learner_denied"]) — never presume a learner.
 #   skip_known          — never ask a slot already filled at/above lock confidence.
+#   no_authority_prefers_callback— CB-50: a proposed `escalate` driven SOLELY by the no-authority
+#                         gatekeeper read (belief.active_objection == "decision_maker", no genuine
+#                         escalation trigger) is down-tiered to attempt_close@callback — book a
+#                         follow-up for the real decision-maker instead of wasting a live human.
+#   escalate_only_if_warranted— CB-50: ANY surviving TRIGGERLESS escalate (no genuine reason — the
+#                         agent bailing, not handing off) is redirected — gatekeeper / 3rd-party
+#                         ("for my <relative>") read -> attempt_close@callback; otherwise a NON-
+#                         terminal selling act (answer_via_kb on an open question, else pitch) so the
+#                         agent keeps selling and reaches a proper close later. Genuine reasons still
+#                         escalate. Mirrors close_floor: the terminal move is gated until warranted.
 #   offer_low_commitment_on_budget— repeated FIRM budget refusals (cumulative count in belief.meta) ->
 #                         offer the FREE callback rung (help + a future meeting), denying only the paid
 #                         tiers, instead of looping or releasing. Runs LAST (final say).
@@ -273,6 +283,152 @@ def de_escalate(decision: Any, belief: BeliefState, config: AgentConfig) -> Any:
     out.rationale = (
         f"de_escalate: {reason}; stopping the pitch and offering a graceful hand-off/exit instead of "
         "pushing or re-asking"
+    )
+    return out
+
+
+# --- no_authority_prefers_callback (CB-50: gatekeeper -> callback, not human escalation) -------
+
+# The DST classifies the no-authority gatekeeper situation ("I'm not the one deciding / I'll check
+# with my sister / not my call") as the `decision_maker` objection. meta keys a future DST/bridge
+# could also set are honored so the gate works even when the objection has since been handled.
+_NO_AUTHORITY_OBJECTION = "decision_maker"
+_NO_AUTHORITY_META_KEYS = frozenset({"no_authority", "decision_maker", "gatekeeper"})
+
+# CB-50 broadening (the Pat-t1 defect): a gatekeeper who merely SPEAKS FOR someone ("my sister's
+# kid", "calling for my nephew", "on behalf of my coworker") does NOT trip the explicit
+# decision_maker objection on turn 1, so the no-authority escalate slipped through. This cheap,
+# tightly-scoped phrase read catches the 3rd-party framing: "for/on behalf of my <relative/person>".
+# Deliberately narrow — it requires an explicit "for my/on behalf of my" lead-in so a first-person
+# caller ("my goal is…", "my daughter is in 8th") is NOT misread as a gatekeeper.
+_THIRD_PARTY_RE = re.compile(
+    r"\b(?:for|on\s+behalf\s+of|representing)\s+(?:my|our|the|a|his|her|their)\b",
+    re.I,
+)
+
+
+def _third_party_read(belief: BeliefState) -> bool:
+    """Cheap heuristic: the caller is asking FOR a third party (a gatekeeper speaking on someone's
+    behalf) rather than for themselves. Looks at the current open_question only — the freshest thing
+    the prospect said — so it's a low-cost read with no history scan. Conservative: needs an explicit
+    "for my / on behalf of my" lead-in (see _THIRD_PARTY_RE), so "my goal is…" won't match."""
+    text = getattr(belief, "open_question", None)
+    if not text:
+        return False
+    return bool(_THIRD_PARTY_RE.search(str(text)))
+
+
+def _is_no_authority(belief: BeliefState) -> bool:
+    """True when the belief indicates the caller is NOT the decision-maker (the gatekeeper read).
+
+    Primary signal is the DST's `decision_maker` objection (dst._OBJECTION_PATTERNS: "check with my
+    sister", "talk to my", "run it by", "not my call"). Also honors an explicit meta flag a future
+    DST/memory bridge could set, so the read survives after the objection itself is cleared. CB-50:
+    additionally a cheap 3rd-party phrase read ("for my sister's kid") so a gatekeeper who only
+    SPEAKS FOR someone — without tripping the explicit objection — is still treated as no-authority."""
+    if belief.active_objection == _NO_AUTHORITY_OBJECTION:
+        return True
+    if any(bool(belief.meta.get(k)) for k in _NO_AUTHORITY_META_KEYS):
+        return True
+    return _third_party_read(belief)
+
+
+def no_authority_prefers_callback(
+    decision: Any,
+    belief: BeliefState,
+    config: AgentConfig,
+    *,
+    history: Optional[Sequence[Any]] = None,
+) -> Any:
+    """Down-tier a no-authority ESCALATION to a low-touch CALLBACK offer (CB-50 — the Pat defect).
+
+    The eval (2026-06-04) showed the agent ESCALATE a no-authority gatekeeper to a live specialist on
+    turn 1 — the LLM proposed `escalate` purely because the caller isn't the decision-maker (the DST
+    surfaces that as the `decision_maker` objection). That wastes a human on an unqualified lead; the
+    correct, low-touch move is to offer to schedule a CALLBACK for the actual decision-maker (capture
+    how/when to reach them). The personas cap such a caller at the free `callback` rung, so the agent
+    SHOULD be offering a callback close, not handing off.
+
+    Conservative + tight: it ONLY rewrites a proposed `escalate`, ONLY when the belief shows the
+    no-authority read, AND ONLY when there is NO genuine escalation trigger (a real human request,
+    compliance territory, a low-confidence streak, or a beyond-band concession — reusing the same
+    predicate escalation_triggers fires on). When a genuine trigger IS present we leave the escalate
+    alone so the real escalation still stands. Output is attempt_close@callback — the free rung, which
+    close_floor/pushiness/offer_low_commitment_on_budget all already treat as never-pushy and never
+    re-tier, and which trips NO escalation reason, so the final escalation re-check leaves it intact."""
+    if decision.act != "escalate":
+        return decision
+    if not _is_no_authority(belief):
+        return decision  # not the gatekeeper situation — leave the escalate to the escalation gate
+    # A GENUINE escalation reason (human request / compliance / low-confidence streak / over-band
+    # concession) must still escalate — only an escalate driven SOLELY by the no-authority read is
+    # redirected. Reuse the escalation predicate so the two gates can never disagree.
+    if _escalation_reason(decision, belief, config, history) is not None:
+        return decision
+    out = decision.copy()
+    out.act = "attempt_close"
+    out.tier = _FREE_LADDER_TIER  # the free callback rung — book a follow-up for the real decider
+    out.target_slot = None
+    out.concession = None
+    out.rationale = (
+        "no_authority_prefers_callback: caller isn't the decision-maker and there's no genuine "
+        "escalation trigger — offering a callback for the actual decider instead of wasting a human"
+    )
+    return out
+
+
+# --- escalate_only_if_warranted (CB-50: a TRIGGERLESS escalate must not terminate the call) ----
+
+def escalate_only_if_warranted(
+    decision: Any,
+    belief: BeliefState,
+    config: AgentConfig,
+    *,
+    history: Optional[Sequence[Any]] = None,
+) -> Any:
+    """A TRIGGERLESS `escalate` is the agent BAILING, not handing off — redirect it (CB-50).
+
+    The real-model eval showed the agent reach for "let me connect you with a specialist who'll call
+    you back" as a DEFAULT forward move: Pat got escalated on turn 1 with zero discovery; Dana's proof
+    question got punted to "a consultant will explain" instead of answered + closed at the consult
+    tier. Mirroring close_floor (CB-29), the terminal/hand-off move is GATED until it is actually
+    warranted. So a proposed `escalate` with NO genuine escalation reason (distress / explicit human
+    request / compliance / a low-confidence streak / an over-band concession — the EXACT predicate
+    escalation_triggers fires on, reused so the two can never disagree) is converted:
+      • no-authority / gatekeeper read (decision_maker objection, a meta flag, OR the cheap 3rd-party
+        "for my <relative>" phrase) -> attempt_close@callback (book a follow-up for the real decider;
+        the same redirect no_authority_prefers_callback produces, now also reachable from this guard);
+      • otherwise -> a NON-terminal selling act: answer_via_kb if the prospect has an open question
+        (answer it, don't punt it), else pitch (keep discovering/selling so a proper close can land on
+        a LATER turn).
+    A GENUINE escalation reason is left untouched — Marcus's truly-unanswerable cases, distress, and
+    explicit requests still escalate (escalation_triggers owns those and re-checks after this gate).
+    Conservative + tight: it ONLY rewrites a proposed `escalate`, and ONLY when no genuine reason
+    exists. R37: copy + mutate the Decision, never construct a fresh one or touch the core cycle."""
+    if decision.act != "escalate":
+        return decision
+    # A GENUINE escalation reason still escalates immediately — only a TRIGGERLESS escalate (the agent
+    # bailing) is redirected. Reuse escalation_triggers' predicate so the gates can never disagree.
+    if _escalation_reason(decision, belief, config, history) is not None:
+        return decision
+    out = decision.copy()
+    out.target_slot = None
+    out.tier = None
+    out.concession = None
+    if _is_no_authority(belief):
+        out.act = "attempt_close"
+        out.tier = _FREE_LADDER_TIER  # book a callback for the actual decision-maker
+        out.rationale = (
+            "escalate_only_if_warranted: triggerless escalate on a no-authority/gatekeeper read — "
+            "booking a callback for the real decider instead of terminally handing off"
+        )
+        return out
+    # Qualified / first-person prospect with no genuine trigger: keep SELLING. Answer their open
+    # question if any (don't punt it to 'a consultant will explain'), else re-anchor on value.
+    out.act = "answer_via_kb" if belief.open_question else "pitch"
+    out.rationale = (
+        "escalate_only_if_warranted: triggerless escalate with no genuine reason — keeping the agent "
+        "selling (answering the open question / pitching) so it can reach a proper close, not bailing"
     )
     return out
 
@@ -865,19 +1021,31 @@ def apply_gates(
     hands off gracefully before any gate can propose pressure. Between them: skip_known ->
     no_repeat_discovery (CB-35) -> establish_who_first (CB-34) -> address_direct_input ->
     must_clear_objection -> price_gate -> advance_to_close -> close_floor -> pushiness_cap ->
-    offer_low_commitment_on_budget (last, so the free-callback offer has final say).
+    no_authority_prefers_callback (CB-50: a no-authority escalate -> a callback offer) ->
+    escalate_only_if_warranted (CB-50: ANY surviving triggerless escalate -> a callback offer on a
+    gatekeeper read, else a non-terminal selling act — the agent keeps selling instead of bailing) ->
+    offer_low_commitment_on_budget (last, so the free-callback offer has final say). The closing
+    escalation re-check leaves a callback close intact (no trigger) but still catches genuine ones.
     """
-    # Extreme moments dominate: nothing else matters if we must defer.
-    escalated = escalation_triggers(decision, belief, config, history=history)
-    if escalated.act == "escalate":
+    # Extreme moments dominate: nothing else matters if we must defer. The short-circuit fires only on
+    # a GENUINE escalation REASON (over-band concession / human request / compliance / low-confidence
+    # streak) — NOT merely because the LLM already proposed `escalate`. CB-50: an LLM escalate with no
+    # genuine trigger (the no-authority gatekeeper) must flow into the chain so no_authority_prefers_
+    # callback can down-tier it; the closing escalation re-check still catches any genuine trigger.
+    if _escalation_reason(decision, belief, config, history) is not None:
+        escalated = escalation_triggers(decision, belief, config, history=history)
         return escalated
 
     # CB-37: hostility or EXTREME bail short-circuits to a graceful hand-off BEFORE anything else can
     # propose pressure or a discovery re-ask — the call is over, disengage rather than keep selling.
-    deescalated = de_escalate(decision, belief, config)
-    if deescalated.act == "escalate":
-        belief.escalation_imminent = True
-        return deescalated
+    # Short-circuit only on an ACTUAL de-escalation REASON (hostility / extreme bail) — not merely
+    # because the LLM already proposed `escalate` (CB-50: that no-authority escalate must reach the
+    # chain so no_authority_prefers_callback can down-tier it).
+    if _hostile_or_extreme_bail(belief, config) is not None:
+        deescalated = de_escalate(decision, belief, config)
+        if deescalated.act == "escalate":
+            belief.escalation_imminent = True
+            return deescalated
 
     d = skip_known(decision, belief, config)
     # CB-35: drop a re-ask of an answered/declined/over-asked discovery slot (HARD no-repeat guard).
@@ -894,6 +1062,16 @@ def apply_gates(
     # (min turns + enough filled discovery slots) — kills the premature/pushy close at turns 9 & 11.
     d = close_floor(d, belief, config, history=history)
     d = pushiness_cap(d, belief, config, history=history)
+    # CB-50: a no-authority gatekeeper escalate (LLM-proposed, no genuine trigger) is down-tiered to a
+    # free callback offer for the real decision-maker — don't waste a human on a lead who can't decide.
+    # Placed late so it sees the (possibly rewritten) act; the final escalation re-check below leaves a
+    # callback close untouched (it trips no escalation reason), while a GENUINE trigger still escalates.
+    d = no_authority_prefers_callback(d, belief, config, history=history)
+    # CB-50: ANY surviving triggerless escalate is the agent BAILING — redirect it. A gatekeeper read
+    # (now incl. the cheap 3rd-party "for my <relative>" phrase) books a callback; an otherwise-
+    # qualified prospect keeps SELLING (answer their open question, else pitch) so it can close on a
+    # later turn instead of terminally handing off. A GENUINE reason still escalates (re-checked below).
+    d = escalate_only_if_warranted(d, belief, config, history=history)
     # LAST override: a budget-constrained prospect gets the free callback rung (help + future meeting),
     # not a loop or a release — placed here so must_clear_objection/pushiness don't undo the offer.
     d = offer_low_commitment_on_budget(d, belief, config)

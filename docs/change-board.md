@@ -70,15 +70,6 @@
 - **Refs:** `src/api/operate.py::live_snapshot` + `live_ep`; LiveKit Agents room/participant model + SIP dispatch (`scripts/setup_sip_dispatch.py`, rule `SDR_hKYQYAwz96uA`); the disabled take-over control (`web/app/operate/live/page.tsx`); R37 in `src/core/respond.py`.
 - **Take-over spec (user, 2026-06-02) — refines CB-01.c:** on "Take over", the AI must (1) be INTERRUPTED mid-conversation and (2) speak a DEFAULT TTS hand-off line (e.g. "Let me bring in a specialist to help — one moment. They may type some of their responses, so there might be a brief pause between answers."). Then the OPERATOR talks into their own device (browser mic / WebRTC into the call's LiveKit room) and is heard by the caller through the phone — operator audio is published as a room participant, NOT a dial-in (presume the operator is NOT calling from their own phone number, so no SIP bridge / caller-ID concerns). The agent stops auto-generating; the operator may ALSO TYPE responses that are TTS'd to the caller ("the agent might be typing their responses"). So take-over = interrupt + disclosure TTS + operator mic→room audio + optional operator-typed→TTS, with the AI yielded. Consent/recording state must carry over; respect R37 (don't fork the brain — the brain just stops).
 
-### CB-50 — No-authority gatekeeper should route to a callback, not escalate to a human on turn 1
-- **Type / Surface / Size:** change · `core` (`src/core` gates/policy) · S/M
-- **Prereqs:** —
-- **Important files (candidates):** `src/core/gates.py` (escalation/advance gates), `src/core/policy.py` (act selection for a no-authority/disqualified read), the disqualify→callback path.
-- **Current:** the Pat eval (2026-06-04) showed the agent ESCALATED a no-authority, vaguely-curious gatekeeper to a live specialist in ONE turn (outcome=escalated) — wasting a human on an unqualified lead instead of politely capturing the decision-maker's info / booking a callback for the actual parent.
-- **Desired:** on a no_authority read, prefer a low-touch CALLBACK offer (capture how/when to reach the decision-maker) over a live-human escalation; escalate only on a genuine escalation trigger, not merely because the caller isn't the decision-maker.
-- **Acceptance:** re-running Pat, the outcome is a callback (or graceful disqualify), NOT a turn-1 human escalation; the buy-gate/disqualify invariants hold; existing escalation tests stay green.
-- **Refs:** Pat baseline transcript (episode `sp-102ff1bd…`, cohort `experiment_eval_personas_pat`); `src/core/gates.py` escalation path.
-
 ---
 
 ## In Progress
@@ -139,6 +130,15 @@
 - **Verification:** `cd web && npx tsc --noEmit` clean (exit 0). Cadence dark tokens reused (no new visual language); human phrases only, no raw key/slug renders. Screenshot via a temp mock harness (backend wasn't up) confirmed all four phrases render — `tests/e2e/shots/cb45_timing.png`; harness deleted after capture.
 - **Constraints checked:** no internal-index/slug leak in rendered timing; null-tolerant so it shipped independent of CB-44 landing. Contract field names match the backend exactly (verified against operate.py).
 - **Follow-ups / known gaps:** real-data render (vs mock harness) to be eyeballed once a live/stored call carries timing.
+
+### CB-50 — No-authority gatekeeper → callback, and no triggerless terminal escalation
+- **Type / Surface / Size:** change · `core` (`src/core` gates) · M
+- **Completed:** 2026-06-04
+- **Files changed (actual):** `src/core/gates.py` (`no_authority_prefers_callback` + tightened `escalation_triggers`/`de_escalate` short-circuits + new `escalate_only_if_warranted`); `src/core/dst.py` (hedged/disjunctive grade extracted at reduced confidence so an uncertain "7th or 8th" isn't locked + asserted back; broadened `_HUMAN_REQUEST_RE`); `tests/unit/test_policy.py` (+8), `tests/unit/test_cb50_escalate_guard.py` (NEW, 7), `tests/e2e/test_demo_call.py` (escalate param uses a genuine human request).
+- **What changed:** RCA — the no-authority gatekeeper surfaces as `active_objection="decision_maker"`, the LLM proposed `escalate`, and `escalation_triggers` short-circuited on an already-`escalate` input even with no genuine trigger. Two-part fix: (1) a triggerless `escalate` is NEVER terminal — `escalate_only_if_warranted` redirects it to `attempt_close@callback` on a no-authority/gatekeeper read (incl. a tight "for my <relative>'s kid" third-party detector) or otherwise to a non-terminal selling act (`answer_via_kb` if there's an open question, else `pitch`); (2) only a GENUINE reason (explicit human request, compliance, low-confidence streak, over-band concession, hostility/extreme-bail) escalates.
+- **Verification:** full non-voice suite 607 passed/5 skipped (TDD red→green); escalation+policy+personas 84 passed; buy-gate stays pure (Pat caps at callback). Real-model eval (before→after): Pat went from turn-1 escalate/no-discovery to **discovery first → callback offer** on the no-authority reveal (both seeds); Dana reached **callback_scheduled at t12** (was a premature t2 escalate); Marcus still escalates only for a genuine unanswerable scheduling ask.
+- **Constraints checked:** R37 (gates copy+mutate the Decision); genuine escalation preserved; buy-gate untouched.
+- **Follow-ups / known gaps:** a vague gatekeeper can still hit the low-confidence-streak genuine-escalation trigger (labelled `escalated`) before the prospect commits to a callback — behaviorally it's a callback offer after discovery, but the outcome label isn't always `callback_scheduled`. Acceptable; revisit if a cleaner gatekeeper→callback-commit path is wanted.
 
 ### CB-49 — Replace the fake demo KB with a real, sourced 175-chunk Nerdy corpus + fix retrieval
 - **Type / Surface / Size:** feature · `data` (KB) · `core` (retrieval) · `sim` (eval wiring) · L

@@ -19,6 +19,8 @@
 # CB-34/35/36/37 deterministic signals (all in belief.meta, carried across the call by copy()):
 #   - grade extraction now accepts a BARE ordinal/number answer ("Third"->3, "8"->8 when grade was
 #     just asked, sane 1-12 bound, "kindergarten"->K) so an answered grade is never re-asked (CB-35);
+#     CB-50 (secondary): a HEDGED/disjunctive bare answer ("7th or 8th, not sure") extracts at REDUCED
+#     confidence so an uncertain grade stays a soft, re-confirmable slot (not asserted back as fact);
 #   - declined_slots: discovery slots the prospect declined to answer -> the no-repeat gate drops them;
 #   - learner_established / learner_denied: whether WHO the tutoring is for has been established, so the
 #     agent never presumes a learner exists before a who-is-this-for step (CB-34);
@@ -82,6 +84,37 @@ _GRADE_SPELLED_WITH_GRADE_RE = re.compile(
 _AGE_CONTEXT_RE = re.compile(
     r"\b\d{1,2}\s*(?:years?|yrs?)\s*old\b|\bage[d]?\s+\d{1,2}\b|\bis\s+\d{1,2}\s+years?\b", re.I
 )
+# CB-50 (secondary): a HEDGED / disjunctive grade answer must NOT lock a confirmed grade slot. The
+# eval showed the agent assert "Got it — eighth-grade math" when Pat said "7th or 8th, not sure" —
+# an uncertain answer extracted as a high-confidence (lock-level) slot. A hedge is either explicit
+# uncertainty ("not sure", "maybe", "I think", "around", "or so", "ish", "between") OR a disjunction
+# of two candidate grades ("7th or 8th", "5 or 6"). When a BARE grade answer is hedged we drop its
+# confidence below the lock threshold so the slot stays SOFT (re-confirmable next turn) instead of
+# being asserted back as fact. Explicit "Nth grade" forms are still trusted (someone who says "8th
+# grade" is committing) — only the thinner bare forms are softened.
+_GRADE_HEDGE_RE = re.compile(
+    r"\bnot\s+sure\b|\bnot\s+certain\b|\bmaybe\b|\bi\s+think\b|\bi\s+guess\b|\bprobably\b"
+    r"|\baround\b|\bish\b|\bor\s+so\b|\bbetween\b|\bsomewhere\b|\bunsure\b|\bdon'?t\s+know\b",
+    re.I,
+)
+# A disjunction of two grade-ish tokens ("7th or 8th", "5 or 6", "third or fourth") — the caller is
+# offering two candidates, so neither is a confirmed grade.
+_GRADE_DISJUNCTION_RE = re.compile(
+    r"\b\d{1,2}(?:st|nd|rd|th)?\s+or\s+\d{1,2}(?:st|nd|rd|th)?\b"
+    r"|\b(?:" + "|".join(_GRADE_ORDINAL_WORDS) + r")\s+or\s+(?:"
+    + "|".join(_GRADE_ORDINAL_WORDS) + r")\b",
+    re.I,
+)
+# Lock-confidence ceiling for a HEDGED bare grade answer: kept strictly below dst._LOCK_CONFIDENCE so
+# the slot stays soft (it can be confirmed on a firmer later turn rather than asserted back as fact).
+_HEDGED_GRADE_CONFIDENCE = 0.6
+
+
+def _is_hedged_grade(text: str) -> bool:
+    """True when a grade answer expresses uncertainty or offers two candidate grades — so a BARE
+    extraction from it must not lock a confirmed grade (CB-50 secondary: the '7th or 8th, not sure'
+    false confirmation)."""
+    return bool(_GRADE_HEDGE_RE.search(text) or _GRADE_DISJUNCTION_RE.search(text))
 
 
 def _coerce_grade(raw: Any) -> Optional[str]:
@@ -136,7 +169,9 @@ def _extract_grade(text: str, *, asked_grade: bool = False) -> Optional[tuple[An
     ONLY when the agent JUST asked for the grade (`asked_grade`); otherwise a stray ordinal/number in a
     non-answer context ("1st time calling", "the 3rd of June", "my 2nd child", an age "she is 7") would
     masquerade as and LOCK a grade. Out-of-range numbers (e.g. an age "16") and explicit age phrases are
-    rejected (CB-35 + follow-up)."""
+    rejected (CB-35 + follow-up). CB-50 (secondary): a HEDGED / disjunctive bare answer ("7th or 8th,
+    not sure") is extracted at REDUCED confidence (below the lock threshold) so an uncertain grade stays
+    a SOFT, re-confirmable slot instead of being asserted back as fact."""
     for pat, conf in _GRADE_PATTERNS:
         m = pat.search(text)
         if m:
@@ -159,25 +194,33 @@ def _extract_grade(text: str, *, asked_grade: bool = False) -> Optional[tuple[An
     # masquerade as (and worse, LOCK) a grade. So when the grade was NOT just asked, extract nothing.
     if not asked_grade:
         return None
+    # CB-50 (secondary): a HEDGED / disjunctive bare answer ("7th or 8th, not sure") must NOT lock a
+    # confirmed grade. We cap a bare extraction's confidence below the lock threshold so the slot stays
+    # soft (re-confirmable) instead of being asserted back as fact ("Got it — eighth-grade math").
+    hedged = _is_hedged_grade(text)
+
+    def _conf(c: float) -> float:
+        return min(c, _HEDGED_GRADE_CONFIDENCE) if hedged else c
+
     # CB-35: a bare spelled ordinal ("Third", "fifth") answering "what grade?".
     sm = _GRADE_SPELLED_WORD_RE.search(text)
     if sm:
         g = _coerce_grade(_GRADE_ORDINAL_WORDS[sm.group(1).lower()])
         if g is not None:
-            return g, 0.85
+            return g, _conf(0.85)
     # A bare numeric ordinal ("3rd", "8th") without the word "grade".
     om = _GRADE_BARE_ORDINAL_RE.search(text)
     if om:
         g = _coerce_grade(om.group(1))
         if g is not None:
-            return g, 0.8
+            return g, _conf(0.8)
     # A bare standalone number ("8") — but NOT a number that is plainly an age ("she is 7 years old").
     if not _AGE_CONTEXT_RE.search(text):
         nm = _GRADE_BARE_NUMBER_RE.search(text)
         if nm:
             g = _coerce_grade(nm.group(1))
             if g is not None:
-                return g, 0.75
+                return g, _conf(0.75)
     return None
 
 
@@ -300,8 +343,20 @@ _AFFORDABILITY_REFUSAL_RE = re.compile(
 )
 # A bare price/cost question (not necessarily an objection) -> opens price talk via the gate.
 _PRICE_INQUIRY_RE = re.compile(r"\b(how much|what(?:'s| is| does it) cost|price|pricing|per (month|hour|session)|monthly|fees?|rates?)\b", re.I)
-# An explicit ask for a human — routes to escalate via the escalation gate.
-_HUMAN_REQUEST_RE = re.compile(r"\b(speak|talk|connect me) (to|with) (a |an )?(human|person|representative|rep|agent|advisor|someone)\b|real (person|human)", re.I)
+# An explicit ask for a human — routes to escalate via the escalation gate. Two shapes: (1) a
+# "speak/talk/connect me to/with a <human>" verb phrase, and (2) a "want/need/get me/give me/put me
+# on with a <human>" desire phrase ("I want a human now", "get me a real person", "let me talk to
+# someone"). Tight to an explicit human-noun (human/person/rep/agent/advisor/someone) so it never
+# captures the decision_maker objection ("run it by my spouse") the rubric keeps distinct.
+_HUMAN_NOUN = r"(?:human|person|people|representative|rep|agent|advisor|someone|somebody)"
+_HUMAN_REQUEST_RE = re.compile(
+    r"\b(?:speak|talk|connect me|put me through|transfer me|let me (?:speak|talk))\s+"
+    r"(?:to|with|on)?\s*(?:a |an |the )?(?:real |actual |live )?" + _HUMAN_NOUN + r"\b"
+    r"|\b(?:want|need|get me|give me|wanna (?:speak|talk))\s+(?:to\s+)?(?:speak\s+(?:to|with)\s+)?"
+    r"(?:a |an |the )?(?:real |actual |live )?" + _HUMAN_NOUN + r"\b"
+    r"|\breal (?:person|human)\b",
+    re.I,
+)
 # A question at all: a trailing '?' or a leading interrogative/request-to-explain.
 _QUESTION_RE = re.compile(r"\?|\b(what|how|when|where|why|who|which|can you|could you|do you|are there|is there|tell me about)\b", re.I)
 

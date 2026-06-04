@@ -667,6 +667,203 @@ def test_advance_to_close_offers_free_callback_when_budget_constrained():
     assert gates.advance_to_close(Decision(act="answer_via_kb"), b2, cfg).tier == "callback"
 
 
+# --- no_authority_prefers_callback (CB-50: gatekeeper -> callback, not human escalation) -------
+
+def test_no_authority_redirects_proposed_escalate_to_callback():
+    """CB-50: a no-authority gatekeeper (decision_maker objection, no genuine escalation trigger) gets
+    a low-touch callback offer, NOT a wasted live-human escalation. The LLM proposed `escalate`
+    purely because the caller isn't the decision-maker — the gate down-tiers it to attempt_close@callback."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.active_objection = "decision_maker"  # "I'll have to check with my sister"
+    b.last_user_act = "objection"
+    proposed = Decision(act="escalate", rationale="caller isn't the decision-maker")
+    out = gates.no_authority_prefers_callback(proposed, b, cfg)
+    assert out.act == "attempt_close"
+    assert out.tier == "callback"
+    assert out.act != "escalate"
+
+
+def test_no_authority_does_not_redirect_a_genuine_escalation():
+    """The gate is conservative: it only redirects an escalate that's driven by the no-authority read.
+    A REAL trigger (explicit human request) still escalates — escalation_triggers owns that and runs
+    before/after this gate, so the full chain keeps escalating; the gate itself leaves it alone when
+    there is no no_authority signal."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.last_user_act = "human_request"  # a genuine escalation cue, NOT the gatekeeper situation
+    proposed = Decision(act="escalate", rationale="they asked for a person")
+    out = gates.no_authority_prefers_callback(proposed, b, cfg)
+    assert out.act == "escalate"  # no decision_maker signal -> the gate doesn't touch it
+
+
+def test_no_authority_leaves_non_escalate_acts_alone():
+    """The gate only rewrites an `escalate`; a normal answer/pitch on a decision_maker objection is
+    untouched (must_clear_objection / handle_objection own the in-conversation handling)."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.active_objection = "decision_maker"
+    for proposed in (Decision(act="handle_objection"), Decision(act="answer_via_kb"), Decision(act="pitch")):
+        out = gates.no_authority_prefers_callback(proposed, b, cfg)
+        assert out.act == proposed.act
+
+
+def test_apply_gates_no_authority_gatekeeper_books_callback_not_escalate():
+    """Full chain (the Pat defect, CB-50): on a no-authority read with NO genuine escalation trigger,
+    apply_gates must NOT yield `escalate` — it routes to a callback close. Mirrors a turn-1/2
+    gatekeeper where the LLM proposed escalate."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.active_objection = "decision_maker"
+    b.last_user_act = "objection"
+    b.turn_count = 1
+    proposed = Decision(act="escalate", rationale="not the decision-maker")
+    out = apply_gates(proposed, b, cfg, history=[])
+    assert out.act != "escalate"
+    assert out.act == "attempt_close" and out.tier == "callback"
+
+
+def test_apply_gates_genuine_human_request_still_escalates():
+    """Guardrail: a real escalation trigger (explicit human request) still escalates through the full
+    chain even when a decision_maker objection is ALSO present — escalation_triggers wins. We never
+    suppress a genuine escalation just because the caller is also a gatekeeper."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.active_objection = "decision_maker"
+    b.last_user_act = "human_request"  # genuine trigger present
+    proposed = Decision(act="pitch", rationale="benign")
+    out = apply_gates(proposed, b, cfg, history=[])
+    assert out.act == "escalate"
+
+
+async def test_policy_no_authority_prefers_callback_over_escalate():
+    """Policy-level (LLM proposes -> gates decide): the LLM proposes `escalate` for a no-authority
+    gatekeeper; the policy returns a callback close instead of wasting a human (CB-50)."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.active_objection = "decision_maker"
+    b.last_user_act = "objection"
+    b.turn_count = 1
+    llm = MockLLMClient([_proposal_json(act="escalate", rationale="caller can't decide")])
+    d = await decide(b, history=[], config=cfg, llm_client=llm)
+    assert d.act != "escalate"
+    assert d.act == "attempt_close" and d.tier == "callback"
+
+
+# --- escalate_only_if_warranted (CB-50 broadening: a TRIGGERLESS escalate must not terminate) --
+# The eval showed the agent reach for "let me connect you with a specialist who'll call you back"
+# as a DEFAULT forward move — terminally escalating with zero discovery (Pat t1) or punting a
+# question to "a consultant will explain" (Dana). A proposed `escalate` with NO genuine escalation
+# reason (distress / explicit human request / compliance / low-confidence streak / over-band
+# concession) is NOT a hand-off — it is the agent bailing. So it is redirected: a gatekeeper /
+# no-authority read books a callback; otherwise the agent keeps selling (answer the open question,
+# else pitch). A GENUINE escalation reason still escalates immediately.
+
+def test_triggerless_escalate_on_qualified_belief_redirects_to_pitch():
+    """A triggerless escalate on a QUALIFIED belief with NO open question keeps the agent selling —
+    redirected to a non-terminal pitch, never `escalate` (the Dana/Marcus over-eager-escalate)."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    fill_slot(b, "grade_level", "8", 0.9)
+    fill_slot(b, "subject", "math", 0.9)  # qualified, no gatekeeper read, no open question
+    b.turn_count = 4
+    proposed = Decision(act="escalate", rationale="let me hand you to a specialist")
+    out = gates.escalate_only_if_warranted(proposed, b, cfg, history=[])
+    assert out.act != "escalate"
+    assert out.act == "pitch"
+
+
+def test_triggerless_escalate_with_open_question_answers_via_kb():
+    """A triggerless escalate while the prospect has an OPEN QUESTION answers it (don't punt the
+    proof question to 'a consultant will explain' — the Dana regression)."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    fill_slot(b, "grade_level", "8", 0.9)
+    b.open_question = "do you have proof it actually works?"
+    b.last_user_act = "question"
+    b.turn_count = 4
+    proposed = Decision(act="escalate", rationale="a consultant will explain")
+    out = gates.escalate_only_if_warranted(proposed, b, cfg, history=[])
+    assert out.act == "answer_via_kb"
+    assert out.act != "escalate"
+
+
+def test_triggerless_escalate_on_no_authority_books_callback():
+    """A triggerless escalate on a no-authority/gatekeeper read books a CALLBACK for the real decider
+    (the existing CB-50 behavior, now also reachable from this guard, not just the explicit objection)."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.meta["no_authority"] = True  # gatekeeper read WITHOUT the explicit decision_maker objection
+    proposed = Decision(act="escalate", rationale="caller isn't the decider")
+    out = gates.escalate_only_if_warranted(proposed, b, cfg, history=[])
+    assert out.act == "attempt_close" and out.tier == "callback"
+    assert out.act != "escalate"
+
+
+def test_genuine_escalation_still_escalates_through_the_guard():
+    """A GENUINE escalation reason (explicit human request) is NOT redirected — it still escalates.
+    Distress / compliance / low-confidence streak / over-band concession behave the same."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.last_user_act = "human_request"  # genuine trigger
+    proposed = Decision(act="escalate", rationale="they asked for a person")
+    out = gates.escalate_only_if_warranted(proposed, b, cfg, history=[])
+    assert out.act == "escalate"
+
+
+def test_guard_leaves_non_escalate_acts_alone():
+    """The guard ONLY rewrites a proposed `escalate`; any other act passes untouched."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    for proposed in (Decision(act="pitch"), Decision(act="answer_via_kb"), Decision(act="ask", target_slot="goal")):
+        out = gates.escalate_only_if_warranted(proposed, b, cfg, history=[])
+        assert out.act == proposed.act
+
+
+def test_apply_gates_triggerless_escalate_no_authority_phrase_books_callback():
+    """Full chain (Pat t1, CB-50): a gatekeeper speaking FOR someone ('my sister's kid') is read as
+    no-authority via the cheap 3rd-party phrase even WITHOUT the explicit decision_maker objection;
+    a triggerless escalate routes to a callback close, never a terminal hand-off."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    b.open_question = "I'm calling for my sister's kid, do you do middle-school math?"
+    b.turn_count = 1
+    proposed = Decision(act="escalate", rationale="not the parent")
+    out = apply_gates(proposed, b, cfg, history=[])
+    assert out.act != "escalate"
+    assert out.act == "attempt_close" and out.tier == "callback"
+
+
+def test_apply_gates_triggerless_escalate_qualified_keeps_selling():
+    """Full chain (Dana): a triggerless escalate on a qualified prospect with an open question is
+    redirected to a non-terminal selling act so the agent can still reach a proper close later —
+    NOT a terminal escalate."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    fill_slot(b, "grade_level", "8", 0.9)
+    fill_slot(b, "subject", "math", 0.9)
+    b.open_question = "can you prove the results are real?"
+    b.last_user_act = "question"
+    b.turn_count = 4
+    proposed = Decision(act="escalate", rationale="hand off the proof question")
+    out = apply_gates(proposed, b, cfg, history=[])
+    assert out.act != "escalate"
+    assert out.act in ("answer_via_kb", "pitch", "attempt_close", "handle_objection")
+
+
+def test_apply_gates_genuine_escalation_survives_full_chain():
+    """Full chain guardrail: a real escalation trigger still escalates end-to-end (Marcus's truly-
+    unanswerable scheduling case / distress / explicit request) — the guard never suppresses it."""
+    cfg = make_config()
+    b = BeliefState.fresh()
+    fill_slot(b, "grade_level", "8", 0.9)
+    b.last_user_act = "human_request"
+    b.turn_count = 6
+    proposed = Decision(act="escalate", rationale="explicitly asked for a person")
+    out = apply_gates(proposed, b, cfg, history=[])
+    assert out.act == "escalate"
+
+
 # --- close_floor (CB-29: no blind premature/pushy paid close) ----------------------------------
 
 def test_close_floor_blocks_blind_paid_close():
