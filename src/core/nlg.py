@@ -22,6 +22,15 @@
 # surfaced as YOUR_LAST_LINES with an instruction NOT to restate a point/offer already made (rephrase
 # substantively or advance). ONLY the agent's own lines are passed — never the caller transcript — so
 # the distillation is preserved (no new inventable facts). realize + realize_stream stay in lock-step.
+# SAFEGUARD 2 (runtime grounding): the scattered soft grounding wording is CONSOLIDATED into ONE clear
+# _GROUNDING_RULE (no invented figure/price/percentage/guarantee or student-outcome story) applied as
+# the first-line constraint on a CLAIM turn (answer_via_kb/handle_objection/pitch) or whenever facts
+# exist. realize() additionally accepts grounding_retry=True — the BLOCKING-path regenerate respond()
+# triggers when retriever.grounded() flags the first reply as ungrounded; it hardens the rule
+# (_GROUNDING_RETRY_RULE) so the second attempt states only supported claims. The STREAMING path keeps
+# the first-line rule only — a streamed token can't be un-spoken, so respond_stream NEVER regenerates
+# mid-stream (an ungrounded streamed reply is flagged in decision.meta by respond_stream for
+# observability, not rewritten). realize + realize_stream still build the SAME prompt (lock-step).
 from __future__ import annotations
 
 from typing import Any, AsyncIterator, Optional, Sequence
@@ -122,15 +131,64 @@ def _persona_system(config: AgentConfig) -> str:
     return base
 
 
-def _grounding_block(retrieved_facts: Optional[Sequence[Any]]) -> str:
-    """Render retrieved KB facts (U5) into a grounding constraint, or an empty string if none."""
-    if not retrieved_facts:
+# SAFEGUARD 2 (runtime grounding) — ONE consolidated grounding rule, replacing the scattered soft
+# wording. It is the first-line constraint on BOTH paths (blocking + streaming) so the model is told
+# up front to invent no specific (a figure or a student-outcome story) not in the facts. The blocking
+# path additionally re-runs NLG with the HARDENED variant below when a reply still slips an unsupported
+# specific through; the streaming path cannot un-speak a token, so this first-line rule is its only
+# guard (an ungrounded streamed reply is flagged for observability, never regenerated mid-stream).
+_GROUNDING_RULE = (
+    "GROUNDING RULE (do not break): state ONLY claims supported by the facts provided below. Do NOT "
+    "invent a specific figure, price, percentage, guarantee, or a student-outcome story (e.g. \"went "
+    "from a D to a B+\", \"scored an A on the final\") that is not in those facts. If you lack a "
+    "specific number or story, say so plainly — do NOT make one up."
+)
+
+# The HARDENED re-instruction the blocking path uses on a regenerate after grounded() flagged the
+# first reply as ungrounded. Stronger + explicit about the honest fallback so the second attempt does
+# not repeat the fabrication. Only used by realize(grounding_retry=True); never on the stream path.
+_GROUNDING_RETRY_RULE = (
+    "Your previous reply asserted a specific the provided facts do NOT support. REWRITE it: state ONLY "
+    "claims directly supported by the facts below. If you do not have a specific figure or a real "
+    "student story, say plainly that you don't have that exact number/example and offer a concrete "
+    "next step (a consultation, a callback, or connecting them with the details) — do NOT invent one."
+)
+
+
+# SAFEGUARD 2: acts that ASSERT a product fact/proof to the prospect — the turns the runtime grounding
+# guard checks (mirrors loop/grading._FACTUAL_ACTS minus confirm_known, which only echoes known slots).
+# A bare ask/confirm/escalate asserts nothing, so it is NOT grounding-checked and gets no facts-claim
+# nudge (its prompt is unchanged from before SAFEGUARD 2).
+_CLAIM_ACTS = frozenset({"answer_via_kb", "handle_objection", "pitch"})
+
+
+def _grounding_block(
+    retrieved_facts: Optional[Sequence[Any]],
+    *,
+    is_claim: bool = False,
+    retry: bool = False,
+) -> str:
+    """Render the SAFEGUARD 2 grounding constraint + any retrieved KB facts (U5), or "" when nothing
+    applies. Behavior:
+      • facts present -> the consolidated _GROUNDING_RULE + the facts (was: a softer ad-hoc block);
+      • NO facts but a CLAIM turn -> the rule + an explicit "no facts retrieved, don't invent a
+        specific" nudge so a fact-asserting turn is pushed toward the honest line rather than inventing;
+      • NO facts and NOT a claim turn -> "" (unchanged from before — a bare ask carries no grounding
+        block, so the opening/discovery prompt is identical to pre-SAFEGUARD-2).
+    `retry` (blocking-path regenerate after grounded() flagged the first reply) prepends the stronger
+    _GROUNDING_RETRY_RULE."""
+    if not retrieved_facts and not is_claim:
         return ""
-    facts = "\n".join(f"- {str(f)}" for f in retrieved_facts)
-    return (
-        "GROUNDING — you may ONLY state facts supported by these retrieved KB snippets; "
-        "do not invent specifics (prices, guarantees, claims) absent here:\n" + facts
-    )
+    lines: list[str] = []
+    if retry:
+        lines.append(_GROUNDING_RETRY_RULE)
+    lines.append(_GROUNDING_RULE)
+    if retrieved_facts:
+        facts = "\n".join(f"- {str(f)}" for f in retrieved_facts)
+        lines.append("Facts you may rely on:\n" + facts)
+    else:
+        lines.append("(No supporting facts were retrieved — do not state any specific figure or story.)")
+    return "\n".join(lines)
 
 
 # CB-48 (anti-repetition): the instruction that accompanies YOUR_LAST_LINES — do NOT restate a point
@@ -169,13 +227,19 @@ def _build_messages(
     retrieved_facts: Optional[Sequence[Any]],
     *,
     own_last_lines: Optional[Sequence[Any]] = None,
+    grounding_retry: bool = False,
 ) -> list[Message]:
     """Assemble persona + act-specific + grounding messages for the realization call.
 
     own_last_lines (CB-48) are the agent's OWN last 1-2 spoken turns (threaded from respond/
     respond_stream). When present they are surfaced as YOUR_LAST_LINES plus a do-not-restate
     instruction so NLG stops repeating the same hedge/offer; only the agent's own lines are passed
-    (never the caller transcript), preserving the distillation."""
+    (never the caller transcript), preserving the distillation.
+
+    SAFEGUARD 2: the grounding block is included for a CLAIM act (answer_via_kb/handle_objection/pitch)
+    OR whenever facts are present; `grounding_retry` (the blocking-path regenerate after grounded()
+    flagged the first reply) hardens it. A bare ask/confirm/escalate with no facts gets no grounding
+    block (its prompt is unchanged)."""
     guidance = _ACT_GUIDANCE.get(decision.act, "Respond helpfully and warmly.")
     if decision.act == "attempt_close" and decision.tier in _TIER_GUIDANCE:
         guidance = f"{guidance} {_TIER_GUIDANCE[decision.tier]}"
@@ -201,7 +265,9 @@ def _build_messages(
         # the opening turn's prompt is unchanged).
         own_block,
         _NO_RESTATE_INSTRUCTION if own_block else "",
-        _grounding_block(retrieved_facts),
+        _grounding_block(
+            retrieved_facts, is_claim=decision.act in _CLAIM_ACTS, retry=grounding_retry
+        ),
         "Write ONLY the agent's next spoken line (1-3 short sentences). No prefaces, no quotes.",
     ]
     user = "\n".join(p for p in parts if p)
@@ -219,18 +285,23 @@ async def realize(
     *,
     retrieved_facts: Optional[Sequence[Any]] = None,
     own_last_lines: Optional[Sequence[Any]] = None,
+    grounding_retry: bool = False,
 ) -> str:
     """Realize a gated Decision into one persona-consistent, voice-shaped reply string.
 
     The decision has ALREADY passed the gates (policy returns the gated decision), so NLG only has
     to phrase it. When retrieved_facts is supplied (U5 KB grounding) the prompt constrains the reply
     to those facts. own_last_lines (CB-48) carries the agent's own last 1-2 spoken turns so the prompt
-    can forbid restating them. The reply is whitespace-trimmed; a blank LLM reply — OR any call failure
-    (a real OpenRouter 429/5xx/timeout that outlived the client's bounded retry, FINDING 2) — degrades
-    to a safe filler so the caller always gets a non-empty turn instead of a crash.
+    can forbid restating them. SAFEGUARD 2: `grounding_retry=True` is the blocking-path REGENERATE
+    after retriever.grounded() flagged the first reply as ungrounded — it hardens the grounding rule so
+    the second attempt states only supported claims (or says it lacks the figure). The reply is
+    whitespace-trimmed; a blank LLM reply — OR any call failure (a real OpenRouter 429/5xx/timeout that
+    outlived the client's bounded retry, FINDING 2) — degrades to a safe filler so the caller always
+    gets a non-empty turn instead of a crash.
     """
     messages = _build_messages(
-        decision, belief, config, retrieved_facts, own_last_lines=own_last_lines
+        decision, belief, config, retrieved_facts,
+        own_last_lines=own_last_lines, grounding_retry=grounding_retry,
     )
     try:
         text = await llm_client.complete(messages)

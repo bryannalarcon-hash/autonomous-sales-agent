@@ -640,21 +640,48 @@ def test_advance_to_close_holds_off_when_not_ready():
     assert gates.advance_to_close(Decision(act="attempt_close", tier="trial"), b3, cfg).act == "attempt_close"
 
 
-def test_advance_to_close_breaks_through_repeatedly_handled_objection():
-    """A relentless objector (re-raising the same objection every turn) would otherwise pin the agent
-    to handle_objection forever. After the objection has been handled repeatedly, break the deadlock
-    with a low-pressure consultation offer instead of handling it yet again."""
+def test_objection_breakthrough_now_routes_through_the_unified_loop_breaker():
+    """The objection-DEADLOCK breakthrough is no longer a special case inside advance_to_close — it is
+    SUBSUMED by SAFEGUARD 1's break_no_progress_loop (a relentlessly re-raised objection handled K
+    times with no progress is exactly a no-progress reactive run). So advance_to_close LEAVES an open
+    objection alone (handle it first), and the deadlock-break now comes from the unified gate via
+    apply_gates. (Consolidation: the old `_recent_objection_handles` / `_BREAKTHROUGH_OBJECTION_HANDLES`
+    special case was removed and folded here — the unified mechanism is the single owner of loop-breaking.)
+    """
     cfg = make_config()
+    # advance_to_close alone no longer breaks through an open objection (it handles it first).
     b = BeliefState.fresh(); b.turn_count = 8; b.drivers["trust"] = 0.55; b.active_objection = "efficacy_doubt"
     handled_twice = [
         {"role": "agent", "act": "handle_objection"}, {"role": "user", "text": "..."},
         {"role": "agent", "act": "handle_objection"}, {"role": "user", "text": "..."},
     ]
-    out = gates.advance_to_close(Decision(act="handle_objection"), b, cfg, history=handled_twice)
-    assert out.act == "attempt_close" and out.tier == "consultation"
-    # With only ONE prior handle, keep handling (no premature break-through).
-    handled_once = [{"role": "agent", "act": "handle_objection"}, {"role": "user", "text": "..."}]
-    assert gates.advance_to_close(Decision(act="handle_objection"), b, cfg, history=handled_once).act == "handle_objection"
+    assert gates.advance_to_close(Decision(act="handle_objection"), b, cfg, history=handled_twice).act == "handle_objection"
+
+    # The unified breaker (via apply_gates) breaks the deadlock: K reactive handle_objection acts with
+    # the objection never clearing (no progress) forces a COMMIT — down-tiered to the free callback rung
+    # because the close would be blind (no discovery, neutral intent), so close_floor doesn't veto it.
+    from src.core.gates import _LOOP_BREAK_K
+    b2 = BeliefState.fresh(); b2.turn_count = 8; b2.drivers["trust"] = 0.55; b2.active_objection = "efficacy_doubt"
+    b2.meta = {
+        "recent_acts": ["handle_objection"] * _LOOP_BREAK_K,
+        "progress_snapshot": {"locked_slots": 0, "active_objection": "efficacy_doubt", "purchase_intent": 0.5},
+    }
+    history = [
+        {"role": "agent", "act": "handle_objection"}, {"role": "user", "text": "still no"},
+    ] * _LOOP_BREAK_K
+    out = apply_gates(Decision(act="handle_objection"), b2, cfg, history=history)
+    assert out.act == "attempt_close", "the unified loop-breaker must break the objection deadlock"
+
+    # Below K reactive acts (only one prior handle), the breaker does NOT fire — keep handling.
+    b3 = BeliefState.fresh(); b3.turn_count = 8; b3.drivers["trust"] = 0.55; b3.active_objection = "efficacy_doubt"
+    b3.meta = {
+        "recent_acts": ["handle_objection"],
+        "progress_snapshot": {"locked_slots": 0, "active_objection": "efficacy_doubt", "purchase_intent": 0.5},
+    }
+    out_keep = apply_gates(Decision(act="handle_objection"), b3, cfg, history=[
+        {"role": "agent", "act": "handle_objection"}, {"role": "user", "text": "..."},
+    ])
+    assert out_keep.act == "handle_objection"
 
 
 def test_advance_to_close_offers_free_callback_when_budget_constrained():

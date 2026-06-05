@@ -41,6 +41,15 @@
 #                         instead of answering questions forever (the can't-close fix). CB-48: it will
 #                         NOT take close-initiative over a RECURRING unanswered question (don't re-
 #                         convert address_direct_input's answer back into a close on a warm prospect).
+#                         Shares its close-readiness/tier test (_closeable_tier) with the loop-breaker.
+#   break_no_progress_loop— SAFEGUARD 1 (the ONE general loop-breaker): if the last K gated acts were
+#                         all REACTIVE (ask/confirm_known/pitch/answer_via_kb/handle_objection) AND
+#                         nothing PROGRESSED across them (no slot newly locked, no objection cleared,
+#                         no purchase_intent rise > epsilon — prior-turn snapshot kept by respond() in
+#                         meta), force a COMMIT: a close if closeable (_closeable_tier), else a genuine
+#                         escalation, else an honest bottom-line answer (NOT a (K+1)th loop turn).
+#                         SUBSUMES the old objection-deadlock special case AND catches the free-form
+#                         re-ask/re-offer loops the slot/objection-specific guards never covered.
 #   close_floor         — CB-29: forbid a PAID close (consultation/trial/enrollment) until real
 #                         discovery (min turns + enough filled discovery slots), applied to a directly
 #                         LLM-PROPOSED close too — kills the premature/pushy close. callback is exempt.
@@ -403,9 +412,16 @@ def escalate_only_if_warranted(
         a LATER turn).
     A GENUINE escalation reason is left untouched — Marcus's truly-unanswerable cases, distress, and
     explicit requests still escalate (escalation_triggers owns those and re-checks after this gate).
-    Conservative + tight: it ONLY rewrites a proposed `escalate`, and ONLY when no genuine reason
-    exists. R37: copy + mutate the Decision, never construct a fresh one or touch the core cycle."""
+    A break_no_progress_loop STICKY terminal (decision.meta["loop_terminal"], ISSUE 2) is ALSO left
+    untouched — it is a deliberate firm hand-off AFTER a soft commit was already tried and declined, so
+    redirecting it back into another selling/answer turn would resume the death-march this guard is
+    meant to avoid creating. Conservative + tight: it ONLY rewrites a proposed `escalate`, and ONLY when
+    no genuine reason exists. R37: copy + mutate the Decision, never construct a fresh one."""
     if decision.act != "escalate":
+        return decision
+    # A break_no_progress_loop sticky terminal is warranted by the loop policy (a declined soft commit
+    # already fired) — do NOT redirect it back into a selling/answer turn (that would re-loop).
+    if bool(decision.meta.get("loop_terminal")):
         return decision
     # A GENUINE escalation reason still escalates immediately — only a TRIGGERLESS escalate (the agent
     # bailing) is redirected. Reuse escalation_triggers' predicate so the gates can never disagree.
@@ -623,32 +639,42 @@ def address_direct_input(
     return decision
 
 
-# --- advance_to_close -------------------------------------------------------------------------
+# --- advance_to_close + the SHARED closeable/tier-selection logic ------------------------------
 
-# Reactive/stalling acts the agent gets stuck in; advance_to_close converts these to a close when the
-# belief is closeable. attempt_close/escalate/disqualify are never advanceable; handle_objection is
-# advanceable ONLY in the break-through case (a repeatedly-handled objection).
+# Reactive/stalling acts advance_to_close converts to a close when the belief is closeable.
+# attempt_close/escalate/disqualify/handle_objection are never advanceable here — an open objection is
+# handled first, and the objection-DEADLOCK breakthrough is now break_no_progress_loop's job (a no-
+# progress reactive run), so the old _recent_objection_handles / _BREAKTHROUGH_OBJECTION_HANDLES
+# special case is GONE — folded into the unified loop-breaker.
 _ADVANCEABLE_ACTS = frozenset({"answer_via_kb", "confirm_known", "pitch", "ask"})
-# After the agent has handled objections this many times recently, break the deadlock and advance
-# (a relentless objector who re-raises every turn would otherwise block every close).
-_BREAKTHROUGH_OBJECTION_HANDLES = 2
 
 
-def _recent_objection_handles(history: Optional[Sequence[Any]], lookback: int = 6) -> int:
-    """Count handle_objection acts among the last `lookback` agent turns — detects the agent being
-    stuck handling the same objection over and over (so it can advance instead)."""
-    if not history:
-        return 0
-    seen = handled = 0
-    for turn in reversed(list(history)):
-        if not isinstance(turn, dict) or turn.get("role") not in ("assistant", "agent"):
-            continue
-        seen += 1
-        if turn.get("act") == "handle_objection":
-            handled += 1
-        if seen >= lookback:
-            break
-    return handled
+def _closeable_tier(belief: BeliefState, config: AgentConfig, *, breakthrough: bool = False) -> Optional[str]:
+    """The SINGLE source of truth for "is this belief closeable, and at which tier?" (shared by
+    advance_to_close AND break_no_progress_loop so the close-readiness logic is never duplicated).
+
+    Returns the commitment-ladder tier to close at, or None when the belief is NOT closeable yet.
+    Mirrors advance_to_close's selection: budget-constrained -> the FREE 'callback' rung; very warm +
+    buying intent -> 'trial'; warmed (or breaking through a stalled objection) -> 'consultation';
+    otherwise not closeable (None). `breakthrough` lets the consultation rung fire on a stalled
+    objection even when trust hasn't reached the warm bar (the deadlock break)."""
+    trust = float(belief.drivers.get("trust", 0.0))
+    intent = float(belief.drivers.get("purchase_intent", 0.0))
+    price_sens = float(belief.drivers.get("price_sensitivity", 0.0))
+    refusals = int(belief.meta.get("affordability_refusal_count", 0))
+    budget_constrained = (
+        price_sens >= _threshold(config, "callback_price_sensitivity")
+        or refusals >= int(_threshold(config, "budget_refusals_before_callback"))
+    )
+    if budget_constrained:
+        return "callback"
+    if trust >= _threshold(config, "close_ready_trial_trust") and intent >= _threshold(
+        config, "close_ready_trial_intent"
+    ):
+        return "trial"
+    if trust >= _threshold(config, "close_ready_trust") or breakthrough:
+        return "consultation"
+    return None
 
 
 def advance_to_close(
@@ -660,16 +686,20 @@ def advance_to_close(
 ) -> Any:
     """Take the INITIATIVE to close once the belief says the prospect is closeable.
 
-    The LLM policy tends to stay reactive — answering an inquisitive prospect's questions forever (or
-    handling a relentless objector turn after turn) and never asking for the sale (the can't-close
-    failure: 0 close attempts even for warm, qualified prospects). This gate converts a reactive/
-    stalling act into an attempt_close at the right tier once at least `min_turns_before_close` turns
-    have passed and EITHER there is no open objection (warmth-gated close) OR the objection has been
-    handled repeatedly (break the deadlock with a low-pressure consultation). Tier selection:
+    The LLM policy tends to stay reactive — answering an inquisitive prospect's questions forever and
+    never asking for the sale (the can't-close failure: 0 close attempts even for warm, qualified
+    prospects). This gate converts a reactive/stalling act into an attempt_close at the right tier once
+    at least `min_turns_before_close` turns have passed AND there is no open objection (warmth-gated
+    close). Tier selection is shared with break_no_progress_loop via _closeable_tier():
       • budget-constrained (price_sensitivity high OR firm refusals) -> the FREE 'callback' rung — a
         no-budget prospect still gets a meeting, never a paid tier they'll reject;
       • else very warm + buying intent -> 'trial';
-      • else warmed (or breaking through an objection) -> 'consultation'.
+      • else warmed -> 'consultation'.
+    The OBJECTION-DEADLOCK breakthrough (a relentless objector handled repeatedly) is NO LONGER a
+    special case here — it is subsumed by break_no_progress_loop (SAFEGUARD 1): a relentless objector
+    handled K times with the objection never clearing is exactly a no-progress reactive run, so the
+    breakthrough close falls out of the general loop-breaker. advance_to_close therefore leaves an open
+    objection ALONE (handle it first); the breaker breaks the deadlock when it's a genuine stall.
     trust is the reliable warmth signal (purchase_intent in the agent's belief barely moves). The
     prospect's HONEST buy-gate still decides acceptance; NLG still has the open_question so the close
     acknowledges what they asked (not a dodge). Runs BEFORE pushiness_cap (which can veto an over-
@@ -686,45 +716,255 @@ def advance_to_close(
         and _question_recurs(belief, history)
     ):
         return decision
-    objection_open = bool(belief.active_objection)
-    breakthrough = objection_open and _recent_objection_handles(history) >= _BREAKTHROUGH_OBJECTION_HANDLES
-    can_advance = decision.act in _ADVANCEABLE_ACTS or (breakthrough and decision.act == "handle_objection")
-    if not can_advance:
+    if decision.act not in _ADVANCEABLE_ACTS:
         return decision
-    # An open objection that has NOT yet been handled enough times: keep handling, don't close over it.
-    if objection_open and not breakthrough:
+    # An open objection: keep handling it, don't close over it. The break-through (a relentlessly
+    # re-raised objection) is now break_no_progress_loop's job — a no-progress reactive run.
+    if bool(belief.active_objection):
+        return decision
+
+    tier = _closeable_tier(belief, config)
+    if tier is None:
         return decision
 
     trust = float(belief.drivers.get("trust", 0.0))
     intent = float(belief.drivers.get("purchase_intent", 0.0))
-    price_sens = float(belief.drivers.get("price_sensitivity", 0.0))
-    refusals = int(belief.meta.get("affordability_refusal_count", 0))
-    budget_constrained = (
-        price_sens >= _threshold(config, "callback_price_sensitivity")
-        or refusals >= int(_threshold(config, "budget_refusals_before_callback"))
-    )
-
-    if budget_constrained:
-        tier = "callback"
-    elif trust >= _threshold(config, "close_ready_trial_trust") and intent >= _threshold(
-        config, "close_ready_trial_intent"
-    ):
-        tier = "trial"
-    elif trust >= _threshold(config, "close_ready_trust") or breakthrough:
-        tier = "consultation"
-    else:
-        return decision
-
     out = decision.copy()
     out.act = "attempt_close"
     out.tier = tier
     out.target_slot = None
     out.rationale = (
-        f"advance_to_close: tier='{tier}' (trust={trust:.2f}, purchase_intent={intent:.2f}, "
-        f"breakthrough={breakthrough}, budget_constrained={budget_constrained}), "
+        f"advance_to_close: tier='{tier}' (trust={trust:.2f}, purchase_intent={intent:.2f}), "
         f"{belief.turn_count} turns in — taking initiative instead of staying reactive"
     )
     return out
+
+
+# --- break_no_progress_loop (SAFEGUARD 1: ONE general progress-based loop-breaker) -------------
+
+# Acts that are REACTIVE — the agent responding to the prospect without committing to a next step.
+# A run of these with NO progress is the free-form loop (Marcus re-asking an untracked "SAT score?"
+# ~7x; Dana re-offering "judge for yourself" 5x) that no slot/objection-specific guard caught.
+_REACTIVE_ACTS = frozenset({"ask", "confirm_known", "pitch", "answer_via_kb", "handle_objection"})
+# K — how many CONSECUTIVE reactive gated acts (with no progress across them) trip the breaker.
+# Conservative: a normal multi-objection call makes real progress (a slot locks / an objection clears /
+# intent rises) almost every turn, so 3 reactive-AND-stalled turns in a row is a genuine stall, not a
+# healthy call. Tuned against the pitch/close/objection tests so a real progressing call is NOT cut
+# short. The recent_acts window respond() maintains carries at most K acts.
+_LOOP_BREAK_K = 3
+# purchase_intent must rise by MORE than this since the prior turn to count as progress (the agent's
+# own intent barely moves, so a tiny jitter is not real progress).
+_PROGRESS_INTENT_EPSILON = 0.03
+
+
+def _locked_slot_count(belief: BeliefState) -> int:
+    """How many slots are at/above lock confidence right now (a slot reaching lock = progress)."""
+    return sum(1 for s in belief.slots if belief.slot_confidence(s) >= _LOCK_CONFIDENCE)
+
+
+def _made_progress_since_prior(belief: BeliefState) -> bool:
+    """PROGRESS this window = a discovery slot newly reached lock confidence, OR active_objection went
+    set->None, OR purchase_intent rose by > epsilon, compared to the prior-turn snapshot respond()
+    stamped on belief.meta["progress_snapshot"]. With no prior snapshot we conservatively treat the
+    state as progressing (don't trip the breaker before there's a window to judge)."""
+    snap = belief.meta.get("progress_snapshot")
+    if not isinstance(snap, dict):
+        return True  # no baseline yet -> not a stall
+    prior_locked = int(snap.get("locked_slots", 0))
+    prior_obj = snap.get("active_objection")
+    prior_intent = float(snap.get("purchase_intent", _NEUTRAL_PRIOR))
+    if _locked_slot_count(belief) > prior_locked:
+        return True  # a slot reached lock confidence
+    if prior_obj is not None and belief.active_objection is None:
+        return True  # an objection cleared
+    if float(belief.drivers.get("purchase_intent", 0.0)) - prior_intent > _PROGRESS_INTENT_EPSILON:
+        return True  # buying intent rose meaningfully
+    return False
+
+
+def _stalled_reactive_run(belief: BeliefState) -> bool:
+    """True when the last K gated acts (belief.meta["recent_acts"]) were ALL reactive — i.e. the agent
+    committed to nothing across the window. A non-reactive act (an attempt_close / escalate / etc.)
+    anywhere in the window breaks the run (we're not actually stuck looping)."""
+    recent = list(belief.meta.get("recent_acts", []))
+    if len(recent) < _LOOP_BREAK_K:
+        return False
+    window = recent[-_LOOP_BREAK_K:]
+    return all(a in _REACTIVE_ACTS for a in window)
+
+
+def break_no_progress_loop(
+    decision: Any,
+    belief: BeliefState,
+    config: AgentConfig,
+    *,
+    history: Optional[Sequence[Any]] = None,
+) -> Any:
+    """SAFEGUARD 1 — ONE general progress-based loop-breaker (subsumes the objection-deadlock special
+    case + catches the free-form re-ask/re-offer loops no slot/objection guard covered).
+
+    When the last K (=_LOOP_BREAK_K) consecutive GATED acts were all REACTIVE (ask / confirm_known /
+    pitch / answer_via_kb / handle_objection) AND there was NO progress across them — no discovery slot
+    newly locked, no active_objection cleared, no purchase_intent rise > epsilon (the prior-turn
+    snapshot is maintained by respond() in belief.meta) — the agent is genuinely stuck looping, so we
+    FORCE a COMMIT this turn instead of a (K+1)th identical reactive act:
+      • if the belief is closeable (the SHARED _closeable_tier test advance_to_close uses), attempt_close
+        at the lowest sensible reachable tier;
+      • else, if a genuine escalation reason fires (the EXACT _escalation_reason predicate
+        escalation_triggers owns), escalate;
+      • else, an honest bottom-line answer_via_kb (a real next-step turn, NOT another loop turn),
+        tagged decision.meta["loop_break"] so it's observable and so advance_to_close / the directness
+        guards treat it as a deliberate break, not a fresh reactive act.
+    Conservative + tight: it ONLY acts on a genuine stall (K reactive acts AND zero progress), so a
+    normal multi-objection call that advances each turn is never cut short. R37: copy + mutate the
+    Decision, never construct a fresh one. This is the unified replacement for the old
+    _recent_objection_handles / _BREAKTHROUGH_OBJECTION_HANDLES special case (now reachable here too):
+    a relentless objector handled K times with the objection never clearing is exactly a no-progress
+    reactive run, so the breakthrough close falls out of the general rule.
+
+    STICKY (ISSUE 2 — the dana_11 death-march): a soft forced-commit the prospect DECLINES must NOT be
+    re-offered every time the call re-stalls. respond() carries belief.meta["loop_break_fired"] once a
+    soft commit has fired; if the call STALLS AGAIN after that (another K reactive no-progress turns
+    following the declined commit), this is the SECOND break — we ESCALATE to a firm honest terminal
+    (escalate, marked loop_terminal so escalate_only_if_warranted leaves it alone) instead of offering
+    the same soft close once more. One soft commit, then escalate-and-stop; never re-loop.
+    """
+    if decision.act not in _REACTIVE_ACTS:
+        return decision  # already committing (close/escalate/disqualify) — nothing to break
+
+    # ESCALATE-AND-STAY: once the breaker has issued its terminal escalate for this loop
+    # (loop_terminal_fired latched by respond()), the loop decision is FINAL — any subsequent reactive
+    # turn re-escalates immediately (no need to re-accumulate another full K-stall). This keeps the
+    # call terminally escalated instead of relapsing into the reactive death-march the moment the
+    # escalate act reset the recent-acts run. (The runtime normally ends the call on escalation_imminent;
+    # this guarantees the brain itself won't resume answering if the call continues.)
+    if bool(belief.meta.get("loop_terminal_fired")):
+        out = decision.copy()
+        out.act = "escalate"
+        out.target_slot = None
+        out.tier = None
+        out.concession = None
+        out.meta = dict(out.meta)
+        out.meta["loop_break"] = True
+        out.meta["loop_terminal"] = True
+        out.rationale = (
+            "break_no_progress_loop: loop already escalated terminally — staying escalated rather than "
+            "relapsing into the reactive loop"
+        )
+        belief.escalation_imminent = True
+        return out
+
+    if not _stalled_reactive_run(belief):
+        return decision  # fewer than K reactive acts, or a commit broke the run — no stall
+    if _made_progress_since_prior(belief):
+        return decision  # something advanced this window — a healthy call, not a loop
+
+    # STICKY ESCALATION: a soft forced-commit already fired earlier and the call re-stalled (the prospect
+    # declined it and the agent relapsed into the loop). Don't re-offer the same soft close — give a firm
+    # honest terminal that asks for the decision and stops. Marked loop_terminal so escalate_only_if_
+    # warranted treats it as warranted (it is — we already tried the soft commit) and does NOT redirect
+    # it back into another selling/answer turn (which would resume the death-march).
+    if bool(belief.meta.get("loop_break_fired")):
+        out = decision.copy()
+        out.act = "escalate"
+        out.target_slot = None
+        out.tier = None
+        out.concession = None
+        out.meta = dict(out.meta)
+        out.meta["loop_break"] = True
+        out.meta["loop_terminal"] = True
+        out.rationale = (
+            f"break_no_progress_loop: STALLED AGAIN after a prior soft commit ({_LOOP_BREAK_K} more "
+            "reactive turns, no progress) — firm honest terminal (escalate) instead of re-offering the "
+            "same soft close; one soft commit then stop, never re-loop"
+        )
+        belief.escalation_imminent = True
+        return out
+
+    # FIRST break — we are genuinely stalled. Force a soft commit, lowest-friction first.
+    objection_open = bool(belief.active_objection)
+    tier = _closeable_tier(belief, config, breakthrough=objection_open)
+    if tier is not None:
+        # A PAID close that would be BLIND (no discovery + no readiness) is down-tiered to the FREE
+        # 'callback' rung: close_floor would veto a blind paid close anyway, but a loop must still BREAK
+        # — so we commit to the no-cost next step (a callback) instead of bouncing back to a loop turn.
+        # callback keeps the buy-gate pure (the no-budget rung) and is exempt from close_floor.
+        if tier in _PAID_CLOSE_TIERS and _paid_close_is_blind(belief, config):
+            tier = _FREE_LADDER_TIER
+        out = decision.copy()
+        out.act = "attempt_close"
+        out.tier = tier
+        out.target_slot = None
+        out.concession = None
+        out.meta = dict(out.meta)
+        out.meta["loop_break"] = True
+        out.rationale = (
+            f"break_no_progress_loop: {_LOOP_BREAK_K} reactive turns with no progress — forcing a "
+            f"commit (attempt_close@{tier}) instead of looping"
+        )
+        return out
+
+    # Not closeable: a genuine escalation reason short-circuits to a real hand-off.
+    if _escalation_reason(decision, belief, config, history) is not None:
+        out = decision.copy()
+        out.act = "escalate"
+        out.target_slot = None
+        out.tier = None
+        out.concession = None
+        out.meta = dict(out.meta)
+        out.meta["loop_break"] = True
+        out.meta["loop_terminal"] = True
+        out.rationale = (
+            "break_no_progress_loop: stalled with no progress and a genuine escalation reason — "
+            "handing off instead of looping"
+        )
+        belief.escalation_imminent = True
+        return out
+
+    # Neither closeable nor escalatable: give an HONEST bottom-line + a concrete next step (answer the
+    # open question with the facts on hand, or state plainly what we can't do and offer the next step).
+    # NOT another loop turn — tagged so it's observable and not re-counted as a fresh reactive act.
+    out = decision.copy()
+    out.act = "answer_via_kb"
+    out.target_slot = None
+    out.tier = None
+    out.meta = dict(out.meta)
+    out.meta["loop_break"] = True
+    out.rationale = (
+        f"break_no_progress_loop: {_LOOP_BREAK_K} reactive turns with no progress and not closeable — "
+        "giving an honest bottom-line + a concrete next step instead of looping"
+    )
+    return out
+
+
+# --- loop-breaker bookkeeping (maintained by respond.py, consumed by the breaker) -------------
+
+def progress_snapshot(belief: BeliefState) -> dict[str, Any]:
+    """Capture the progress-relevant state of `belief` for the loop-breaker's next-turn comparison.
+
+    respond() stamps this on the NEW belief's meta["progress_snapshot"] AFTER each turn; on the next
+    turn break_no_progress_loop compares the (DST-updated) current belief to it to detect PROGRESS (a
+    slot newly locked / an objection cleared / purchase_intent risen). Kept here so the snapshot shape
+    is owned by the same module that reads it — respond.py just calls this, never hard-codes the keys."""
+    return {
+        "locked_slots": _locked_slot_count(belief),
+        "active_objection": belief.active_objection,
+        "purchase_intent": float(belief.drivers.get("purchase_intent", _NEUTRAL_PRIOR)),
+    }
+
+
+def record_recent_act(belief: BeliefState, act: Optional[str]) -> None:
+    """Append the GATED act to belief.meta["recent_acts"], trimmed to the breaker's K-act window.
+
+    respond() calls this with the final gated act each turn so break_no_progress_loop sees the trailing
+    run of acts. Trimmed to _LOOP_BREAK_K so the list never grows unbounded and the window is exactly
+    what the breaker inspects. A None act (defensive) is ignored. Mutates belief in place; copy()
+    carries meta to the next turn's input."""
+    if not act:
+        return
+    recent = list(belief.meta.get("recent_acts", []))
+    recent.append(str(act))
+    belief.meta["recent_acts"] = recent[-_LOOP_BREAK_K:]
 
 
 # --- close_floor (CB-29: no premature/pushy close before real discovery) -----------------------
@@ -738,6 +978,17 @@ _PAID_CLOSE_TIERS = frozenset({"consultation", "trial", "enrollment"})
 # The neutral driver prior — purchase_intent at/below this means the prospect has NOT signaled any
 # buying readiness yet, so a paid close with zero discovery is the agent closing BLIND (the defect).
 _NEUTRAL_PRIOR = 0.5
+
+
+def _paid_close_is_blind(belief: BeliefState, config: AgentConfig) -> bool:
+    """The close_floor blind-close predicate, factored out so break_no_progress_loop can reuse it
+    (no duplication): a PAID close is BLIND when NO non-budget discovery slot is filled AND
+    purchase_intent has NOT risen above the neutral prior. The free 'callback' rung is never blind."""
+    required = _required_discovery_slots(config)
+    filled = sum(1 for s in required if belief.slot_confidence(s) >= _LOCK_CONFIDENCE)
+    has_discovery = filled >= int(_threshold(config, "discovery_slots_before_close"))
+    signals_readiness = float(belief.drivers.get("purchase_intent", 0.0)) > _NEUTRAL_PRIOR
+    return not (has_discovery or signals_readiness)
 
 
 def close_floor(
@@ -769,12 +1020,8 @@ def close_floor(
     if decision.tier == "callback":
         return decision  # the free rung is exempt — never pushy
 
-    required = _required_discovery_slots(config)
-    filled = sum(1 for s in required if belief.slot_confidence(s) >= _LOCK_CONFIDENCE)
-    has_discovery = filled >= int(_threshold(config, "discovery_slots_before_close"))
-    signals_readiness = float(belief.drivers.get("purchase_intent", 0.0)) > _NEUTRAL_PRIOR
     # The close stands unless the agent is closing BLIND: no discovery AND no readiness signal.
-    if has_discovery or signals_readiness:
+    if not _paid_close_is_blind(belief, config):
         return decision
 
     out = decision.copy()
@@ -783,7 +1030,7 @@ def close_floor(
     out.tier = None
     out.target_slot = None
     out.rationale = (
-        f"close_floor: closing blind ({filled} discovery slot(s), no readiness signal); "
+        "close_floor: closing blind (no discovery slot, no readiness signal); "
         f"holding off a {decision.tier or 'paid'} close — building value instead of pushing"
     )
     return out
@@ -1021,7 +1268,9 @@ def apply_gates(
     hands off gracefully before any gate can propose pressure. Between them: skip_known ->
     no_repeat_discovery (CB-35) -> establish_who_first (CB-34) -> address_direct_input ->
     must_clear_objection -> price_gate -> advance_to_close -> close_floor -> pushiness_cap ->
-    no_authority_prefers_callback (CB-50: a no-authority escalate -> a callback offer) ->
+    break_no_progress_loop (SAFEGUARD 1: a stalled K-reactive-no-progress run that survived the close/
+    pushiness back-offs -> a forced commit) -> no_authority_prefers_callback (CB-50: a no-authority
+    escalate -> a callback offer) ->
     escalate_only_if_warranted (CB-50: ANY surviving triggerless escalate -> a callback offer on a
     gatekeeper read, else a non-terminal selling act — the agent keeps selling instead of bailing) ->
     offer_low_commitment_on_budget (last, so the free-callback offer has final say). The closing
@@ -1062,6 +1311,16 @@ def apply_gates(
     # (min turns + enough filled discovery slots) — kills the premature/pushy close at turns 9 & 11.
     d = close_floor(d, belief, config, history=history)
     d = pushiness_cap(d, belief, config, history=history)
+    # SAFEGUARD 1: ONE general progress-based loop-breaker. If the last K gated acts were all REACTIVE
+    # with NO progress (slot lock / objection clear / intent rise), force a COMMIT — a close if
+    # closeable, else a genuine escalation, else an honest bottom-line. Subsumes the old objection-
+    # deadlock special case AND catches the free-form re-ask/re-offer loops the slot/objection guards
+    # missed. Placed AFTER close_floor + pushiness_cap so it sees the FINAL reactive act those gates may
+    # have backed a blind/over-aggressive close DOWN to (a warm-but-no-discovery prospect that bounces
+    # advance_to_close's close back to a pitch is exactly the silent loop the breaker must catch). The
+    # breaker itself down-tiers a blind PAID forced close to the free callback rung, so it never closes
+    # blind — close_floor protection is preserved without re-running it.
+    d = break_no_progress_loop(d, belief, config, history=history)
     # CB-50: a no-authority gatekeeper escalate (LLM-proposed, no genuine trigger) is down-tiered to a
     # free callback offer for the real decision-maker — don't waste a human on a lead who can't decide.
     # Placed late so it sees the (possibly rewritten) act; the final escalation re-check below leaves a

@@ -26,19 +26,40 @@
 # restating the same hedge/offer. ONLY the agent's lines are passed (never the caller transcript) — the
 # distillation-preserving choice (no new inventable facts). Public respond/respond_stream signatures are
 # unchanged (history is already a param), so the voice worker is unaffected.
+# SAFEGUARD 1 (loop-breaker bookkeeping): _decide_turn maintains belief.meta["recent_acts"] (the last K
+# gated acts) + ["progress_snapshot"] (prior-turn locked-slot count / active_objection / purchase_intent)
+# so gates.break_no_progress_loop can detect a stalled K-reactive-no-progress run and force a commit.
+# Both are stamped from the GATED decision/new_belief and carried across the call by BeliefState.copy(),
+# so the blocking + streaming paths feed the breaker IDENTICAL inputs (it runs inside the shared decide()).
+# ISSUE 2 stickiness: once a forced commit fires (decision.meta["loop_break"]) we latch
+# meta["loop_break_fired"] so a SECOND re-stall escalates to a firm terminal, not the same soft close;
+# and once the terminal escalate fires (meta["loop_terminal"]) we latch meta["loop_terminal_fired"] so
+# the breaker stays escalated (escalate-and-stay) instead of relapsing into the loop if the call continues.
+# SAFEGUARD 2 (runtime grounding) — ASYMMETRIC by design and TIGHTLY scoped: the BLOCKING respond()
+# path runs retriever.grounded() on a CLAIM reply (answer_via_kb/handle_objection/pitch) AFTER NLG, but
+# only REGENERATES (then falls back to a safe honest line) when the reply contains a genuine fabricated
+# SPECIFIC — an unsupported NUMBER, an unsupported strict CLAIM_TOKEN, or an invented STUDENT-OUTCOME
+# pattern (grade/score jump). A normal on-topic efficacy/objection answer PASSES UNTOUCHED even when
+# grounded()'s strict term-overlap ratio is low (the broad ratio arm was dropped — it sprayed the canned
+# fallback ~4x/turn on Marcus/Dana). The STREAMING respond_stream() path CANNOT un-speak a streamed
+# token, so it does NOT regenerate; it relies on the same hardened first-line grounding rule in the
+# prompt and only FLAGS an ungrounded streamed reply on decision.meta["grounding"] for observability.
+# R37 parity preserved: both paths run the SAME brain; only the blocking path gets the regenerate backstop.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional, Sequence
 
 from src.config.settings import AgentConfig
-from src.core import dst
+from src.core import dst, gates
 from src.core.belief_state import BeliefState
 from src.core.llm import LLMClient
 from src.core.nlg import realize, realize_stream
 from src.core.policy import Decision, decide
+from src.kb import retriever
 
 # One structured line per agent turn with the three model-call stage timings + total. Each stage is
 # dominated by exactly ONE LLM round-trip (the slot/gate/trend work between calls is sub-millisecond),
@@ -53,6 +74,156 @@ _TOOL_ACTS = frozenset({"answer_via_kb"})
 # CB-35: discovery acts that ASK the prospect for a slot value (used to count re-asks). confirm_known
 # is excluded — it confirms what we already have, it does not re-prompt the prospect for the answer.
 _ASK_ACTS = frozenset({"ask"})
+
+
+# SAFEGUARD 2 (runtime grounding): acts that ASSERT a product fact/proof — the only turns the grounding
+# guard checks. A bare ask/confirm_known/escalate asserts nothing, so it is never grounding-checked.
+# Mirrors loop/grading._FACTUAL_ACTS (minus confirm_known, which only echoes an already-known slot).
+_CLAIM_ACTS = frozenset({"answer_via_kb", "handle_objection", "pitch"})
+
+# The honest fallback line spoken when a claim reply is STILL ungrounded after one regenerate — better
+# to say plainly that we don't have the specific than to speak a fabrication (the failure SAFEGUARD 2
+# fixes: invented "D to a B+" student outcomes under pressure). Keeps a concrete next step.
+_UNGROUNDED_FALLBACK = (
+    "I don't have a specific figure I can quote you on that, but I can connect you with the exact "
+    "details and a plan that fits — would that help?"
+)
+
+
+# SAFEGUARD 2 — an INVENTED STUDENT-OUTCOME pattern: a grade-jump / score-jump narrative ("from a D to
+# a B+", "went from a 2 to a 4", "scored an A on the final", "jumped 120 points on the SAT"). This is
+# the dangerous fabrication Safeguard 2 caught (the D->B+ story) — it has no price/percent so the NUMBER
+# arm misses it, and "scored"/"jumped" aren't CLAIM_TOKENS. We detect the shape directly so it's flagged
+# even when the broad ratio arm is gone. Tight + literal so it does NOT fire on a normal efficacy answer.
+_OUTCOME_FABRICATION_RES = (
+    # "from a D to a B(+)", "from a C- to an A", "from a 2 to a 4" — a graded before->after jump.
+    re.compile(r"\bfrom\s+(?:a|an)?\s*[A-F][+\-]?\b.*?\bto\s+(?:a|an)?\s*[A-F][+\-]?\b", re.I),
+    re.compile(r"\bfrom\s+(?:a|an)?\s*\d+\b.*?\bto\s+(?:a|an)?\s*\d+\b", re.I),
+    # "went/jumped/improved/rose/climbed/raised ... from ... to ..." (a movement verb + a jump).
+    re.compile(
+        r"\b(?:went|jump(?:ed)?|improv(?:ed)?|ros(?:e)?|climb(?:ed)?|rais(?:ed)?|"
+        r"bump(?:ed)?|boost(?:ed)?|gain(?:ed)?)\b.{0,40}?\bfrom\b.{0,40}?\bto\b",
+        re.I,
+    ),
+    # "scored/got/earned an A/B/... on the final/test/exam/quiz" — an invented graded result.
+    re.compile(
+        r"\b(?:scored|got|earned|aced)\b.{0,20}?\b(?:an?\s+)?[A-F][+\-]?\b.{0,20}?"
+        r"\b(?:final|exam|test|quiz|midterm)\b",
+        re.I,
+    ),
+    # "jumped/gained/rose N points" — an invented point-gain stat presented as a specific outcome.
+    re.compile(
+        r"\b(?:jump(?:ed)?|gain(?:ed)?|ros(?:e)?|improv(?:ed)?|rais(?:ed)?|up)\b.{0,15}?\b\d+\s*points?\b",
+        re.I,
+    ),
+)
+
+
+def _has_invented_outcome(reply: str, report: Any) -> bool:
+    """True when the reply contains an invented STUDENT-OUTCOME pattern (grade/score jump) that the KB
+    does NOT support. We only treat it as invented when the report is ungrounded (grounded() already
+    confirmed the specifics aren't backed) AND the literal outcome shape is present — so a real KB-backed
+    outcome (none currently exist in kb_v0/results.json, which carries only aggregate proof) wouldn't be
+    flagged, and a normal efficacy answer with no before->after narrative never matches the regexes."""
+    return any(rx.search(reply) for rx in _OUTCOME_FABRICATION_RES)
+
+
+def _is_fabrication(reply: str, report: Any, facts: Sequence[Any]) -> bool:
+    """Decide whether an ungrounded reply is a genuine FABRICATION worth replacing — TIGHTLY scoped to
+    invented SPECIFICS only (the over-fire fix). grounded() is a strict term-overlap check that scores
+    almost any non-verbatim prose as ungrounded, so a broad ratio test sprayed the canned fallback over
+    normal efficacy / "is this a scam" / proof answers (60 fires across 15 transcripts). We therefore
+    fire ONLY on a real fabricated specific and let an ordinary on-topic answer PASS UNTOUCHED even when
+    grounded()'s ratio is low:
+      (a) an unsupported NUMBER presented as a stat/figure (an invented "120 points", "8 weeks", "$299"
+          — report.unsupported_numbers);
+      (b) an unsupported strict CLAIM_TOKEN (a curated promise word: guarantee/refund/proven/
+          accredited/free/... not backed by the KB);
+      (c) an invented STUDENT-OUTCOME pattern (grade-jump / score-jump narrative — the D->B+ story shape
+          the NUMBER + CLAIM_TOKEN arms both miss).
+    The broad SOFT ratio arm is GONE: a normal objection/efficacy/value answer with NO fabricated
+    specific is NOT a fabrication, regardless of grounded()'s ratio. grounded() returns grounded=True for
+    a clean reply, so this is only consulted on a ratio/number/claim failure."""
+    # (a) an unsupported number presented as a figure.
+    if report.unsupported_numbers:
+        return True
+    # (b) an unsupported strict claim token in the reply (re-derive the strict subset; the report's
+    # surfaced term list mixes claim tokens with ordinary ratio-failure words).
+    reply_words = {w.lower() for w in retriever._WORD_RE.findall(reply)}
+    if reply_words & retriever.CLAIM_TOKENS & set(report.unsupported_terms or []):
+        return True
+    if reply_words & retriever.CLAIM_TOKENS and not facts:
+        return True  # a promise word with no facts at all to support it is unsupported by definition
+    # (c) an invented student-outcome narrative (grade/score jump) the KB doesn't back.
+    if _has_invented_outcome(reply, report):
+        return True
+    # NO broad ratio arm — a normal on-topic answer with no fabricated specific passes untouched.
+    return False
+
+
+async def _ground_blocking_reply(
+    reply: str,
+    decision: Decision,
+    belief: BeliefState,
+    config: AgentConfig,
+    llm_client: LLMClient,
+    retrieved_facts: Optional[Sequence[Any]],
+    own_last_lines: Sequence[str],
+) -> str:
+    """SAFEGUARD 2 — enforce grounding on the live BLOCKING reply for a CLAIM turn (no-op otherwise).
+
+    For a claim act (answer_via_kb/handle_objection/pitch) only, run retriever.grounded(reply, facts)
+    and consult _is_fabrication() — which fires ONLY on a genuine fabricated SPECIFIC (an unsupported
+    number, an unsupported strict CLAIM_TOKEN, or an invented grade/score-jump outcome), NOT on a merely
+    low-ratio on-topic answer. On a fabrication, REGENERATE once via NLG with the hardened grounding
+    instruction (grounding_retry=True); if it is STILL a fabrication, fall back to a safe honest line.
+    A grounded reply, a non-claim turn, OR an ungrounded-but-not-fabrication reply passes through
+    untouched and makes NO extra LLM call. NEVER raises — any guard failure returns the original reply
+    (the call path must not crash). The chosen reply + whether it was regenerated/replaced is stamped on
+    decision.meta["grounding"] for observability."""
+    if decision.act not in _CLAIM_ACTS:
+        return reply
+    facts = list(retrieved_facts or [])
+    try:
+        report = retriever.grounded(reply, facts)
+    except Exception:
+        return reply  # a guard failure must never crash the turn — keep the original reply
+    # A grounded reply, OR an ungrounded-but-not-fabrication reply (a benign on-topic prose pitch with
+    # no invented specific), passes through untouched — no extra LLM call. Only a FABRICATION (an
+    # invented figure/promise/outcome-story) is regenerated.
+    if report.grounded or not _is_fabrication(reply, report, facts):
+        decision.meta["grounding"] = {
+            "checked": True, "grounded": bool(report.grounded), "action": "passthrough",
+        }
+        return reply
+
+    # Fabrication: regenerate ONCE with the hardened instruction.
+    try:
+        regenerated = await realize(
+            decision, belief, config, llm_client,
+            retrieved_facts=retrieved_facts,
+            own_last_lines=own_last_lines,
+            grounding_retry=True,
+        )
+        regen_report = retriever.grounded(regenerated, facts)
+    except Exception:
+        # Regeneration call failed — do NOT speak the flagged original; use the safe honest line.
+        decision.meta["grounding"] = {
+            "checked": True, "grounded": False, "action": "fallback",
+            "unsupported": list(report.unsupported_numbers) + list(report.unsupported_terms),
+        }
+        return _UNGROUNDED_FALLBACK
+    # The regeneration is accepted if it is grounded OR at least no longer a fabrication (the hardened
+    # instruction steered it to an honest, specific-free line that the strict ratio bar may still trip).
+    if regen_report.grounded or not _is_fabrication(regenerated, regen_report, facts):
+        decision.meta["grounding"] = {"checked": True, "grounded": False, "action": "regenerated"}
+        return regenerated
+    # Still a fabrication after the regenerate -> the safe honest line (never speak the invention).
+    decision.meta["grounding"] = {
+        "checked": True, "grounded": False, "action": "fallback",
+        "unsupported": list(regen_report.unsupported_numbers) + list(regen_report.unsupported_terms),
+    }
+    return _UNGROUNDED_FALLBACK
 
 
 def _record_asked_slot(belief: BeliefState, decision: Any) -> None:
@@ -175,6 +346,23 @@ async def _decide_turn(
     # slot + increments the count; any non-ask clears the pending marker so a stale one can't linger.
     _record_asked_slot(new_belief, decision)
 
+    # SAFEGUARD 1 bookkeeping: maintain the loop-breaker's inputs on new_belief.meta (carried to the
+    # next turn by BeliefState.copy()). PRIOR-turn recent_acts + progress_snapshot were already on the
+    # belief when apply_gates ran (so the breaker saw them); now record THIS turn's GATED act into the
+    # K-act window and overwrite the snapshot with the CURRENT state so next turn can detect progress
+    # (a slot newly locked / an objection cleared / purchase_intent risen) since this turn.
+    gates.record_recent_act(new_belief, decision.act)
+    new_belief.meta["progress_snapshot"] = gates.progress_snapshot(new_belief)
+    # ISSUE 2 (stickiness): once the loop-breaker has fired a forced commit this call, latch it so a
+    # SUBSEQUENT re-stall escalates to a firm terminal instead of re-offering the same soft close. A
+    # sticky one-way flag carried by copy(); the breaker reads it on the next stall. A second flag,
+    # loop_terminal_fired, latches once the terminal escalate has fired so the breaker stays escalated
+    # (escalate-and-stay) rather than relapsing into the loop if the call continues past the hand-off.
+    if decision.meta.get("loop_break"):
+        new_belief.meta["loop_break_fired"] = True
+    if decision.meta.get("loop_terminal"):
+        new_belief.meta["loop_terminal_fired"] = True
+
     # CB-28: when this turn is a TOOL-USE act (answer_via_kb) grounded in retrieved facts, capture
     # the facts that grounded it on decision.meta["retrieved"] (JSON-able strings) so the runtime can
     # persist them onto Turn.retrieved and Call Review can show WHAT was pulled. Stamped only for the
@@ -266,10 +454,18 @@ async def respond(
         retrieved_facts=retrieved_facts, last_user_act=last_user_act,
     )
 
+    own_lines = _own_last_lines(history)  # CB-48: no-restate context (own lines only)
     reply_text = await realize(
         decision, new_belief, config, llm_client,
         retrieved_facts=retrieved_facts,
-        own_last_lines=_own_last_lines(history),  # CB-48: no-restate context (own lines only)
+        own_last_lines=own_lines,
+    )
+    # SAFEGUARD 2: on the BLOCKING path enforce grounding for a CLAIM turn — regenerate once on an
+    # ungrounded reply (a fabricated figure/outcome), then fall back to a safe honest line. A grounded
+    # reply or a non-claim (bare ask/confirm/escalate) passes through with no extra LLM call. The
+    # streaming path cannot un-speak a token, so it does NOT get this regenerate backstop (see below).
+    reply_text = await _ground_blocking_reply(
+        reply_text, decision, new_belief, config, llm_client, retrieved_facts, own_lines,
     )
     t3 = time.perf_counter()
 
@@ -328,4 +524,23 @@ async def respond_stream(
     holder.tokens = parts
     holder.reply = "".join(parts)
     holder.ready = True
+    # SAFEGUARD 2 (streaming asymmetry): a streamed token CANNOT be un-spoken, so we do NOT regenerate
+    # mid-stream — the hardened first-line grounding rule in the prompt is the constraint here. We only
+    # FLAG an ungrounded claim reply on decision.meta["grounding"] for observability (so a downstream
+    # monitor/grader can surface it). The blocking respond() path keeps the regenerate-on-ungrounded
+    # backstop; R37 parity holds — both paths run the SAME brain, only the blocking path can rewrite.
+    if decision.act in _CLAIM_ACTS:
+        try:
+            report = retriever.grounded(holder.reply, list(retrieved_facts or []))
+            decision.meta["grounding"] = {
+                "checked": True,
+                "grounded": bool(report.grounded),
+                "action": "stream_flag_only",
+                "unsupported": (
+                    list(report.unsupported_numbers) + list(report.unsupported_terms)
+                    if not report.grounded else []
+                ),
+            }
+        except Exception:
+            pass  # observability only — never affect the streamed turn
     _stamp_timings(decision, new_belief, llm_client, t0=t0, t1=t1, t2=t2, t3=t3)
