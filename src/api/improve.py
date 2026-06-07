@@ -1,20 +1,26 @@
 # Operator-dashboard IMPROVE API (plan U16 — Improve mode). The 4 Improve screens read/write JSON
 # through these endpoints: P6 Experiment Lab (GET /api/experiments — the before/after champion-vs-
 # challenger records; POST /api/experiments/run kicks off a live A/B between the champion and a single
-# changed value ASYNCHRONOUSLY — it persists a `running` record + returns 202 IMMEDIATELY, then runs
+# changed value ASYNCHRONOUSLY — it persists a `running` record + returns 202 IMMEDIATELY with the
+# effective (floored) n so the UI quotes the sample size that will ACTUALLY run (CB-57), then runs
 # the (paid, minutes-long) A/B in a BACKGROUND task that settles the SAME record to its terminal state
 # on completion/timeout/crash (CB-15/CB-20: the button never hangs and a run never lingers `running`
-# forever); POST /api/experiments/scaffold builds a draft experiment seeded from a reviewed call so the
-# review page can open a per-experiment review before running, CB-19; GET /api/experiments/{id} returns
-# ONE experiment's detail + its A/B "mock calls" — the champion-arm + challenger-arm self-play episodes
-# the run persisted, each openable in Review, plus the failure reason, CB-24/CB-25), P7 Approval Queue (GET /api/approvals = experiments in
-# `blocked` state, plus POST .../approve -> promote the challenger to champion, POST .../reject), P8
-# KB/Playbook Editor (GET /api/kb returns the REAL grounded corpus from the kb_chunk table grouped by
-# section — the facts/objection-rebuttals the agent grounds answers on, NOT placeholder strings; GET
-# /api/playbook shows the current champion config; POST /api/kb + /api/playbook SAVE a DRAFT CHALLENGER
-# — a NEW experiment record built via the generator's pure config mutators that NEVER touches
-# version_lineage, so the live champion is unchanged, R20), and P9 Version History (GET /api/versions =
-# the lineage tree + champion; POST /api/versions/{v}/rollback re-promotes a prior version).
+# forever); CB-56: every launch gets a UNIQUE experiment_id (timestamp suffix) so re-running a
+# dimension never clobbers the prior record — old ids remain backward-compatible; POST
+# /api/experiments/scaffold builds a draft experiment seeded from a reviewed call so the review page
+# can open a per-experiment review before running, CB-19; GET /api/experiments/{id} returns ONE
+# experiment's detail + its A/B "mock calls" — the champion-arm + challenger-arm self-play episodes
+# the run persisted, each openable in Review, plus the failure reason, CB-24/CB-25), P7 Approval Queue
+# (GET /api/approvals = experiments in `blocked` state, plus POST .../approve -> promote the challenger
+# to champion, POST .../reject), P8 KB/Playbook Editor (GET /api/kb returns the REAL grounded corpus
+# from the kb_chunk table grouped by section — the facts/objection-rebuttals the agent grounds answers
+# on, NOT placeholder strings; GET /api/playbook shows the current champion config; POST /api/kb +
+# /api/playbook SAVE a DRAFT CHALLENGER — a NEW experiment record built via the generator's pure
+# config mutators that NEVER touches version_lineage, so the live champion is unchanged, R20), and P9
+# Version History (GET /api/versions = the lineage tree + champion; POST /api/versions/{v}/rollback
+# re-promotes a prior version). CB-58: _settle_failed_run no longer conflates timed-out/crashed runs
+# with guardrail regressions — failed runs use guardrail="pass" + a plain-English reason so rejected
+# cards show exactly one truthful terminal story.
 # DB-INJECTABLE the same way src.api.operate is: an ImproveStore protocol abstracts the data layer so
 # create_improve_router(improve_store=...) takes the real src.memory.store in prod and a seeded
 # in-memory fake in tests (no Postgres). The run endpoint also takes an injected LLM factory (prod: a
@@ -27,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from typing import Any, Awaitable, Callable, Optional, Protocol
 
 from fastapi import APIRouter, HTTPException
@@ -664,6 +671,21 @@ _RUN_TIMEOUT_FLOOR_S = 300.0
 _RUN_TIMEOUT_CEILING_S = 1800.0
 
 
+def unique_run_id(challenger_version: str) -> str:
+    """CB-56: Generate a unique, monotonic experiment_id for each run launch.
+
+    Uses a millisecond-precision timestamp suffix so re-running the same dimension never collides with
+    the prior record. Format: RUN-{challenger_version}-{timestamp_ms}. Old ids of the form
+    RUN-{version} (no timestamp suffix) remain parseable and loadable — backward-compat is purely
+    additive (old records still display; only new launches get a suffix).
+
+    NOTE: arm_episode_id derivation (CB-25) uses the full experiment_id as a prefix, so each unique
+    run gets its own arm episode namespace automatically — no separate change needed there.
+    """
+    ts = int(time.time() * 1000)
+    return f"RUN-{challenger_version}-{ts}"
+
+
 def compute_run_timeout_s(
     n: int,
     max_turns: int = _RUN_MAX_TURNS,
@@ -958,14 +980,23 @@ def create_improve_router(
 
         CB-24: `reason` is the SPECIFIC failure detail captured by the background task (a timeout's
         elapsed budget, or the exception class) — falls back to a generic message only when the caller
-        couldn't classify the failure."""
+        couldn't classify the failure.
+
+        CB-58: a failed/timed-out run did NOT run a guardrail comparison, so guardrail stays "pass"
+        (there is no regression to report — the run simply did not complete). Setting guardrail="trip"
+        here conflates infrastructure failure with a guardrail regression, which renders contradictory
+        messaging on the card (red guardrail language for a run that never produced data). Plain-English
+        reason text describes what actually happened."""
         record = _running_record(
             experiment_id, champion, challenger, n=n, population=population, name=name
         )
         record.state = "rejected"
-        record.guardrail = "trip"
+        # CB-58: do NOT set guardrail="trip" — the run never produced a comparison so there is no
+        # regression to report. Keep guardrail at the neutral "pass" default and let the plain-English
+        # reason on the card explain the actual failure.
+        record.guardrail = "pass"
         record.guardrail_reason = reason or (
-            "the run did not complete (timed out or failed) — no result recorded"
+            "The run did not complete — no result was recorded."
         )
         await store.save_experiment(record)
 
@@ -1020,8 +1051,9 @@ def create_improve_router(
             )
         await run_semaphore.acquire()
 
-        # Persist a `running` record + return it immediately. The background task upserts this SAME id.
-        experiment_id = f"RUN-{challenger.challenger_version}"
+        # CB-56: every launch gets a UNIQUE, monotonic id (timestamp suffix) so re-running the same
+        # dimension never clobbers the prior record. Old ids (RUN-{version}, no suffix) still load/display.
+        experiment_id = unique_run_id(challenger.challenger_version)
         population = f"Held-out · {n} personas"
         if req.episode_id:  # CB-19: a run scaffolded from a reviewed call carries its origin.
             population = f"{population} · seeded from a reviewed call"
@@ -1048,10 +1080,20 @@ def create_improve_router(
         _run_tasks.add(task)
         task.add_done_callback(_run_tasks.discard)
 
+        # CB-57: include the EFFECTIVE (floored/capped) n and the bounds in the 202 response so the
+        # UI can quote the n that will actually run, not the raw requested n.
         # 202 Accepted: the run is started, not finished. `decision` is "running" until the poll settles.
         return JSONResponse(
             status_code=202,
-            content={"experiment": experiment_to_dict(running), "decision": "running"},
+            content={
+                "experiment": experiment_to_dict(running),
+                "decision": "running",
+                # CB-57: the actual n the backend will use (after floor/cap), plus the bounds so the
+                # dialog can quote this exact number and note when the input was floored.
+                "effective_n": n,
+                "n_min": _MIN_RUN_N,
+                "n_max": _MAX_RUN_N,
+            },
         )
 
     @router.post("/api/experiments/scaffold")

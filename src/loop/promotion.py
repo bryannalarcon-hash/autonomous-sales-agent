@@ -10,6 +10,8 @@
 # gate -> optional promote, so the R36 pause is LIVE on the default path (not a dead None). Reuses
 # src.loop.grading.guardrails_regressed + src.loop.sim2real; async for the store/runner/reporter
 # seams. NO LiveKit / numpy / scipy / pandas; SEEDED random only.
+# CB-58: all operator-facing reason strings are written in plain English — no Python flag names
+# (challenger_better is False, is_extreme, etc.) ever appear in a reason the UI renders.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -103,26 +105,28 @@ def evaluate_promotion(
         )
 
     # 2. The bar — evaluate each criterion and record WHY any failed.
+    # CB-58: all reason strings use plain English; no Python flag names (challenger_better, is_extreme,
+    # etc.) appear — these reasons may render on operator-facing card footers.
     reasons: list[str] = []
     lift_ok = experiment.comparison.challenger_better
     if not lift_ok:
         reasons.append(
-            "no significant lift: challenger_better is False (delta CI includes 0 — not "
-            "statistically separated from noise)"
+            "No significant lift detected — the difference between the two configs fell within "
+            "statistical noise (delta confidence interval includes zero)."
         )
     regressed = guardrails_regressed(
         experiment.champion_guardrails, experiment.challenger_guardrails
     )
     if regressed:
         reasons.append(
-            "guardrail regression: challenger pushes harder and/or makes more false promises than "
-            "the champion (R24)"
+            "Guardrail regression: the challenger pushed harder or made more unsupported claims "
+            "than the current champion (R24)."
         )
     qual_ok = experiment.challenger_qual_acc >= experiment.champion_qual_acc - qual_tolerance
     if not qual_ok:
         reasons.append(
-            f"qualification regression: challenger qual_acc {experiment.challenger_qual_acc:.3f} < "
-            f"champion {experiment.champion_qual_acc:.3f} - tolerance {qual_tolerance:.3f} (R29)"
+            f"Qualification accuracy dropped from {experiment.champion_qual_acc:.0%} to "
+            f"{experiment.challenger_qual_acc:.0%} — beyond the allowed tolerance (R29)."
         )
 
     passed = lift_ok and (not regressed) and qual_ok
@@ -140,8 +144,8 @@ def evaluate_promotion(
             promote=False,
             requires_human=True,
             reasons=[
-                "passed the bar but the diff is EXTREME (pricing concession or persona) — blocked "
-                "pending human approval (R19)"
+                "Passed the bar but the change involves a pricing or persona boundary — held for "
+                "human review before promoting (R19)."
             ],
         )
 
@@ -150,8 +154,8 @@ def evaluate_promotion(
         status="promoted",
         promote=True,
         requires_human=False,
-        reasons=["passed the bar (significant lift, guardrails clean, qualification held) and is "
-                 "non-extreme — auto-promoted with HOTL post-hoc review (R19)"],
+        reasons=["Passed the bar (significant lift, guardrails clean, qualification held) — "
+                 "auto-promoted with post-hoc review (R19)."],
     )
 
 

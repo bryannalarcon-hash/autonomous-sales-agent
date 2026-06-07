@@ -2,11 +2,13 @@
 // (src/api/improve.py) returns for /api/experiments, /api/experiments/run (ASYNC — 202 + a `running`
 // record, CB-15; multi-metric via `changes`, CB-27), /api/experiments/scaffold (seed a draft from a
 // reviewed call, CB-19), /api/experiments/{id} (one experiment's detail + its A/B mock calls per arm,
-// CB-25), /api/approvals(+approve/reject), /api/kb, /api/playbook, /api/versions(+rollback). Keep in lockstep
-// with that module. The backend has already
-// translated every internal index (dimension slug -> dimension_label, lifecycle state -> state_label)
-// into human-readable fields; the raw `dimension`/`state` slugs are kept ONLY for client branching
-// (chip color, action gating) and MUST NOT render in operator text — the UI shows the *_label fields.
+// CB-25), /api/approvals(+approve/reject), /api/kb, /api/playbook, /api/versions(+rollback). Keep in
+// lockstep with that module. The backend has already translated every internal index (dimension slug ->
+// dimension_label, lifecycle state -> state_label) into human-readable fields; the raw
+// `dimension`/`state` slugs are kept ONLY for client branching (chip color, action gating) and MUST
+// NOT render in operator text — the UI shows the *_label fields.
+// CB-57: RunExperimentResponse includes effective_n/n_min/n_max so the dialog quotes the n that will
+// actually run (after the backend's floor/cap), never the raw requested value.
 // lib/improve-api.ts types against these.
 
 /** One persisted champion-vs-challenger experiment (P6 lab / P7 approvals). */
@@ -79,10 +81,16 @@ export interface RunExperimentRequest {
 
 /** The run result (CB-15 — the run is ASYNC): the freshly-persisted `running` experiment (already
  *  label-translated) + the gate decision, which is "running" until the background A/B settles it (the
- *  /api/experiments poll catches the terminal state). The endpoint replies 202 Accepted, not 200. */
+ *  /api/experiments poll catches the terminal state). The endpoint replies 202 Accepted, not 200.
+ *  CB-57: effective_n is the actual n the backend will use (after flooring to the minimum and capping
+ *  at the maximum). n_min / n_max are the bounds, present so the dialog can note when input was floored.
+ *  These may be absent on legacy/test responses — fall back to experiment.n when missing. */
 export interface RunExperimentResponse {
   experiment: Experiment;
   decision: string;
+  effective_n?: number;
+  n_min?: number;
+  n_max?: number;
 }
 
 /** One A/B "mock call" — a per-arm self-play episode summary (CB-25). `outcome` is a raw outcome slug

@@ -79,33 +79,6 @@
 - **Acceptance:** scripted repro (tests/e2e/qa6 adaptation): conv A completes → conv B in a fresh session completes (no 409); `/api/consent/start` fires once per gate; the finished episode shows terminal state + correct duration and is searchable in `/operate/calls`. Regression test on the consent-session binding.
 - **Refs:** QA6 qa-chat report (BLOCKER #1–3), qa-operate bug #7; `/tmp/qa6/transcript_2_stuck*.log`, `conv2_blocked.png`, `20_live_call_review.png`.
 
-### CB-56 — Experiment rerun silently overwrites prior run's record (ID collision)
-- **Type / Surface / Size:** bug · `api` (`improve`) · `loop` · S–M
-- **Prereqs:** —
-- **Important files (candidates):** `src/api/improve.py` (experiment_id = champion+dimension+seed; UI runs always use `_RUN_HELD_OUT_SEED=7`), store save/upsert semantics.
-- **Current:** launching a run on a dimension that was run before reuses the same experiment_id and clobbers the old record — QA6's run destroyed the "goal-first discovery @n30" history. Using the feature erases its own audit trail.
-- **Desired:** every launch gets a unique record (timestamp/sequence in the id or a stored lineage); prior results remain in Past; reruns may be *grouped*, never overwritten.
-- **Acceptance:** run the same dimension twice → two Past cards (or one card with two preserved runs); regression test asserts no upsert-overwrite of a terminal record.
-- **Refs:** QA6 qa-lab HIGH #3.
-
-### CB-57 — Run-experiment honesty: quote the floored n, real progress, audible completion
-- **Type / Surface / Size:** bug · `web` (`/improve/lab` run dialog + cards) · S–M
-- **Prereqs:** —
-- **Important files (candidates):** `web/app/improve/lab/page.tsx` (cost line + card states), `src/api/improve.py` (`n = max(_MIN_RUN_N, min(req.n, _MAX_RUN_N))` ~:995 — surface the floor in the run response/record).
-- **Current:** modal computes "runs {n×2} real model calls" from the RAW input; backend floors to `_MIN_RUN_N` (QA6: asked n=1, promised "2 calls", ran 5/arm). Card shows "Sample 5/5" 3s after launch, static ~2min, then silently vanishes from Active (no toast); "Running" vs hung indistinguishable.
-- **Desired:** the dialog quotes the n that will actually run (and says when input was floored); the running card fills incrementally (or honestly says "running, no per-episode progress available"); completion announces itself (toast + card transition).
-- **Acceptance:** submitting n=1 shows "will run 5 per arm (minimum sample)"; a finished run produces a visible state change without a manual tab switch.
-- **Refs:** QA6 qa-lab CRITICAL #2 (reconciled: floor is by design, the QUOTE is the bug), HIGH #4.
-
-### CB-58 — Untangle rejection vs guardrail messaging on experiment cards
-- **Type / Surface / Size:** bug · `api` (`improve`) · `web` · S–M
-- **Prereqs:** —
-- **Important files (candidates):** `src/api/improve.py` (failure path sets `guardrail="trip"` + stuffs generic reason, ~:960–970; completion path reason assembly), `web/app/improve/lab/page.tsx` (footer copy "needs approval").
-- **Current:** rejected cards show BOTH "WHY IT ENDED: no significant lift…" and a red "Guardrail tripped — needs approval" while the Approvals queue is empty — two contradictory stories, one false call-to-action. Timed-out runs render "no result recorded" alongside Sample 5/5 + metrics; two past cards show "Sample 40 / —"; `challenger_better is False` (internal flag) renders verbatim; one draft card is a zombie "Running · Sample 0 / —".
-- **Desired:** one truthful ending per card: insignificance ≠ guardrail ≠ needs-approval; "needs approval" only when an approval actually exists; timeout cards show no fabricated metrics; reasons in plain English (no internal flag names); no permanent zombie states.
-- **Acceptance:** a rejected-for-insignificance card shows no guardrail/approval language; a guardrail-blocked card links to a real Approvals entry; e2e sweep finds no `challenger_better` string in rendered text.
-- **Refs:** QA6 qa-lab HIGH #5, MEDIUM #7–9, LOW #10.
-
 ### CB-59 — One champion: experiments + KPI must target the LIVE champion (v1), not champion_v0.yaml
 - **Type / Surface / Size:** bug/change · `api` (`improve`, `operate`) · `web` (KPI) · M
 - **Prereqs:** —
@@ -229,6 +202,33 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-58 — Untangle rejection vs guardrail messaging on experiment cards
+- **Type / Surface / Size:** bug · `api` (`improve`) · `loop` · `web` · S–M
+- **Completed:** 2026-06-07
+- **Files changed (actual):** `src/api/improve.py` (`_settle_failed_run` no longer sets `guardrail="trip"` for incomplete runs; plain-English fallback reason), `src/loop/promotion.py` (all 3 rejection reasons rewritten plain-English — no `challenger_better is False` flag text), `web/app/improve/lab/page.tsx` (approval CTA only when `state=='blocked'`; no fabricated metrics/Sample bar for n=0 runs; reason no longer duplicated into the guardrail strip).
+- **What changed:** the three conflated endings now tell distinct truths: rejected-insignificant (no guardrail language), guardrail-regressed (regression strip, approval CTA only if an approvals entry exists), failed/timed-out (no metrics, honest copy).
+- **Verification:** 6 new tests (terminal-path state/guardrail/reason triples + `"challenger_better"` absent from every reason); full suite 680/0 with all Wave-1 changes in tree.
+- **Constraints checked:** no internal flag names render; historical records keep old text (display now keyed off state, so they render correctly).
+- **Follow-ups / known gaps:** old stored records retain `guardrail="trip"` from the legacy failure path (historical data, display-mitigated).
+
+### CB-57 — Run-experiment honesty: quote the floored n, honest progress
+- **Type / Surface / Size:** bug · `web` (`/improve/lab`) · `api` · S–M
+- **Completed:** 2026-06-07
+- **Files changed (actual):** `src/api/improve.py` (202 body now carries `effective_n`/`n_min`/`n_max`), `web/lib/improve-types.ts`, `web/app/improve/lab/page.tsx` (dialog quotes the FLOORED n with a floor note; running card shows "Running — results land in one batch" instead of a fake full Sample bar), `tests/e2e/qa7_cb57.py` (NEW — pre-launch probe, no paid submit).
+- **What changed:** n=1 now honestly quotes 10 calls (5/arm minimum) before launch; no fake instant progress.
+- **Verification:** 3 new API tests (floor/cap/no-floor in 202); qa7_cb57.py PASS live (n=1 → "10 calls" quoted, drawer closed without submitting).
+- **Constraints checked:** no paid run launched during verification.
+- **Follow-ups / known gaps:** UI mirrors N_MIN=5/N_MAX=24 as local constants for the pre-launch quote (matches backend today) — drift risk if `_MIN_RUN_N`/`_MAX_RUN_N` change; wire a config GET if they ever move. No completion toast yet (card transition only).
+
+### CB-56 — Experiment rerun silently overwrites prior run's record (ID collision)
+- **Type / Surface / Size:** bug · `api` (`improve`) · S–M
+- **Completed:** 2026-06-07
+- **Files changed (actual):** `src/api/improve.py` (`unique_run_id()` — ms-timestamp suffix on `RUN-{challenger_version}`; used by `run_experiment_ep`).
+- **What changed:** every launch now creates a unique record; re-running the same dimension can no longer clobber prior history (the QA6 run had destroyed the goal-first@n30 record this way). Old-format ids still fetch (back-compat) and arm episode namespaces are scoped per run.
+- **Verification:** 4 new tests (distinct ids, first record untouched by rerun, arm-id scoping, legacy id fetch); improve suite 52/52.
+- **Constraints checked:** concurrency guard makes same-ms collision impossible (one run at a time).
+- **Follow-ups / known gaps:** reruns are separate cards (no grouping UI) — acceptable per CB entry ("may be grouped, never overwritten").
 
 ### CB-55 — Lab→Review handoff 404s: composite episode IDs double-encoded
 - **Type / Surface / Size:** bug · `web` (`/improve/lab/[id]` → `/operate/review/[id]`) · S

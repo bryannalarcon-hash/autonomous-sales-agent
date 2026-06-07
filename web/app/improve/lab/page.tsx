@@ -21,6 +21,12 @@
 // CB-27: the RunDrawer's threshold picker is a CSV-like grid — each row a {metric, new value}, with
 // "+"/"−" to add/remove rows; >1 row sends a multi-metric `changes` request (single row stays the
 // single-dimension default), explicitly relaxing the R19 single-dimension invariant for manual runs.
+// CB-56: unique run IDs (timestamp suffix) — re-running a dimension never clobbers the prior record.
+// CB-57: the dialog quotes the effective (floored/capped) n from the 202 response; the running card
+// shows an honest "running" state — no fabricated per-episode progress.
+// CB-58: distinct terminal stories per outcome — rejected-insignificant ≠ guardrail-regressed ≠
+// failed/timed-out. The guardrail strip says "needs approval" only for blocked state; failed/timed-out
+// cards never show fabricated lift metrics; no Python flag phrasing renders.
 // Data from /api/experiments; the discovery-sequencing before/after is the headline demo artifact. All
 // semantic labels (state, dimension, version, population/cohort) are humanized before render — no raw
 // slug, `__…__` experiment suffix, or DRAFT-/exp- id renders. Cards/drawer show the human version +
@@ -116,8 +122,11 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
   const tripped = e.guardrail === 'trip';
   // CB-24: a rejected/blocked/failed experiment carries WHY in guardrail_reason — surface it
   // prominently (not only in the guardrail strip) so a failed run never reads as a silent "gone".
+  // CB-58: only show the "why it ended" callout once (here), not again in the guardrail strip.
   const isFailed = e.state === 'rejected' || e.state === 'blocked';
   const failureReason = (isFailed || tripped) ? e.guardrail_reason : null;
+  // CB-58: a run that produced no comparison (n=0, failed/timed-out) has no real lift data to show.
+  const hasRealLift = e.n > 0;
   return (
     <>
       <div className="scrim" onClick={onClose} />
@@ -201,38 +210,54 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
             <Icon name="arrowR" size={15} />
           </button>
 
-          <div className="card solid card-pad">
-            <div className="faint" style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 10 }}>
-              Lift (challenger − champion)
+          {/* CB-58: only show lift stats when the run actually completed a comparison (n > 0).
+              A timed-out or crashed run never produced data — showing zeroed schema defaults as
+              metrics fabricates results that never existed. */}
+          {hasRealLift ? (
+            <div className="card solid card-pad">
+              <div className="faint" style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 10 }}>
+                Lift (challenger − champion)
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                <Stat l="Same-call enroll" v={pts(e.enroll_delta)} good={e.enroll_delta > 0} />
+                <Stat l="Ladder score" v={dec(e.delta)} good={e.delta > 0} />
+                <Stat l="95% CI" v={`[${e.delta_ci[0].toFixed(2)}, ${e.delta_ci[1].toFixed(2)}]`} mono />
+                <Stat l="Significance" v={`${Math.round(e.significance * 100)}%`} good={e.challenger_better ? true : null} />
+              </div>
+              <div
+                className="row"
+                style={{
+                  marginTop: 12,
+                  gap: 8,
+                  alignItems: 'center',
+                  padding: '9px 11px',
+                  borderRadius: 10,
+                  background: tripped ? 'var(--danger-soft)' : 'var(--ok-soft)',
+                  border: `1px solid ${tripped ? 'var(--danger-border)' : 'var(--ok-border)'}`,
+                }}
+              >
+                <Icon name="shield" size={15} style={{ color: tripped ? 'var(--danger)' : 'var(--ok)' }} />
+                <span style={{ fontSize: 12.5, fontWeight: 600, color: tripped ? 'var(--danger)' : 'var(--ok)' }}>
+                  {tripped
+                    ? e.state === 'blocked'
+                      ? 'Guardrail tripped — awaiting approval'
+                      : 'Guardrail regression detected'
+                    : e.guardrail === 'warn'
+                      ? 'Guardrail warning'
+                      : 'All guardrails pass'}
+                </span>
+              </div>
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-              <Stat l="Same-call enroll" v={pts(e.enroll_delta)} good={e.enroll_delta > 0} />
-              <Stat l="Ladder score" v={dec(e.delta)} good={e.delta > 0} />
-              <Stat l="95% CI" v={`[${e.delta_ci[0].toFixed(2)}, ${e.delta_ci[1].toFixed(2)}]`} mono />
-              <Stat l="Significance" v={`${Math.round(e.significance * 100)}%`} good={e.challenger_better ? true : null} />
+          ) : e.state === 'rejected' ? (
+            <div className="card solid card-pad">
+              <div className="faint" style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 7 }}>
+                Run outcome
+              </div>
+              <div className="muted" style={{ fontSize: 12.5 }}>
+                This run did not complete — no comparison data was recorded.
+              </div>
             </div>
-            <div
-              className="row"
-              style={{
-                marginTop: 12,
-                gap: 8,
-                alignItems: 'center',
-                padding: '9px 11px',
-                borderRadius: 10,
-                background: tripped ? 'var(--danger-soft)' : 'var(--ok-soft)',
-                border: `1px solid ${tripped ? 'var(--danger-border)' : 'var(--ok-border)'}`,
-              }}
-            >
-              <Icon name="shield" size={15} style={{ color: tripped ? 'var(--danger)' : 'var(--ok)' }} />
-              <span style={{ fontSize: 12.5, fontWeight: 600, color: tripped ? 'var(--danger)' : 'var(--ok)' }}>
-                {tripped
-                  ? `Guardrail tripped — needs approval${e.guardrail_reason ? ` · ${e.guardrail_reason}` : ''}`
-                  : e.guardrail === 'warn'
-                    ? 'Guardrail warning'
-                    : 'All guardrails pass'}
-              </span>
-            </div>
-          </div>
+          ) : null}
 
           {e.state === 'passed' ? (
             <button className="btn btn-primary">
@@ -437,6 +462,8 @@ function MetricRowEditor({
 // CB-19: an optional `episodeId` (when the drawer was opened by scaffolding from a reviewed call)
 // is shown as context AND threaded onto the run request, and `prefillKind` pre-selects the dimension
 // so the operator confirms the scaffolded experiment before launching the (async) run.
+// CB-57: the cost note quotes the effective (floored/capped) n from the 202 response, not the raw
+// requested n. Before submit, a pre-compute shows the floored n so the operator knows what will run.
 function RunDrawer({
   onClose,
   onStarted,
@@ -457,6 +484,14 @@ function RunDrawer({
   const [name, setName] = useState<string>('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // CB-57: backend constants for honest pre-submit cost note (floor/cap).
+  // These match _MIN_RUN_N=5 and _MAX_RUN_N=24 in improve.py; kept here so the dialog is honest
+  // BEFORE submit (the 202 response confirms effective_n after submit).
+  const N_MIN = 5;
+  const N_MAX = 24;
+  // The effective n the backend will actually use: floor to min, cap to max.
+  const effectiveN = Math.max(N_MIN, Math.min(N_MAX, n));
+  const wasFloored = effectiveN !== n;
 
   useEffect(() => {
     let cancelled = false;
@@ -701,12 +736,20 @@ function RunDrawer({
             </div>
           </div>
 
-          {/* explicit cost note (before submit) */}
-          <div className="row" style={{ gap: 8, alignItems: 'center', padding: '10px 12px', borderRadius: 10, background: 'var(--accent-soft)', border: '1px solid var(--accent-border)' }}>
-            <Icon name="bolt" size={15} style={{ color: 'var(--accent-strong)' }} />
-            <span style={{ fontSize: 12.5, color: 'var(--accent-strong)', fontWeight: 600 }}>
-              This runs {n * 2} real model calls ({n} per arm × champion and challenger) and spends model credit.
-            </span>
+          {/* CB-57: explicit cost note using the EFFECTIVE (floored/capped) n, not the raw input.
+              If the requested n was below the minimum sample, note the floor so the operator knows. */}
+          <div className="row" style={{ gap: 8, alignItems: 'flex-start', padding: '10px 12px', borderRadius: 10, background: 'var(--accent-soft)', border: '1px solid var(--accent-border)' }}>
+            <Icon name="bolt" size={15} style={{ color: 'var(--accent-strong)', marginTop: 1 }} />
+            <div>
+              <span style={{ fontSize: 12.5, color: 'var(--accent-strong)', fontWeight: 600 }}>
+                This runs {effectiveN * 2} real model calls ({effectiveN} per arm × champion and challenger) and spends model credit.
+              </span>
+              {wasFloored ? (
+                <div style={{ fontSize: 11.5, color: 'var(--accent-strong)', marginTop: 3, opacity: 0.8 }}>
+                  Your input ({n}) is below the minimum sample of {N_MIN} — the run will use {effectiveN} calls per arm.
+                </div>
+              ) : null}
+            </div>
           </div>
 
           {err ? (
@@ -718,7 +761,7 @@ function RunDrawer({
 
           <button className="btn btn-primary" onClick={submit} disabled={!canSubmit}>
             <Icon name="play" size={16} />
-            {busy ? 'Running…' : `Run experiment · ${n * 2} calls`}
+            {busy ? 'Running…' : `Run experiment · ${effectiveN * 2} calls`}
           </button>
         </div>
       </div>
@@ -882,13 +925,18 @@ function LabPageInner() {
                       <span className="muted" style={{ fontSize: 12 }}>{populationLabel(e.population)}</span>
                     </div>
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', borderTop: '1px solid var(--border)' }}>
-                    <Cell l="Enroll Δ" v={pts(e.enroll_delta)} good={e.enroll_delta > 0} />
-                    <Cell l="Ladder Δ" v={dec(e.delta)} good={e.delta > 0} />
-                    <Cell l="Significance" v={`${Math.round(e.significance * 100)}%`} last />
-                  </div>
-                  {/* CB-24: surface the failure/rejection reason on the CARD too (not just blocked) —
-                      a rejected/failed run shows WHY right on the card, never a blank "gone". */}
+                  {/* CB-58: only show the lift cells when the run produced real data (n > 0). A
+                      failed/timed-out run has n=0 and all schema defaults at zero — never render
+                      those as if they were a meaningful result. */}
+                  {e.n > 0 ? (
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', borderTop: '1px solid var(--border)' }}>
+                      <Cell l="Enroll Δ" v={pts(e.enroll_delta)} good={e.enroll_delta > 0} />
+                      <Cell l="Ladder Δ" v={dec(e.delta)} good={e.delta > 0} />
+                      <Cell l="Significance" v={`${Math.round(e.significance * 100)}%`} last />
+                    </div>
+                  ) : null}
+                  {/* CB-24/CB-58: surface the failure/rejection reason on the CARD — distinct
+                      stories per terminal outcome. "Needs approval" only on blocked state. */}
                   {e.state === 'blocked' || e.state === 'rejected' ? (
                     <div
                       style={{
@@ -903,26 +951,40 @@ function LabPageInner() {
                       }}
                     >
                       <Icon name="alert" size={13} />
-                      {e.guardrail_reason ??
-                        (e.state === 'blocked'
-                          ? 'Guardrail blocked — needs approval'
-                          : 'Did not pass the bar')}
+                      {e.state === 'blocked'
+                        ? (e.guardrail_reason ?? 'Held for approval')
+                        : (e.guardrail_reason ?? 'Did not pass the bar')}
                     </div>
                   ) : null}
-                  <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
-                    <div className="row" style={{ justifyContent: 'space-between', marginBottom: 5 }}>
-                      <span className="faint" style={{ fontSize: 11 }}>Sample</span>
-                      <span className="mono" style={{ fontSize: 11.5 }}>{e.n} / {e.target || '—'}</span>
+                  {/* CB-57/CB-58: honest sample display. Running → "Running — results land in one
+                      batch" (no fabricated per-episode progress). Completed with data → n/target.
+                      Failed/timed-out with no data (n=0) → omit the bar entirely. */}
+                  {e.state === 'running' ? (
+                    <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
+                      <div className="row" style={{ gap: 7, alignItems: 'center' }}>
+                        <span className="faint" style={{ fontSize: 11 }}>Running</span>
+                        <span className="muted" style={{ fontSize: 11 }}>— results land in one batch</span>
+                      </div>
+                      <div className="bar" style={{ marginTop: 5 }}>
+                        <i style={{ width: '30%', background: 'var(--accent)', opacity: 0.5 }} />
+                      </div>
                     </div>
-                    <div className="bar">
-                      <i
-                        style={{
-                          width: `${e.target ? Math.min(100, (e.n / e.target) * 100) : 0}%`,
-                          background: e.target && e.n >= e.target ? 'var(--ok)' : 'var(--accent)',
-                        }}
-                      />
+                  ) : e.n > 0 ? (
+                    <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
+                      <div className="row" style={{ justifyContent: 'space-between', marginBottom: 5 }}>
+                        <span className="faint" style={{ fontSize: 11 }}>Sample</span>
+                        <span className="mono" style={{ fontSize: 11.5 }}>{e.n} / {e.target || '—'}</span>
+                      </div>
+                      <div className="bar">
+                        <i
+                          style={{
+                            width: `${e.target ? Math.min(100, (e.n / e.target) * 100) : 0}%`,
+                            background: e.target && e.n >= e.target ? 'var(--ok)' : 'var(--accent)',
+                          }}
+                        />
+                      </div>
                     </div>
-                  </div>
+                  ) : null}
                 </div>
               ))}
             </div>

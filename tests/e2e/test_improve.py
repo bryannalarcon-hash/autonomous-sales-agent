@@ -1106,3 +1106,411 @@ def test_no_raw_dimension_or_state_slug_in_operator_labels():
         assert "_" not in e["state_label"]  # no raw state slug as the shown chip text
         # the raw slug is still present under the internal-only keys (for client logic), not as label.
         assert e["state_label"] != e["state"] or e["state"] in ("draft",)
+
+
+# =============================== CB-56 — UNIQUE EXPERIMENT IDS (NO RERUN CLOBBER) ================
+# Every launch of the same dimension must produce a UNIQUE experiment_id so re-running never silently
+# overwrites the prior record. Old ids (RUN-{version}, no timestamp suffix) must still load/display.
+
+
+async def test_cb56_two_runs_produce_distinct_ids():
+    """CB-56: launching the same dimension twice (sequentially — second after first settles, since the
+    concurrency guard serializes runs) produces TWO distinct records. The first is never clobbered."""
+    app, store = _run_app()
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        # First run.
+        r1 = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 5},
+        )
+        assert r1.status_code == 202, r1.text
+        id1 = r1.json()["experiment"]["experiment_id"]
+        # Wait for the first to settle (releases the concurrency semaphore).
+        await _settle(ac, id1)
+
+        # Second run on the SAME dimension — now the permit is free.
+        r2 = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 5},
+        )
+        assert r2.status_code == 202, r2.text
+        id2 = r2.json()["experiment"]["experiment_id"]
+        await _settle(ac, id2)
+
+    # The two ids MUST be distinct — same dimension, different runs.
+    assert id1 != id2, "re-running the same dimension must produce a unique experiment id"
+
+    # Both records are in the store (neither was clobbered by the other).
+    assert id1 in store._experiments, "first run's record must still exist after re-run"
+    assert id2 in store._experiments, "second run's record must exist"
+
+
+async def test_cb56_first_run_terminal_record_untouched_by_second():
+    """CB-56: once the first run settles to a terminal state, launching a second run on the same
+    dimension MUST NOT modify it. The first's state/KPIs remain exactly as settled.
+    Runs are sequential (concurrency guard serializes them: second starts after first settles)."""
+    app, store = _run_app()
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        # First run — let it settle fully (releases the semaphore).
+        r1 = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 5},
+        )
+        id1 = r1.json()["experiment"]["experiment_id"]
+        settled1 = await _settle(ac, id1)
+        assert settled1["state"] != "running"
+
+        # Snapshot the first record BEFORE the second run.
+        snapshot_state = settled1["state"]
+        snapshot_kpi = settled1["challenger_kpi"]
+
+        # Second run on the SAME dimension (permit is now free).
+        r2 = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 5},
+        )
+        assert r2.status_code == 202, r2.text
+        id2 = r2.json()["experiment"]["experiment_id"]
+        await _settle(ac, id2)
+
+    # The two runs must have distinct IDs (CB-56 core guarantee).
+    assert id1 != id2, "re-running the same dimension must produce a unique experiment id"
+
+    # The first record is exactly as settled — second run did not touch it.
+    first_after = store._experiments[id1]
+    assert first_after.state == snapshot_state, "first run's state was modified by re-run"
+    assert abs(first_after.challenger_kpi - snapshot_kpi) < 1e-9, "first run's KPI changed"
+
+
+async def test_cb56_arm_episode_ids_are_scoped_to_unique_run():
+    """CB-56: arm episode ids (CB-25) are prefixed by the experiment_id, so two runs of the same
+    dimension produce non-colliding arm episode namespaces — no episode from run 1 can be fetched
+    as if it belongs to run 2. Runs are sequential (concurrency guard serializes them)."""
+    from src.api.improve import arm_episode_id
+    app, store = _run_app()
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r1 = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 5},
+        )
+        id1 = r1.json()["experiment"]["experiment_id"]
+        await _settle(ac, id1)  # wait; frees the semaphore
+
+        r2 = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 5},
+        )
+        assert r2.status_code == 202, r2.text
+        id2 = r2.json()["experiment"]["experiment_id"]
+        await _settle(ac, id2)
+
+    ep1 = arm_episode_id(id1, "champion", 0)
+    ep2 = arm_episode_id(id2, "champion", 0)
+    assert ep1 != ep2, "arm episode ids from two distinct runs must not collide"
+    assert id1 in ep1
+    assert id2 in ep2
+
+
+async def test_cb56_old_style_id_still_fetchable():
+    """CB-56 backward-compat: an old-style id (RUN-{version}, no timestamp suffix) seeded directly
+    into the store is still fetchable via GET /api/experiments/{id} — old records don't break."""
+    # Seed an experiment with the OLD id format (no timestamp suffix) into the store.
+    champ = load_config("champion_v0")
+    old_id = f"RUN-{champ.version}__playbooks.discovery_sequence__7"
+    exp = ExperimentRecord(
+        experiment_id=old_id,
+        challenger_version="vOLD",
+        parent_version=champ.version,
+        name="Legacy run",
+        dimension="playbooks.discovery_sequence",
+        declared_diff=["playbooks.discovery_sequence"],
+        diff_description="old style id",
+        population="held_out",
+        n=5,
+        target=5,
+        kb_version="kb_v0",
+        state="rejected",
+    )
+    from datetime import datetime, timezone
+    exp.created_at = datetime.now(timezone.utc)
+    store = FakeImproveStore([exp], [])
+    from src.api.server import create_app
+    app = create_app(improve_store=store, config=champ)
+    from fastapi.testclient import TestClient
+    client = TestClient(app)
+    r = client.get(f"/api/experiments/{old_id}")
+    assert r.status_code == 200, r.text
+    assert r.json()["experiment"]["experiment_id"] == old_id
+
+
+# =============================== CB-57 — EFFECTIVE N IN 202 RESPONSE ==============================
+# The 202 response must include the effective (floored/capped) n so the UI can quote the n that will
+# ACTUALLY run, not the raw requested value. For n=1, effective_n must be >= _MIN_RUN_N.
+
+
+async def test_cb57_202_response_includes_effective_n():
+    """CB-57: the 202 response carries effective_n, n_min, n_max so the dialog quotes the real n."""
+    from src.api.improve import _MIN_RUN_N, _MAX_RUN_N
+    app, _ = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "thresholds.pushiness_cap", "value": 0.5, "n": 1},
+        )
+        assert r.status_code == 202, r.text
+        body = r.json()
+    assert "effective_n" in body, "202 response must include effective_n (CB-57)"
+    assert "n_min" in body, "202 response must include n_min (CB-57)"
+    assert "n_max" in body, "202 response must include n_max (CB-57)"
+    # For n=1, the floor must apply.
+    assert body["effective_n"] >= _MIN_RUN_N, "effective_n must be at least the minimum sample"
+    assert body["effective_n"] == body["experiment"]["n"], \
+        "effective_n in response must match the experiment record's n"
+    assert body["n_min"] == _MIN_RUN_N
+    assert body["n_max"] == _MAX_RUN_N
+
+
+async def test_cb57_effective_n_not_floored_when_above_minimum():
+    """CB-57: when n >= _MIN_RUN_N, effective_n equals the requested n (no floor applied)."""
+    from src.api.improve import _MIN_RUN_N
+    app, _ = _run_app()
+    requested_n = _MIN_RUN_N + 2  # above the floor
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "thresholds.pushiness_cap", "value": 0.5, "n": requested_n},
+        )
+        assert r.status_code == 202, r.text
+        body = r.json()
+    assert body["effective_n"] == requested_n, "effective_n should match requested n when above floor"
+
+
+async def test_cb57_effective_n_capped_at_maximum():
+    """CB-57: when n > _MAX_RUN_N, effective_n is capped to the maximum."""
+    from src.api.improve import _MAX_RUN_N
+    app, _ = _run_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "thresholds.pushiness_cap", "value": 0.5, "n": 9999},
+        )
+        assert r.status_code == 202, r.text
+        body = r.json()
+    assert body["effective_n"] == _MAX_RUN_N, "effective_n must not exceed the maximum"
+
+
+# =============================== CB-58 — TERMINAL STATE STORIES (NO CONFLATION) ==================
+# Three distinct terminal stories:
+#   (a) rejected-insignificant: no significant lift; no guardrail language, no approval CTA
+#   (b) guardrail-regressed: guardrail="trip"; CTA only if an approvals entry actually exists
+#   (c) failed/timed-out: guardrail="pass" (not "trip"); plain-English reason; no metrics (n=0)
+#
+# "challenger_better is False" must NEVER appear in any reason string.
+
+
+def _insignificant_record() -> ExperimentRecord:
+    """A rejected record where the challenger showed no significant lift (delta CI includes 0)."""
+    from datetime import datetime, timezone
+    return ExperimentRecord(
+        experiment_id="EXP-INSIG",
+        challenger_version="vX-insig",
+        parent_version="vX",
+        name="Insignificant run",
+        dimension="playbooks.discovery_sequence",
+        declared_diff=["playbooks.discovery_sequence"],
+        diff_description="reorder: goal-first",
+        population="Held-out · 5 personas",
+        n=5,
+        target=5,
+        kb_version="kb_v0",
+        champion_kpi=3.05,
+        challenger_kpi=3.07,
+        delta=0.02,
+        delta_ci=[-0.05, 0.09],  # CI INCLUDES 0 -> no significant lift
+        challenger_better=False,
+        enroll_delta=0.01,
+        significance=0.0,
+        guardrail="pass",  # no guardrail regression
+        guardrail_reason="No significant lift detected — the difference between the two configs fell within statistical noise (delta confidence interval includes zero).",
+        champion_qual_acc=0.93,
+        challenger_qual_acc=0.93,
+        is_extreme=False,
+        state="rejected",
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+def _guardrail_regressed_record() -> ExperimentRecord:
+    """A rejected record where the challenger tripped a guardrail (regression)."""
+    from datetime import datetime, timezone
+    return ExperimentRecord(
+        experiment_id="EXP-GUARD",
+        challenger_version="vX-guard",
+        parent_version="vX",
+        name="Guardrail regression",
+        dimension="thresholds.pushiness_cap",
+        declared_diff=["thresholds.pushiness_cap"],
+        diff_description="pushiness_cap 0.7 -> 0.9",
+        population="Held-out · 5 personas",
+        n=5,
+        target=5,
+        kb_version="kb_v0",
+        champion_kpi=3.05,
+        challenger_kpi=3.20,
+        delta=0.15,
+        delta_ci=[0.03, 0.27],
+        challenger_better=True,
+        enroll_delta=0.05,
+        significance=0.95,
+        guardrail="trip",  # guardrail TRIPPED
+        guardrail_reason="Guardrail regression: the challenger pushed harder or made more unsupported claims than the current champion (R24).",
+        champion_qual_acc=0.93,
+        challenger_qual_acc=0.93,
+        is_extreme=False,
+        state="rejected",
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+def _failed_timeout_record() -> ExperimentRecord:
+    """A record that settled rejected because the run timed out (no comparison ran)."""
+    from datetime import datetime, timezone
+    return ExperimentRecord(
+        experiment_id="EXP-TIMEOUT",
+        challenger_version="vX-timeout",
+        parent_version="vX",
+        name="Timed out run",
+        dimension="playbooks.discovery_sequence",
+        declared_diff=["playbooks.discovery_sequence"],
+        diff_description="reorder: goal-first",
+        population="Held-out · 5 personas",
+        n=5,
+        target=5,
+        kb_version="kb_v0",
+        # schema defaults — no real comparison ran
+        guardrail="pass",
+        guardrail_reason="The run did not complete — no result was recorded.",
+        is_extreme=False,
+        state="rejected",
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+def _seeded_cb58_client() -> TestClient:
+    """A client with one record of each CB-58 terminal type seeded."""
+    exps = [_insignificant_record(), _guardrail_regressed_record(), _failed_timeout_record()]
+    from src.api.server import create_app
+    app = create_app(
+        improve_store=FakeImproveStore(exps, []),
+        config=load_config("champion_v0"),
+    )
+    return TestClient(app)
+
+
+def test_cb58_rejected_insignificant_has_no_guardrail_trip():
+    """CB-58(a): a rejected-insignificant record has guardrail='pass', NOT 'trip' — no guardrail
+    regression, so there should be no guardrail language on the card."""
+    client = _seeded_cb58_client()
+    body = client.get("/api/experiments").json()
+    rec = next(e for e in body["experiments"] if e["experiment_id"] == "EXP-INSIG")
+    assert rec["guardrail"] == "pass", "insignificant rejection must NOT show guardrail trip"
+    assert rec["state"] == "rejected"
+    # The reason must explain the actual outcome, not guardrail language.
+    reason = rec["guardrail_reason"] or ""
+    assert "guardrail" not in reason.lower() or "regression" not in reason.lower(), \
+        "insignificant rejection reason must not conflate with guardrail regression"
+
+
+def test_cb58_guardrail_regressed_has_trip_and_reason():
+    """CB-58(b): a guardrail-regressed record has guardrail='trip' + a plain-English reason.
+    It does NOT have an approvals entry (not blocked), so no approval CTA should appear."""
+    client = _seeded_cb58_client()
+    body = client.get("/api/experiments").json()
+    rec = next(e for e in body["experiments"] if e["experiment_id"] == "EXP-GUARD")
+    assert rec["guardrail"] == "trip"
+    assert rec["state"] == "rejected"  # not 'blocked' — no approval entry
+    # Approval queue must NOT contain this record (it's rejected, not blocked).
+    approvals = client.get("/api/approvals").json()
+    assert not any(e["experiment_id"] == "EXP-GUARD" for e in approvals["approvals"]), \
+        "a rejected guardrail-trip record must not appear in the approvals queue"
+
+
+def test_cb58_failed_timeout_has_pass_guardrail_and_plain_reason():
+    """CB-58(c): a failed/timed-out run settles with guardrail='pass' (no regression — it never ran
+    a comparison), state='rejected', and a plain-English reason. Never guardrail='trip' for a run
+    that didn't complete."""
+    client = _seeded_cb58_client()
+    body = client.get("/api/experiments").json()
+    rec = next(e for e in body["experiments"] if e["experiment_id"] == "EXP-TIMEOUT")
+    assert rec["guardrail"] == "pass", \
+        "a timed-out run must NOT set guardrail='trip' — it never ran a comparison"
+    assert rec["state"] == "rejected"
+    reason = rec["guardrail_reason"] or ""
+    assert len(reason) > 0, "failed run must carry a non-empty reason"
+    assert "no result" in reason.lower() or "did not complete" in reason.lower(), \
+        "failed run reason must explain it did not complete"
+
+
+async def test_cb58_background_timeout_settles_with_pass_guardrail():
+    """CB-58(c) via the live run path: a background run that times out (blocking runner + tiny
+    timeout) settles guardrail='pass', NOT 'trip' — the CB-58 fix to _settle_failed_run."""
+    gate = asyncio.Event()  # never released -> runner blocks past the timeout
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+    app, _ = _run_app(runner=_blocking_runner(gate), run_timeout_s=0.05)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 5},
+        )
+        assert r.status_code == 202, r.text
+        settled = await _settle(ac, r.json()["experiment"]["experiment_id"])
+    assert settled["state"] == "rejected"
+    assert settled["guardrail"] == "pass", \
+        "a timed-out run must settle guardrail='pass', not 'trip' (CB-58)"
+
+
+def test_cb58_no_python_flag_phrasing_in_any_reason():
+    """CB-58: the string 'challenger_better' must NEVER appear in any experiment reason string,
+    because it is a Python internal flag name, not operator-facing English."""
+    client = _seeded_cb58_client()
+    body = client.get("/api/experiments").json()
+    for exp in body["experiments"]:
+        reason = (exp.get("guardrail_reason") or "").lower()
+        assert "challenger_better" not in reason, \
+            f"Python flag 'challenger_better' leaked into reason for {exp['experiment_id']!r}"
+
+
+async def test_cb58_promotion_rejection_reason_has_no_python_flags():
+    """CB-58: reasons produced by evaluate_promotion (the live run path) also must not contain
+    Python flag names. The dominating runner produces a real promotion decision; the FAIL-CLOSED
+    R36 path lands 'blocked' — check its reason too."""
+    app, _ = _run_app()
+    champ = load_config("champion_v0")
+    seq = list(champ.playbooks["discovery_sequence"])
+    seq[0], seq[-1] = seq[-1], seq[0]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post(
+            "/api/experiments/run",
+            json={"dimension": "playbooks.discovery_sequence", "value": seq, "n": 5},
+        )
+        exp_id = r.json()["experiment"]["experiment_id"]
+        settled = await _settle(ac, exp_id)
+    reason = (settled.get("guardrail_reason") or "").lower()
+    assert "challenger_better is false" not in reason, \
+        "evaluate_promotion reason leaked Python flag 'challenger_better is False'"
+    assert "is_extreme" not in reason, \
+        "evaluate_promotion reason leaked Python flag 'is_extreme'"
