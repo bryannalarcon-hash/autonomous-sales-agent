@@ -23,6 +23,11 @@
 // turns[i].timing — "0.8s to first word" + "spoke for 1.4s" (omitted on text/legacy turns). A
 // call-level "Voice timing" stat in the outcome strip surfaces avg_first_token_ms / avg_stream_ms
 // (absent when the call carries no timing). Human phrases only — no raw ms key renders.
+// CB-55: params.id from a Next.js 14 dynamic route is NOT percent-decoded automatically — composite
+// episode IDs like RUN-...::arm::n that were encoded by the lab page's router.push arrive as
+// RUN-...%3A%3Aarm%3A%3An. We decode once here so fetchEpisode receives the raw ID; the fetch
+// helper then encodes it correctly for the HTTP path. Error display uses a safe fallback message,
+// never the raw encoded ID blob.
 'use client';
 
 import { useMemo, useState } from 'react';
@@ -399,7 +404,11 @@ function ProspectTruthPanel({
 // Next.js 14 App Router: route `params` is a PLAIN object (the Promise+`use()` shape is Next 15+).
 // Passing a plain object to React.use() throws "unsupported type" — so destructure params directly.
 export default function ReviewPage({ params }: { params: { id: string } }) {
-  const { id } = params;
+  // CB-55: Next.js 14 does NOT auto-decode dynamic route params. A composite ID like
+  // RUN-...::arm::n encoded by the lab page arrives as RUN-...%3A%3Aarm%3A%3An. Decode once
+  // so every downstream call (fetchEpisode, setEpisodeGolden, export filename) receives the
+  // canonical raw ID. decodeURIComponent is idempotent on an already-decoded plain ID.
+  const id = decodeURIComponent(params.id);
   const router = useRouter();
   const [ep, setEp] = useState<EpisodeDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -505,6 +514,9 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
   }, [playing, cur, ep]);
 
   if (error) {
+    // CB-55: never render the raw error string — it may contain an encoded episode ID blob
+    // (e.g. "unknown episode 'RUN-...%3A%3A...'"). Show a clean, stable human message instead.
+    const isNotFound = error.toLowerCase().includes('unknown episode') || error.includes('404');
     return (
       <div className="page">
         <div className="empty" style={{ margin: 'auto' }}>
@@ -512,7 +524,11 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
             <Icon name="eye" size={28} />
           </div>
           <h3>Call not found</h3>
-          <p>{error}</p>
+          <p>
+            {isNotFound
+              ? 'This call record does not exist or may have been removed.'
+              : 'Could not load this call — the server may be unavailable.'}
+          </p>
         </div>
       </div>
     );

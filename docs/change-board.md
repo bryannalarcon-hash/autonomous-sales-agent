@@ -70,6 +70,114 @@
 - **Refs:** `src/api/operate.py::live_snapshot` + `live_ep`; LiveKit Agents room/participant model + SIP dispatch (`scripts/setup_sip_dispatch.py`, rule `SDR_hKYQYAwz96uA`); the disabled take-over control (`web/app/operate/live/page.tsx`); R37 in `src/core/respond.py`.
 - **Take-over spec (user, 2026-06-02) — refines CB-01.c:** on "Take over", the AI must (1) be INTERRUPTED mid-conversation and (2) speak a DEFAULT TTS hand-off line (e.g. "Let me bring in a specialist to help — one moment. They may type some of their responses, so there might be a brief pause between answers."). Then the OPERATOR talks into their own device (browser mic / WebRTC into the call's LiveKit room) and is heard by the caller through the phone — operator audio is published as a room participant, NOT a dial-in (presume the operator is NOT calling from their own phone number, so no SIP bridge / caller-ID concerns). The agent stops auto-generating; the operator may ALSO TYPE responses that are TTS'd to the caller ("the agent might be typing their responses"). So take-over = interrupt + disclosure TTS + operator mic→room audio + optional operator-typed→TTS, with the AI yielded. Consent/recording state must carry over; respect R37 (don't fork the brain — the brain just stops).
 
+### CB-54 — Demo chat dies after the first conversation (consent 409 wall + stuck sessions)
+- **Type / Surface / Size:** bug · `api` (`demo_routes`) · `web/app/demo` · M
+- **Prereqs:** —
+- **Important files (candidates):** `src/api/demo_routes.py` (chat 409 gate: consent `pending / need_parental / ended`, see ~:703–708), the demo page's consent-gate effect (likely double-firing `POST /api/consent/start` — 2× per page load, suspect React StrictMode/dev double-mount), session finalization path.
+- **Current:** after one completed conversation, every later session's `POST /api/chat` returns 409 "Consent required before chatting." despite consent/start + consent/respond both returning 200 — reproduced across 3 fresh sessions, both consent paths, reload+retry (QA6). Relatedly, a finished chat episode stayed "In progress" (wrong duration 6:25 vs ≥8:45 observed) and never appeared in the Calls list. UI offers no re-consent affordance; failed bubble retained; input stays enabled.
+- **Desired:** any number of consecutive demo conversations work; consent binds to the session the chat actually uses (fix the double-start race); a finished/abandoned chat episode is finalized (terminal status + real duration) and lands in the Calls list; on a real consent 409 the UI re-offers the gate with honest copy.
+- **Acceptance:** scripted repro (tests/e2e/qa6 adaptation): conv A completes → conv B in a fresh session completes (no 409); `/api/consent/start` fires once per gate; the finished episode shows terminal state + correct duration and is searchable in `/operate/calls`. Regression test on the consent-session binding.
+- **Refs:** QA6 qa-chat report (BLOCKER #1–3), qa-operate bug #7; `/tmp/qa6/transcript_2_stuck*.log`, `conv2_blocked.png`, `20_live_call_review.png`.
+
+### CB-56 — Experiment rerun silently overwrites prior run's record (ID collision)
+- **Type / Surface / Size:** bug · `api` (`improve`) · `loop` · S–M
+- **Prereqs:** —
+- **Important files (candidates):** `src/api/improve.py` (experiment_id = champion+dimension+seed; UI runs always use `_RUN_HELD_OUT_SEED=7`), store save/upsert semantics.
+- **Current:** launching a run on a dimension that was run before reuses the same experiment_id and clobbers the old record — QA6's run destroyed the "goal-first discovery @n30" history. Using the feature erases its own audit trail.
+- **Desired:** every launch gets a unique record (timestamp/sequence in the id or a stored lineage); prior results remain in Past; reruns may be *grouped*, never overwritten.
+- **Acceptance:** run the same dimension twice → two Past cards (or one card with two preserved runs); regression test asserts no upsert-overwrite of a terminal record.
+- **Refs:** QA6 qa-lab HIGH #3.
+
+### CB-57 — Run-experiment honesty: quote the floored n, real progress, audible completion
+- **Type / Surface / Size:** bug · `web` (`/improve/lab` run dialog + cards) · S–M
+- **Prereqs:** —
+- **Important files (candidates):** `web/app/improve/lab/page.tsx` (cost line + card states), `src/api/improve.py` (`n = max(_MIN_RUN_N, min(req.n, _MAX_RUN_N))` ~:995 — surface the floor in the run response/record).
+- **Current:** modal computes "runs {n×2} real model calls" from the RAW input; backend floors to `_MIN_RUN_N` (QA6: asked n=1, promised "2 calls", ran 5/arm). Card shows "Sample 5/5" 3s after launch, static ~2min, then silently vanishes from Active (no toast); "Running" vs hung indistinguishable.
+- **Desired:** the dialog quotes the n that will actually run (and says when input was floored); the running card fills incrementally (or honestly says "running, no per-episode progress available"); completion announces itself (toast + card transition).
+- **Acceptance:** submitting n=1 shows "will run 5 per arm (minimum sample)"; a finished run produces a visible state change without a manual tab switch.
+- **Refs:** QA6 qa-lab CRITICAL #2 (reconciled: floor is by design, the QUOTE is the bug), HIGH #4.
+
+### CB-58 — Untangle rejection vs guardrail messaging on experiment cards
+- **Type / Surface / Size:** bug · `api` (`improve`) · `web` · S–M
+- **Prereqs:** —
+- **Important files (candidates):** `src/api/improve.py` (failure path sets `guardrail="trip"` + stuffs generic reason, ~:960–970; completion path reason assembly), `web/app/improve/lab/page.tsx` (footer copy "needs approval").
+- **Current:** rejected cards show BOTH "WHY IT ENDED: no significant lift…" and a red "Guardrail tripped — needs approval" while the Approvals queue is empty — two contradictory stories, one false call-to-action. Timed-out runs render "no result recorded" alongside Sample 5/5 + metrics; two past cards show "Sample 40 / —"; `challenger_better is False` (internal flag) renders verbatim; one draft card is a zombie "Running · Sample 0 / —".
+- **Desired:** one truthful ending per card: insignificance ≠ guardrail ≠ needs-approval; "needs approval" only when an approval actually exists; timeout cards show no fabricated metrics; reasons in plain English (no internal flag names); no permanent zombie states.
+- **Acceptance:** a rejected-for-insignificance card shows no guardrail/approval language; a guardrail-blocked card links to a real Approvals entry; e2e sweep finds no `challenger_better` string in rendered text.
+- **Refs:** QA6 qa-lab HIGH #5, MEDIUM #7–9, LOW #10.
+
+### CB-59 — One champion: experiments + KPI must target the LIVE champion (v1), not champion_v0.yaml
+- **Type / Surface / Size:** bug/change · `api` (`improve`, `operate`) · `web` (KPI) · M
+- **Prereqs:** —
+- **Important files (candidates):** `src/api/improve.py` (`get_config()` returns the static `champion_v0.yaml`), version store (improve-store champion v1-bd0ef7ce), `web/app/operate/kpi/page.tsx` + its version selector source.
+- **Current:** the Lab baselines v0 and labels it "current production" while the header/Versions page say v1 is live (drawer even shows in-sample mean 0.80 as v0's ladder vs the store's 0.51). KPI's version selector offers v0/vA/vB only — the live champion's performance is invisible, and the only Enrolled/Trial showcase calls (v1) are excluded from every KPI view.
+- **Desired:** a single source of truth for "current champion"; experiments A/B against it by default; KPI selector lists real version labels including the live one; "current production" label always matches the Versions page.
+- **Acceptance:** Lab drawer champion label == Versions page champion == header; KPI can show v1; an experiment run's champion arm uses the promoted config; test pins get_config()/store agreement.
+- **Refs:** QA6 qa-lab MEDIUM #6 + cross-check note, qa-operate bug #9; `/tmp/qa6/24_versions.png`.
+
+### CB-60 — Cohort/count coherence across Operate (one disease, many symptoms)
+- **Type / Surface / Size:** bug · `api` (`operate`, `persistence`) · `web` (calls/KPI/escalations) · L
+- **Prereqs:** —
+- **Important files (candidates):** `src/api/operate.py` (list/KPI/escalation population filters), `web/app/operate/{calls,kpi}/page.tsx`, sidebar badge source.
+- **Current (QA6):** no two surfaces agree — Calls 56 "Real"/200 "All", KPI 2,842 (cohort subtotals sum to 2,692: 150 calls in no cohort), escalations 48 pointing at `sp-` calls the list excludes (sidebar badge 32, "Escalated" filter finds 2); KPI vA card contradicts itself on one screen (headline "67% enrollment" above a ladder saying 0%/100%); vB (n=1) claims three impossible 100% rates; 39 identical seeded stub calls ("Released", latency 0.0s, `"sim-harness decision"`) render unlabeled as if real — operators conclude the agent is broken.
+- **Desired:** every surface states its population and the numbers reconcile; escalation queue links resolve within the list's reachable population (or the queue labels the cohort); seeded/sim data gets a visible badge and is excluded from "Real calls" by default (do NOT delete the stubs); KPI headline and ladder computed from the same denominator.
+- **Acceptance:** counts cross-check script (calls==list totals; cohort subtotals sum; every escalation's call findable from the UI); vA/vB self-consistency; stub rows visibly badged; n=1 views show the small-n warning instead of 100% claims.
+- **Refs:** QA6 qa-operate HIGH #1–4, MEDIUM #10, LOW #16.
+
+### CB-61 — The agent doesn't LISTEN: DST drops caller-stated slots (deadline, callback time)
+- **Type / Surface / Size:** bug · `core` (`dst`, gates' skip_known inputs) · M–L
+- **Prereqs:** —
+- **Important files (candidates):** `src/core/dst.py` (timeline/schedule extraction), `src/core/gates.py` (`skip_known`/`no_repeat_discovery` only help if the slot is FILLED), eval persona scripts for regression.
+- **Current (QA6 conv 1):** caller said "big test in about three weeks" → next turn agent asked "is it keeping up day-to-day, preparing for a test?"; caller said "Thursday after 3pm" → agent asked "What day works for you?"; caller explicitly asked to confirm Thursday → agent answered "they'll be in touch soon" without ever acknowledging the time. The close survives on caller patience, not agent competence. Same root as the measured qualification-accuracy gap (~0.29 vs 0.75–0.80 ladder).
+- **Desired:** stated deadline/timeline and proposed callback windows are captured as slots, never re-asked, and explicitly confirmed on request ("Thursday after 3pm — noted").
+- **Acceptance:** scripted regression replaying QA6 conv 1: zero re-asks of volunteered facts; the confirm request gets an explicit echo of the time; qual-acc on the eval set moves up measurably.
+- **Refs:** QA6 qa-chat HIGH #4 + transcript (verbatim in report).
+
+### CB-62 — Price-question policy: offer the KB-grounded ballpark instead of pure deflection
+- **Type / Surface / Size:** change · `core` (`gates.price_gate`, NLG) · `kb` · S–M
+- **Prereqs:** —
+- **Important files (candidates):** `src/core/gates.py` (`price_gate`, `address_direct_input`), `src/kb/content/pricing*.json` (ARPM ~$335–374/mo VERIFIED range exists), `src/core/nlg.py`.
+- **Current (QA6):** direct price ask with stated tight budget → "Perfect — let me get you connected…" (tone-deaf ack + no number); only after pushback an honest "I don't have a rate to share". The KB carries a grounded range that was never offered. (Credit: nothing was invented.)
+- **Desired:** policy decision — on a direct price ask, give the grounded ballpark/range with the "depends on needs" qualifier, THEN offer the exact-quote callback; acknowledge budget concern before pivoting (never "Perfect —" after "tight budget").
+- **Acceptance:** eval seed with a double price-ask: first response contains a KB-grounded range (grounding guard green) + empathetic ack; deflection-without-number does not recur.
+- **Refs:** QA6 qa-chat MEDIUM #5, FAIL on directness axis.
+
+### CB-63 — Stream the demo chat (SSE) + typing indicator
+- **Type / Surface / Size:** change · `api` (`demo_routes`) · `web/app/demo` · M
+- **Prereqs:** CB-54 (session fix first — same files)
+- **Important files (candidates):** `src/api/demo_routes.py` (`/api/chat` currently BUFFERS the whole brain turn by design — route header comment), `web/app/demo` chat client.
+- **Current:** 5.7–9.1s of total silence per turn, then the reply pops in whole; no typing indicator. The brain already streams tokens on the voice path (R37 parity) — the chat route just doesn't expose them.
+- **Desired:** `/api/chat` streams tokens (SSE) and the UI renders progressively; at minimum an immediate typing indicator. Keep turn persistence + timing stamps (CB-44 fields) intact.
+- **Acceptance:** observable progressive render in the demo (first visible text ≲2s after send on a warm path); turn timing fields still populated; e2e asserts >2 incremental paints per reply.
+- **Refs:** QA6 qa-chat FAIL axis 1 (latencies measured), MEDIUM #6.
+
+### CB-64 — Repetition residual in live chat: verbatim pitch + triple callback-pitch
+- **Type / Surface / Size:** bug · `core` (`nlg`) · S–M
+- **Prereqs:** —
+- **Important files (candidates):** `src/core/nlg.py` (`_NO_RESTATE_INSTRUCTION`, YOUR_LAST_LINES window n=4), `src/core/respond.py` (`_own_last_lines`).
+- **Current (QA6 conv 1):** core pitch delivered near-verbatim in replies 1 and 3 (inside the own-lines window — the instruction was present and ignored); "connect you with my team… exact pricing" pitched 3× and "fifteen minutes" 2×. Milder than the pre-CB-51 stat-cycling but still a FAIL to a blind reviewer.
+- **Desired:** a pitch/offer is made once; later references are abbreviated ("like I mentioned, the team call —") or advance the close instead of re-pitching.
+- **Acceptance:** replay QA6 conv 1 script: no two agent replies share a near-verbatim (>8-content-word) span; eval-judge repetition flags stay at current-or-better on the 3 personas.
+- **Refs:** QA6 qa-chat FAIL axis 2 / MEDIUM #7; builds on CB-51/53.
+
+### CB-65 — Viewer-facing leak sweep (slugs, IDs, debug artifacts)
+- **Type / Surface / Size:** bug · `web` (all surfaces) · `api` (label seams) · M
+- **Prereqs:** —
+- **Important files (candidates):** `src/api/labels.py` (translate at the seam), `web/app/operate/*`, `web/app/improve/*`, demo header.
+- **Current (QA6, all three reports):** raw run IDs as call names (`#RUN-…::challenger::6`); `kb_v0` chip on every page; `challenger_better is False` in reasons; raw config dump as "WHAT CHANGED" (`reorder discovery_sequence -> ['grade_level', …]`); `tier 1`/`tier 0` on lab rows where Calls says "No commitment"; Python decision dumps in tactic notes (`tier='callback' (trust=0.50, breakthrough=False)`); `"sim-harness decision"` rationale text; dead "debug" link in the CONSUMER demo header; full 32-hex IDs as primary labels; card titles `w2-detail`, `@n30`.
+- **Desired:** per the no-internal-indices rule: human labels in all rendered text; IDs shortened or demoted to tooltips/data-attrs; the debug link gone from consumer UI; tactic notes written as operator English.
+- **Acceptance:** automated sweep (qa6 scripts reusable) over demo+operate+improve finds zero `::`, `_v0`, snake_case enum, `is False`, or `->[` patterns in visible text.
+- **Refs:** QA6 leak sections of all three reports; `/tmp/qa6/04_leak_run_ids_top.png`.
+
+### CB-66 — Operate polish batch (sorting, filters, durations, labels)
+- **Type / Surface / Size:** bug · `web` (`/operate`) · `api` (list fields) · M
+- **Prereqs:** CB-60 (population semantics first)
+- **Important files (candidates):** `web/app/operate/calls/page.tsx`, `web/app/operate/live/page.tsx`, review header components, `src/api/operate.py`.
+- **Current (QA6 qa-operate):** column sorting dead (verified no-op); outcome filters miss 4 real outcomes + naming drift ("Callback booked" vs "Callback scheduled"; tier mismatch on two rows); 41/56 durations "—" (incl. 8-turn calls); "Show sample call" dead control; unlabeled number badge on review header; ARCHETYPE column duplicates CALL; escalation rows lack timestamps; "1 calls" grammar; escalation chip rendered one turn before the actual human request; 0:09 2-turn call labeled "Consultation booked".
+- **Desired:** working sort; complete + consistent outcome vocabulary (one name per concept, tier matches outcome); durations computed for any call with ≥1 turn; sample-call control works or is removed; badge labeled; columns deduped; escalation rows timestamped; grammar pluralized; escalation chip on the triggering turn; outcome labels never contradict the transcript.
+- **Acceptance:** e2e: sort toggles order; every outcome present in data is filterable; durations render for multi-turn calls; leak/contradiction spot-checks from the QA6 scripts pass.
+- **Refs:** QA6 qa-operate MEDIUM #5–8, LOW #11–15, bug #8.
+
 ---
 
 ## In Progress
@@ -121,6 +229,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-55 — Lab→Review handoff 404s: composite episode IDs double-encoded
+- **Type / Surface / Size:** bug · `web` (`/improve/lab/[id]` → `/operate/review/[id]`) · S
+- **Completed:** 2026-06-07
+- **Files changed (actual):** `web/app/operate/review/[id]/page.tsx` (decode once + clean error copy), `tests/e2e/qa7_cb55.py` (NEW — assertion-based playwright regression).
+- **What changed:** Next.js 14 does NOT auto-decode dynamic route params; the lab page's `encodeURIComponent('RUN-…::champion::0')` arrived at the review page still encoded, and `fetchEpisode` encoded it AGAIN (`%253A%253A`) → API saw a nonexistent id. Fix: `const id = decodeURIComponent(params.id)` at the consumer (idempotent for plain `ep-`/`sp-` ids). Error page now shows a stable human message ("This call record does not exist…") — never the raw encoded ID blob.
+- **Verification:** qa7_cb55.py before-fix FAIL (both arms "Call not found" with `%3A%3A` blob) → after-fix PASS (champion + challenger transcripts render, 10 turns each; bogus-id error shows clean copy). Re-run by orchestrator against the live dash: PASS.
+- **Constraints checked:** no raw ID/slug in viewer-facing error text; normal call routes unaffected (idempotent decode).
+- **Follow-ups / known gaps:** none.
 
 ### CB-45 — Surface call timing on the dashboard (live + review + calls)
 - **Type / Surface / Size:** feature · `/operate/live` · `/operate/review` · `/operate/calls` · `design` · M
