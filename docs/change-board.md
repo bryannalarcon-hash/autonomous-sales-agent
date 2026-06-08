@@ -79,15 +79,6 @@
 - **Acceptance:** Lab drawer champion label == Versions page champion == header; KPI can show v1; an experiment run's champion arm uses the promoted config; test pins get_config()/store agreement.
 - **Refs:** QA6 qa-lab MEDIUM #6 + cross-check note, qa-operate bug #9; `/tmp/qa6/24_versions.png`.
 
-### CB-63 — Stream the demo chat (SSE) + typing indicator
-- **Type / Surface / Size:** change · `api` (`demo_routes`) · `web/app/demo` · M
-- **Prereqs:** CB-54 (session fix first — same files)
-- **Important files (candidates):** `src/api/demo_routes.py` (`/api/chat` currently BUFFERS the whole brain turn by design — route header comment), `web/app/demo` chat client.
-- **Current:** 5.7–9.1s of total silence per turn, then the reply pops in whole; no typing indicator. The brain already streams tokens on the voice path (R37 parity) — the chat route just doesn't expose them.
-- **Desired:** `/api/chat` streams tokens (SSE) and the UI renders progressively; at minimum an immediate typing indicator. Keep turn persistence + timing stamps (CB-44 fields) intact.
-- **Acceptance:** observable progressive render in the demo (first visible text ≲2s after send on a warm path); turn timing fields still populated; e2e asserts >2 incremental paints per reply.
-- **Refs:** QA6 qa-chat FAIL axis 1 (latencies measured), MEDIUM #6.
-
 ### CB-65 — Viewer-facing leak sweep (slugs, IDs, debug artifacts)
 - **Type / Surface / Size:** bug · `web` (all surfaces) · `api` (label seams) · M
 - **Prereqs:** —
@@ -157,6 +148,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-63 — Stream the demo chat (SSE) + typing indicator
+- **Type / Surface / Size:** change · `api` (`demo_routes`) · `web/components/demo` · M
+- **Completed:** 2026-06-07
+- **Files changed (actual):** `src/api/demo_routes.py` (dual-mode `/api/chat`: SSE via the existing `demo_auto_stream` StreamingResponse idiom + unchanged buffered JSON fallback; shared `_post_turn_hooks` closure for commit/escalation/live-upsert), `web/components/demo/TextConsole.tsx` (progressive token render + immediate typing indicator; CB-54 `/end`-on-done + 409 re-consent preserved), `tests/e2e/test_cb63_chat_stream.py` (NEW, 16).
+- **What changed:** chat now streams the brain's tokens (respond_stream reused — no brain fork, R37 intact). Consent 409 + minor gate fire BEFORE any token; timing stamps/turn persistence/escalation+PII scrub/CB-52 cost capture all proven preserved on the SSE path.
+- **Verification:** 16 new contract tests incl. concat(chunks)==buffered parity + 409-before-first-token; CB-54's 17 tests stay green; full suite 562p/5s.
+- **Constraints checked:** R37 parity; consent/PII compliance on the streamed path; cost accounting fires via the existing `_sse_usage` path.
+- **Follow-ups / known gaps:** live progressive-render + typing-indicator eyeball needs the orchestrator's API restart (queued before the blind QA round).
 
 ### CB-64 — Repetition residual in live chat: verbatim pitch + triple callback-pitch
 - **Type / Surface / Size:** bug · `core` (`nlg`, `respond`) · S–M

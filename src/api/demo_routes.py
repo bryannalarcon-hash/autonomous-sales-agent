@@ -5,29 +5,37 @@
 # detect_minor run on available signals so a suspected minor is gated INDEPENDENT of a client
 # is_minor flag, R40); /api/chat (GATED 409 by consent) runs one brain turn via VoiceSession — it
 # detect_minors the user text first (a self-reported minor flips need_parental -> 409), buffers/persists
-# an escalation with a PII-scrubbed moment, and reports `done` for terminal acts; LIVE PERSISTENCE
-# (Layer 2): after each /api/chat turn the live_upsert_hook (default: persist_call_live) upserts an
-# in_progress Episode using a stable episode_id + created_at stamped at session creation, so the Live
-# monitor can query the call WHILE it is happening; POST /api/demo/auto/start (CB-08 + CB-12) kicks off
-# a SERVER-SIDE demo call (consent pre-captured) that runs a REAL self-play — the agent brain vs an
-# LLM-GENERATED ProspectSimulator (src.sim, NOT a fixed script, so each demo varies) — streaming each
-# committed turn through that same per-turn live-upsert path as a background task, so the Live monitor
-# populates without a phone AND the demo survives the operator navigating away (it is not browser-bound);
-# GET /api/demo/auto/stream?episode_id=<id> (CB-12) is an SSE stream that emits a per-turn `turn` event
-# (and a terminal `end` event) so the live page appends turns in near-real-time instead of waiting on
-# its 5 s poll (which stays a fallback); CB-21 adds a `generating` event emitted BEFORE each brain turn
-# (so the monitor shows a "Generating…" spinner during the ~6 s compose window) and rides the committed
-# reply text on the `turn` event so the monitor can REVEAL it word-by-word (a token-stream-like effect
-# on the demo path; real-voice token streaming is deferred); /api/livekit/token (503 without creds) mints a
-# token via the injected builder AND stamps the already-captured consent onto the room metadata
-# (consent_state/recording_granted/jurisdiction/phone_hash/conversable — no secrets) so the live
-# voice worker SEEDS its ConsentGate from it instead of deadlocking on a pending gate waiting for
-# spoken consent; /api/session/{id}/end persists the Episode (+escalations+lead) FK-safely (using
-# the same episode_id so the final save upserts the in_progress row) and EVICTS the session from
-# the bounded LRU store (503 over cap); GET /api/session/{id} + /api/health are introspection.
-# Everything network/DB-bound is injected from create_app (LLM factory, embedder,
-# retrieve/hydrate/escalation/call-end/live-upsert hooks, token builder) so tests run offline. PII
-# is scrubbed in the VoiceSession before storage; the lead key is the phone-hash.
+# an escalation with a PII-scrubbed moment, and reports `done` for terminal acts; CB-63: /api/chat now
+# STREAMS tokens as SSE when the client sends Accept: text/event-stream (progressive render + typing
+# indicator, eliminating the 5.7–9.1 s silence). SSE events: `token` chunks during NLG generation,
+# then a terminal `done` event carrying {reply, decision_act, done} — the same payload as the buffered
+# JSON fallback (backward-compatible: existing clients that POST without Accept:text/event-stream get
+# unchanged JSON). Streaming reuses handle_user_turn_stream (the VoiceSession streaming twin of
+# handle_user_turn) then commit_turn + post-turn hooks (escalation, close-tier, live upsert) AFTER the
+# stream completes — so consent gating, minor detection, timing stamps, cost accounting, and turn
+# persistence are IDENTICAL to the buffered path. LIVE PERSISTENCE (Layer 2): after each /api/chat
+# turn the live_upsert_hook (default: persist_call_live) upserts an in_progress Episode using a stable
+# episode_id + created_at stamped at session creation, so the Live monitor can query the call WHILE it
+# is happening; POST /api/demo/auto/start (CB-08 + CB-12) kicks off a SERVER-SIDE demo call (consent
+# pre-captured) that runs a REAL self-play — the agent brain vs an LLM-GENERATED ProspectSimulator
+# (src.sim, NOT a fixed script, so each demo varies) — streaming each committed turn through that same
+# per-turn live-upsert path as a background task, so the Live monitor populates without a phone AND the
+# demo survives the operator navigating away (it is not browser-bound); GET /api/demo/auto/stream?
+# episode_id=<id> (CB-12) is an SSE stream that emits a per-turn `turn` event (and a terminal `end`
+# event) so the live page appends turns in near-real-time instead of waiting on its 5 s poll (which
+# stays a fallback); CB-21 adds a `generating` event emitted BEFORE each brain turn (so the monitor
+# shows a "Generating…" spinner during the ~6 s compose window) and rides the committed reply text on
+# the `turn` event so the monitor can REVEAL it word-by-word (a token-stream-like effect on the demo
+# path); /api/livekit/token (503 without creds) mints a token via the injected builder AND stamps the
+# already-captured consent onto the room metadata (consent_state/recording_granted/jurisdiction/
+# phone_hash/conversable — no secrets) so the live voice worker SEEDS its ConsentGate from it instead
+# of deadlocking on a pending gate waiting for spoken consent; /api/session/{id}/end persists the
+# Episode (+escalations+lead) FK-safely (using the same episode_id so the final save upserts the
+# in_progress row) and EVICTS the session from the bounded LRU store (503 over cap); GET
+# /api/session/{id} + /api/health are introspection. Everything network/DB-bound is injected from
+# create_app (LLM factory, embedder, retrieve/hydrate/escalation/call-end/live-upsert hooks, token
+# builder) so tests run offline. PII is scrubbed in the VoiceSession before storage; the lead key is
+# the phone-hash.
 from __future__ import annotations
 
 import asyncio
@@ -40,7 +48,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -694,33 +702,32 @@ def create_demo_router(
             message=_OK_STATE_MESSAGES.get(gate.state, gate.state),
         )
 
-    # --- POST /api/chat (GATED by consent) ------------------------------------------------------
+    # --- POST /api/chat (GATED by consent) -------------------------------------------------------
+    #
+    # CB-63 dual-mode: when the client sends Accept: text/event-stream the response streams tokens
+    # as SSE (progressive render; first visible text within ~1–2 s on a warm path). When the client
+    # sends a plain JSON Accept (or none), the original buffered JSON response is returned unchanged
+    # — existing tests and non-streaming clients keep working.
+    #
+    # SSE event shape (CB-63 streaming path):
+    #   event: token   data: "word "          — one NLG delta as it generates
+    #   event: done    data: {"reply":…,"decision_act":…,"done":…}  — final payload after all tokens
+    #
+    # CONSENT GATING fires BEFORE any tokens flow (same as buffered path). R40 minor detection also
+    # runs before the brain starts. Both paths commit state, run escalation, record the close tier,
+    # and fire the live upsert via _post_turn_hooks() so semantics are identical.
 
-    @router.post("/api/chat", response_model=ChatResponse)
-    async def chat(req: ChatRequest) -> ChatResponse:
-        sess = _get(req.session_id)
-        # Suspected-minor detection on the user's text (R40), INDEPENDENT of any is_minor flag: a
-        # self-reported school-aged caller flips the gate to need_parental and the turn is GATED (409),
-        # so the brain never runs for an un-consented minor.
-        if sess.gate.can_converse and detect_minor({"text": req.text}):
-            sess.gate.flag_minor()
-        if not sess.gate.can_converse:
-            # 409: consent not satisfied (pending / need_parental / ended).
-            raise HTTPException(
-                status_code=409,
-                detail={"reason": "consent_not_satisfied", "state": sess.gate.state},
-            )
-        vs = _ensure_voice_session(sess)
-        sess._speech_counter += 1
-        speech_id = f"s-{sess._speech_counter}"
-        try:
-            pending = await vs.handle_user_turn(req.text, speech_id)
-        except ConsentError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={"reason": "consent_not_satisfied", "state": exc.state},
-            ) from exc
+    async def _post_turn_hooks(sess: "_Session", vs: Any, speech_id: str) -> tuple[Any, bool]:
+        """Run the post-turn hooks that are identical for both the buffered and streaming paths.
+
+        Calls commit_turn (the single writer of session state), handles an escalate decision (U14),
+        tracks the close tier (CB-08), fires the live upsert (Layer 2), and returns (committed, done).
+        Extracted to a helper so the streaming and buffered /api/chat handlers share the SAME logic
+        without duplication. `committed` is the PendingTurn returned by commit_turn (it is the same
+        object that was in the pending buffer, now promoted to committed state)."""
         committed = vs.commit_turn(speech_id)
+        # `committed` IS the promoted PendingTurn (or None if the speech_id was not pending). It
+        # carries the gated decision + assembled reply — use it for all downstream checks.
 
         # ESCALATION (U14/R10): a gated `escalate` decision is handled at runtime — an in-persona async
         # deferral is produced + an EscalationLog is built and queued for review. The log is buffered on
@@ -753,13 +760,103 @@ def create_demo_router(
         # live_episode_id ensures all upserts + the final /end persist target the same row.
         await _live_upsert(sess)
 
-        done = pending.decision.act in ("disqualify", "escalate") or (
-            pending.decision.act == "attempt_close" and pending.decision.tier == "enrollment"
+        done = committed is not None and (
+            committed.decision.act in ("disqualify", "escalate") or (
+                committed.decision.act == "attempt_close" and committed.decision.tier == "enrollment"
+            )
         )
+        return committed, bool(done)
+
+    def _wants_sse(request: Request) -> bool:
+        """True when the client signals it accepts SSE (Accept: text/event-stream)."""
+        accept = request.headers.get("accept", "")
+        return "text/event-stream" in accept
+
+    @router.post("/api/chat")
+    async def chat(req: ChatRequest, request: Request) -> Any:
+        sess = _get(req.session_id)
+        # Suspected-minor detection on the user's text (R40), INDEPENDENT of any is_minor flag: a
+        # self-reported school-aged caller flips the gate to need_parental and the turn is GATED (409),
+        # so the brain never runs for an un-consented minor. Runs BEFORE the brain on BOTH paths.
+        if sess.gate.can_converse and detect_minor({"text": req.text}):
+            sess.gate.flag_minor()
+        if not sess.gate.can_converse:
+            # 409: consent not satisfied (pending / need_parental / ended). Fires BEFORE any token
+            # flows on BOTH paths — the SSE path does NOT open the stream then 409 partway through.
+            raise HTTPException(
+                status_code=409,
+                detail={"reason": "consent_not_satisfied", "state": sess.gate.state},
+            )
+        vs = _ensure_voice_session(sess)
+        sess._speech_counter += 1
+        speech_id = f"s-{sess._speech_counter}"
+
+        # --- CB-63 STREAMING PATH (Accept: text/event-stream) ------------------------------------
+        if _wants_sse(request):
+            async def _sse_gen() -> Any:
+                """Yield SSE `token` events during NLG, then a terminal `done` event.
+
+                The consent gate + minor detection already fired above (before the stream opens) so
+                no token ever flows for an un-consented session. After the token stream ends, commit_turn
+                and post-turn hooks run INSIDE the generator so they complete before the `done` event
+                closes the connection — ensuring timing stamps, cost accounting, and live upsert are
+                persisted synchronously before the client fires /end."""
+                try:
+                    async for token in vs.handle_user_turn_stream(req.text, speech_id):
+                        # Each NLG delta forwarded to the client as a `token` SSE event. JSON-encode
+                        # the token string so the client can safely parse it (handles quotes/newlines).
+                        yield f"event: token\ndata: {json.dumps(token)}\n\n"
+                except ConsentError as exc:
+                    # Consent flipped mid-stream (extremely rare; handle_user_turn_stream raises
+                    # ConsentError if the gate blocks BEFORE generation). Emit an error event so
+                    # the client knows this is a 409, then close cleanly.
+                    err = {"error": "consent_not_satisfied", "state": exc.state}
+                    yield f"event: error\ndata: {json.dumps(err)}\n\n"
+                    return
+                except Exception as exc:
+                    err = {"error": "stream_failed", "detail": str(exc)}
+                    yield f"event: error\ndata: {json.dumps(err)}\n\n"
+                    return
+
+                # Stream complete — run post-turn hooks (commit, escalation, live upsert).
+                try:
+                    decided, done = await _post_turn_hooks(sess, vs, speech_id)
+                except Exception:
+                    # A hook failure must not swallow the reply; emit what we have.
+                    decided, done = None, False
+
+                reply = decided.reply_text if decided is not None else ""
+                act = decided.decision.act if decided is not None else ""
+                payload = json.dumps({"reply": reply, "decision_act": act, "done": done})
+                yield f"event: done\ndata: {payload}\n\n"
+
+            return StreamingResponse(
+                _sse_gen(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache, no-transform",
+                    "X-Accel-Buffering": "no",
+                    "Connection": "keep-alive",
+                },
+            )
+
+        # --- BUFFERED JSON FALLBACK (original path, unchanged) -----------------------------------
+        try:
+            pending = await vs.handle_user_turn(req.text, speech_id)
+        except ConsentError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"reason": "consent_not_satisfied", "state": exc.state},
+            ) from exc
+
+        decided, done = await _post_turn_hooks(sess, vs, speech_id)
+        # `pending` carries the decision / reply from handle_user_turn; `decided` is the same turn
+        # promoted by commit_turn inside _post_turn_hooks. Use pending for the reply (it was computed
+        # first and is identical — R37 parity), decided for done-flag (commit may mutate tier bookkeeping).
         return ChatResponse(
             reply=pending.reply_text,
             decision_act=pending.decision.act,
-            done=bool(done),
+            done=done,
         )
 
     # --- POST /api/livekit/token (only when consent allows recording/voice) ---------------------
