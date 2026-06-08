@@ -70,37 +70,6 @@
 - **Refs:** CB-61 replay transcript /tmp/qa7/cb61_replay_transcript.txt (turn 6); CB-68 Done entry.
 
 
-### CB-74 — KPI page must never default into an empty population
-- **Type / Surface / Size:** bug · `web` (KPI) · S–M
-- **Current (QA9-ops CRITICAL):** fresh load of /operate/kpi auto-selects the live champion (CB-59 round-1 behavior) — but the lineage hash churns (CB-73 pollution), so v1-tagged episodes don't match the newest hash → "No episodes match v1" on every fresh visit. Operators see an empty KPI page with no guidance.
-- **Desired:** auto-select only a POPULATED version (fall back to the most-populated/default view when the live champion has zero episodes, with a one-line note "the live champion has no recorded calls yet — showing <X>"); never an unexplained empty default.
-- **Acceptance:** fresh /operate/kpi load renders data; explicit empty selections show guidance; qa playwright check.
-- **Refs:** QA9-ops bug #1; /tmp/qa9/f07_kpi.png; interacts with CB-73 (root) — this is the display-side guard.
-
-### CB-75 — Operate polish round 2 (label dup, hint→affordance, counts, sort visibility, leaks)
-- **Type / Surface / Size:** bug · `web` (operate) · `api` (count) · M
-- **Current (QA9-ops):** "Champion **Champion** v0" doubled label when the review panel opens (HIGH); the escalation cohort hint is raw pasted text, not a link/affordance (HIGH); "75 real calls" label vs 76 rendered rows (off-by-one); sidebar badge and Unreviewed tab fetched separately (±1 race renders on one screen); `establish_who_first` strategy slug leaks in the Live sample-call belief panel; sort gives no visible direction glyph for sighted users and LADDER/VERSION columns silently eat clicks; DURATION ⇅ doesn't visibly reorder; three filter chips (Booked/Interested/No interest) return empty tables with no "no match" message; "CALL ID" raw 32-hex field in drawer (shorten + copy affordance).
-- **Desired:** each item fixed or explicitly waived; counts on one screen come from one fetch.
-- **WAIVED with evidence:** "review pages 404 on direct URL" — disproven live (200 + proper render for real and bogus ids; agent artifact).
-- **Acceptance:** the QA9-ops bug list re-checked item-by-item by a playwright script; leak sweep extended with the belief-panel surface.
-- **Refs:** QA9-ops bugs #2–#8, #10.
-
-### CB-78 — First-message cold start (~10s to first token) + mid-stream double-send queueing
-- **Type / Surface / Size:** bug · `api`/`web` (demo) · S–M
-- **Current (QA9-chat MEDIUM/INFO):** a session's first message showed 16ms-to-indicator but 10.0s-to-first-text (later turns 9–13ms-to-first-text scale); suspects: first-turn lazy load (KB retrieve / route compile / OpenRouter connection warmup) — diagnose, don't guess. Mid-stream, a second Send was accepted and queued server-side (no client block) — no corruption, but the queue door is open.
-- **Desired:** first-turn latency near later-turn latency (warm whatever is cold at startup), or an honest "connecting…" state; client blocks Send while a stream is active.
-- **Acceptance:** measured first-turn first-token within ~2× of later turns; mid-stream Send is a no-op client-side.
-- **Refs:** QA9-chat bugs #5, #10; streaming measurement table.
-
-### CB-78 — First-message cold start (~10s first token) + mid-stream double-send
-- **Type / Surface / Size:** bug · `core` (`llm`) · `api` (`server` lifespan) · `web` (demo) · S–M
-- **Completed:** 2026-06-08
-- **Files changed (actual):** `src/core/llm.py` (per-(instance,loop) shared httpx `AsyncClient` — was a fresh client + TLS handshake on EVERY call, 3+/turn), `src/api/server.py` (lifespan pre-opens the DB pool alongside the embedder warm-up), `tests/unit/test_cb78_llm_client_reuse.py` (NEW, 5). Web mid-stream Send guard: `canSend` already gates on `sending` (verified — the QA "queue" was the indicator-timing artifact; documented).
-- **What changed:** first-turn latency was paying TLS handshakes + lazy DB-pool creation on top of the LLM round-trips (measured first agent turn 11.3s vs ~7s steady). Connection reuse + pool pre-open remove the startup tax; loop-affinity handled (cache keyed by the running loop, rebuilt on loop/closed change — tests spin one loop each).
-- **Verification:** 5 reuse tests (same-loop reuse, new-loop rebuild, closed-client replace, fake-client tolerance); llm suite + full suites 615p/5s + system green.
-- **Constraints checked:** retry/backoff/cost-capture paths unchanged (same client, just reused); R37 stream parity intact.
-- **Follow-ups / known gaps:** real first-token latency improvement to be confirmed in QA round 3 (the handshake/pool tax is removed; embedder first-load is already warmed). Mid-stream Send is already a no-op client-side (canSend gating); no code change needed there.
-
 ### CB-79 — One-time reset of the dev DB's polluted champion (needs user authorization — DB write)
 - **Type / Surface / Size:** chore · `db` (dev only) · S
 - **Prereqs:** CB-73 (done — stops further pollution)
