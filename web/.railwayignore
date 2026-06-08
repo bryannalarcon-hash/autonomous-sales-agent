@@ -1,0 +1,9 @@
+# .railwayignore — keep the web (Next.js) build context lean for `railway up`.
+# Railpack reinstalls deps and rebuilds, so the local node_modules/.next must NOT be uploaded
+# (they're huge and platform-specific). Deploying from this web/ dir (not repo root) also keeps
+# Railway from finding the root Dockerfile, so it correctly auto-detects the Next.js app.
+node_modules/
+.next/
+tsconfig.tsbuildinfo
+.env
+.env.local

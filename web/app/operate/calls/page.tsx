@@ -44,7 +44,7 @@
 // the drawer tag strip — raw "text" now maps to "Web chat", "voice" → "Web voice", "phone" → "Phone".
 'use client';
 
-import { useEffect, useMemo, useCallback, useState } from 'react';
+import { Suspense, useEffect, useMemo, useCallback, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchEpisodes, fmtDuration, fmtMsShort, fmtTimeAgo } from '@/lib/operate-api';
@@ -294,7 +294,7 @@ function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
   );
 }
 
-export default function CallsPage() {
+function CallsPageInner() {
   const searchParams = useSearchParams();
   const [q, setQ] = useState('');
   const [outcome, setOutcome] = useState(''); // internal key ('' = All)
@@ -530,5 +530,16 @@ export default function CallsPage() {
       </div>
       {sel ? <Drawer c={sel} onClose={() => setSel(null)} /> : null}
     </div>
+  );
+}
+
+// useSearchParams (CB-75's ?cohort= read) forces a client-side render bailout that the Next.js App
+// Router requires be wrapped in a Suspense boundary — otherwise `next build` fails the static export
+// of this route (mirrors the same wrapper in improve/lab/page.tsx).
+export default function CallsPage() {
+  return (
+    <Suspense fallback={<div className="page" />}>
+      <CallsPageInner />
+    </Suspense>
   );
 }
