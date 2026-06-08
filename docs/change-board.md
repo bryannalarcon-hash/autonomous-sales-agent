@@ -79,15 +79,6 @@
 - **Acceptance:** Lab drawer champion label == Versions page champion == header; KPI can show v1; an experiment run's champion arm uses the promoted config; test pins get_config()/store agreement.
 - **Refs:** QA6 qa-lab MEDIUM #6 + cross-check note, qa-operate bug #9; `/tmp/qa6/24_versions.png`.
 
-### CB-60 — Cohort/count coherence across Operate (one disease, many symptoms)
-- **Type / Surface / Size:** bug · `api` (`operate`, `persistence`) · `web` (calls/KPI/escalations) · L
-- **Prereqs:** —
-- **Important files (candidates):** `src/api/operate.py` (list/KPI/escalation population filters), `web/app/operate/{calls,kpi}/page.tsx`, sidebar badge source.
-- **Current (QA6):** no two surfaces agree — Calls 56 "Real"/200 "All", KPI 2,842 (cohort subtotals sum to 2,692: 150 calls in no cohort), escalations 48 pointing at `sp-` calls the list excludes (sidebar badge 32, "Escalated" filter finds 2); KPI vA card contradicts itself on one screen (headline "67% enrollment" above a ladder saying 0%/100%); vB (n=1) claims three impossible 100% rates; 39 identical seeded stub calls ("Released", latency 0.0s, `"sim-harness decision"`) render unlabeled as if real — operators conclude the agent is broken.
-- **Desired:** every surface states its population and the numbers reconcile; escalation queue links resolve within the list's reachable population (or the queue labels the cohort); seeded/sim data gets a visible badge and is excluded from "Real calls" by default (do NOT delete the stubs); KPI headline and ladder computed from the same denominator.
-- **Acceptance:** counts cross-check script (calls==list totals; cohort subtotals sum; every escalation's call findable from the UI); vA/vB self-consistency; stub rows visibly badged; n=1 views show the small-n warning instead of 100% claims.
-- **Refs:** QA6 qa-operate HIGH #1–4, MEDIUM #10, LOW #16.
-
 ### CB-62 — Price-question policy: offer the KB-grounded ballpark instead of pure deflection
 - **Type / Surface / Size:** change · `core` (`gates.price_gate`, NLG) · `kb` · S–M
 - **Prereqs:** —
@@ -184,6 +175,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-60 — Cohort/count coherence across Operate (one disease, many symptoms)
+- **Type / Surface / Size:** bug · `api` (`operate`) · `web` (calls/escalations) · L
+- **Completed:** 2026-06-07 (resumed after mid-flight stop; 2 agent sessions)
+- **Files changed (actual):** `src/api/operate.py` (`_is_completed` filter shared by Calls list AND `/api/kpis` — one denominator; `total` on episodes response; `is_stub` on summaries via `channel=='sim'`; `episode_cohort` on escalations), `web/app/operate/calls/page.tsx` ("Seeded sample" badge; "showing N of total" disclosure), `web/app/operate/escalations/page.tsx` (cohort hint for non-live escalations), `web/lib/operate-types.ts`, `tests/e2e/test_cb60_coherence.py` (NEW, 12), `tests/e2e/qa7_cb60.py` (NEW, live sweep), `tests/e2e/test_operate.py` (2 KPI tests re-spec'd to the completed-only denominator).
+- **What changed:** the 67%-vs-0% KPI self-contradiction came from `/api/kpis` computing over ALL episodes (incl. in_progress orphans) while the list filtered — both now use `_is_completed`; the ~150 no-cohort orphans were those in_progress/null-outcome rows, now excluded from both. Escalation rows carry their cohort (badge == reachable list count); seeded stubs badged and excluded from "Real calls" by default (NOT deleted).
+- **Verification:** 49 passed (coherence 12 + operate suite incl. re-spec'd KPI tests); full suite 584p/11s; query/display-layer only — zero DB writes.
+- **Constraints checked:** no DB UPDATE/DELETE/migrations; stubs preserved; src/core untouched.
+- **Follow-ups / known gaps:** live-dashboard verification needs the API restart (running process predates these changes); KPI version-selector contents are CB-59's scope.
 
 ### CB-54 — Demo chat dies after the first conversation (consent 409 wall + stuck sessions)
 - **Type / Surface / Size:** bug · `web/app/demo` + `web/components/demo` · M (server unchanged)

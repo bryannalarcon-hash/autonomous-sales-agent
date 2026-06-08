@@ -16,6 +16,9 @@
 // (first-token + stream-elapsed, present ONLY while a partial streams); and EpisodeSummary
 // avg_first_token_ms / avg_stream_ms (means over agent turns that carry timing). All are number|null
 // and rendered as human phrases (e.g. "0.8s to first word") — never as raw ms keys.
+// Additions (CB-60): EpisodeSummary gains `is_stub` (channel=='sim' seeded/sim call) and
+// EpisodeListResponse gains `total` (completed-row count before the page cap). Escalation gains
+// `episode_cohort` (cohort of the linked call) so operators know which filter to use in the list.
 
 /** One belief-state driver signal at a turn, already labeled (e.g. "Walk-away risk"). */
 export interface DriverSignal {
@@ -102,6 +105,9 @@ export interface EpisodeSummary {
   /** CB-44/CB-45: mean stream duration across this call's timed agent turns, in ms; null when none. */
   avg_stream_ms?: number | null;
   created_at: string | null;
+  /** CB-60: true when this call is a seeded/sim stub (channel=='sim'). The UI badges these rows
+   *  "Seeded sample" and excludes them from "Real calls" by default (reachable via All cohorts). */
+  is_stub?: boolean;
 }
 
 /** One entry in the prospect's true-driver trajectory (self-play / digital-twin episodes only).
@@ -125,7 +131,11 @@ export interface EpisodeDetail extends EpisodeSummary {
 
 export interface EpisodeListResponse {
   episodes: EpisodeSummary[];
+  /** Episodes in this page (≤ limit). */
   count: number;
+  /** CB-60: total completed rows matching the filter BEFORE the page cap. When total > count the
+   *  list is capped — the UI shows "showing N of total" so operators know they're seeing a slice. */
+  total?: number;
 }
 
 /** CB-44/CB-45: live timing for the turn currently STREAMING on a real voice call. Present on the
@@ -237,6 +247,10 @@ export interface Escalation {
   lifecycle: 'unreviewed' | 'reviewed' | 'resolved' | 'dismissed';
   lifecycle_label: string;
   created_at: string | null;
+  /** CB-60: cohort of the linked call (e.g. "live", "held_out", "training"). Use this to find the
+   *  call in the Calls list: "live" = Real calls filter; anything else = All cohorts + cohort param.
+   *  null when the linked episode can't be resolved (dangling escalation). */
+  episode_cohort?: string | null;
 }
 
 export interface EscalationListResponse {

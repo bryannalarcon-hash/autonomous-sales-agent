@@ -9,6 +9,9 @@
 // `reviewed`; Resolve → POST lifecycle `resolved`. A successful POST optimistically updates the row
 // + drawer and refetches the queue so the segmented-control counts move; a 4xx surfaces inline.
 // All reason/lifecycle text is the backend's pre-translated label (no raw key renders).
+// CB-60: each escalation card and drawer now shows the linked call's cohort (episode_cohort from the
+// API) with a hint telling the operator which filter to use in the Calls list to find that call.
+// Calls from non-live cohorts (sim/self-play/eval) can only be found via "All cohorts".
 'use client';
 
 import { useEffect, useState } from 'react';
@@ -214,6 +217,15 @@ function Drawer({
               ))}
             </div>
           ) : null}
+          {/* CB-60: if the linked call is from a non-live cohort, tell the operator how to find it
+              in the Calls list. The list defaults to "Real calls" (cohort=live) so a sim/eval call
+              won't appear there without switching to "All cohorts". */}
+          {e.episode_cohort && e.episode_cohort !== 'live' ? (
+            <div className="row" style={{ gap: 7, alignItems: 'center', fontSize: 12, color: 'var(--text-3)' }}>
+              <Icon name="alert" size={13} />
+              This call is from the <b>{e.episode_cohort}</b> cohort — to find it in the Calls list, switch to &quot;All cohorts&quot;.
+            </div>
+          ) : null}
           <div className="row" style={{ gap: 10 }}>
             <button className="btn btn-ghost grow" onClick={() => router.push(`/operate/review/${e.episode_id}`)}>
               <Icon name="eye" size={16} />
@@ -389,6 +401,13 @@ export default function EscalationsPage() {
                       </div>
                       <div className="b" style={{ fontSize: 14 }}>
                         Call <span className="mono">{e.episode_id}</span>
+                        {/* CB-60: cohort hint — tells the operator which filter to use in the Calls
+                            list to find this call. Non-live cohorts need "All cohorts" toggle. */}
+                        {e.episode_cohort && e.episode_cohort !== 'live' ? (
+                          <span className="tag" style={{ marginLeft: 8, fontSize: 10.5, opacity: 0.7 }}>
+                            {e.episode_cohort} cohort — use All cohorts in Calls list
+                          </span>
+                        ) : null}
                       </div>
                       <div className="muted" style={{ fontSize: 12.5, marginTop: 3, maxWidth: 680 }}>{e.moment}</div>
                     </div>

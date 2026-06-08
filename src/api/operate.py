@@ -11,6 +11,14 @@
 # endpoints: GET /api/live (newest active call or null), GET /api/live?episode_id=<id> (specific ep),
 # GET /api/live/active (all non-stale active calls with summary fields), GET /api/live/sample
 # (newest completed call with sample:true, for the page's "Show sample call" toggle).
+# CB-60: cohort/count coherence across Operate surfaces. Every surface now states its population and
+# the numbers reconcile. Key guarantees: (1) /api/episodes response carries `total` (completed rows
+# before the limit trim) so the UI can show "showing N of total" when capped. (2) /api/kpis applies
+# _is_completed so its denominator matches the Calls list — no orphan in_progress/null-outcome rows
+# inflate KPI counts. (3) /api/escalations enriches each row with the episode's cohort so operators
+# can see which population an escalation came from and the filter needed to find it in the list.
+# (4) episode_summary gains `is_stub` (True when channel=="sim") so the UI can badge seeded calls
+# and the cohort='live' default already excludes them from "Real calls".
 # CB-06: episode_detail adds "prospect_trajectory" — the prospect's TRUE hidden-driver arc per turn,
 # persisted by run_episode on sim/twin episodes; real (voice/text) episodes get [] so the frontend
 # panel can detect absence with a simple falsy check. Collaborators: src.sim.selfplay (writer).
@@ -337,7 +345,10 @@ def _timing_averages(ep: Episode) -> tuple[Optional[int], Optional[int]]:
 def episode_summary(ep: Episode) -> dict[str, Any]:
     """Flat summary row for P3/Live tile — no transcript body, all labels applied.
     CB-44: also carries avg_first_token_ms / avg_stream_ms (means over timed agent turns, null when
-    the call has no stamped timing) so the Calls list / Review header can show call-level timing."""
+    the call has no stamped timing) so the Calls list / Review header can show call-level timing.
+    CB-60: adds `is_stub` (True when channel=='sim') so the UI can badge seeded/sim calls and exclude
+    them from "Real calls" by default (the cohort='live' filter already does this; is_stub adds a
+    visible confirmation badge in the All-cohorts view)."""
     metrics = ep.metrics or {}
     avg_first_token_ms, avg_stream_ms = _timing_averages(ep)
     return {
@@ -364,6 +375,12 @@ def episode_summary(ep: Episode) -> dict[str, Any]:
         "avg_first_token_ms": avg_first_token_ms,
         "avg_stream_ms": avg_stream_ms,
         "created_at": ep.created_at.isoformat() if ep.created_at else None,
+        # CB-60: seeded/sim stub marker. True when channel=='sim' — the most robust existing trait
+        # (every seeded self-play episode uses channel='sim'; live calls are 'voice'/'text'). The UI
+        # badges these rows and excludes them from "Real calls" by default. NOT derived from the tactic
+        # rationale text ("sim-harness decision") because that's a free-form string that can change;
+        # channel is a validated enum (see src.memory.schema.CHANNELS).
+        "is_stub": ep.channel == "sim",
     }
 
 
@@ -451,8 +468,11 @@ def live_snapshot(
     return payload
 
 
-def escalation_to_dict(esc: EscalationLog) -> dict[str, Any]:
-    """P5 queue row: reason + lifecycle translated to labels."""
+def escalation_to_dict(esc: EscalationLog, *, episode_cohort: Optional[str] = None) -> dict[str, Any]:
+    """P5 queue row: reason + lifecycle translated to labels.
+    CB-60: `episode_cohort` carries the cohort of the linked episode so operators can see which
+    population the escalation came from and apply the matching filter in the Calls list to find it.
+    None when the episode can't be resolved (a dangling escalation from a deleted episode)."""
     return {
         "escalation_id": esc.escalation_id,
         "episode_id": esc.episode_id,
@@ -463,6 +483,9 @@ def escalation_to_dict(esc: EscalationLog) -> dict[str, Any]:
         "lifecycle": esc.lifecycle,
         "lifecycle_label": labels.lifecycle_label(esc.lifecycle),
         "created_at": esc.created_at.isoformat() if esc.created_at else None,
+        # CB-60: the cohort the linked call belongs to. Use this to find the call in the Calls list:
+        # if cohort=='live' use "Real calls"; otherwise switch to "All cohorts" and filter by cohort.
+        "episode_cohort": episode_cohort,
     }
 
 
@@ -580,13 +603,26 @@ def create_operate_router(read_store: Optional[ReadStore] = None) -> APIRouter:
     ) -> dict[str, Any]:
         """P3 Calls list — COMPLETED-calls history; active/0-turn calls excluded. Filters AND
         together; over-fetches then trims so completed rows fill the page even with interleaved
-        active calls. An in-progress `outcome` filter yields an empty completed list (correct)."""
+        active calls. An in-progress `outcome` filter yields an empty completed list (correct).
+        CB-60: response now carries `total` = number of completed rows matching the filter BEFORE
+        the per-page `limit` cap, so the UI can show "showing N of total" when the list is capped.
+        The over-fetch scan uses _MAX_FETCH rows to count all matches (bounded at 10 000)."""
         fetch_limit = min(limit * _COMPLETED_OVERFETCH, _MAX_FETCH)
         eps = await rs.list_episodes(
             version=version, cohort=cohort, outcome=outcome, escalated=escalated, limit=fetch_limit
         )
-        completed = [e for e in eps if _is_completed(e)][:limit]
-        return {"episodes": [episode_summary(e) for e in completed], "count": len(completed)}
+        # CB-60: separate the full completed set (for total) from the capped page (for episodes).
+        # The overfetch multiplier means fetch_limit is usually large enough to count all matches
+        # up to _MAX_FETCH; if the total exceeds that the count is still honest (bounded at _MAX_FETCH).
+        all_completed = [e for e in eps if _is_completed(e)]
+        completed = all_completed[:limit]
+        return {
+            "episodes": [episode_summary(e) for e in completed],
+            "count": len(completed),
+            # total = how many completed rows match the filter (before the page cap). When
+            # total > count, the UI knows the list is capped and can show "showing N of total".
+            "total": len(all_completed),
+        }
 
     # CB-30: the golden calibration SET. Declared BEFORE the dynamic /api/episodes/{episode_id} route
     # so the literal "golden" segment isn't captured as an episode_id (FastAPI matches in declaration
@@ -622,11 +658,18 @@ def create_operate_router(read_store: Optional[ReadStore] = None) -> APIRouter:
         cohort: Optional[str] = None,
         compare_version: Optional[str] = None,
     ) -> dict[str, Any]:
-        """P4 KPI views: ladder headline + distinct enrollment rate; optional compare arm."""
-        eps = await rs.list_episodes(version=version, cohort=cohort, limit=10000)
+        """P4 KPI views: ladder headline + distinct enrollment rate; optional compare arm.
+        CB-60: KPI now filters through _is_completed so its denominator is IDENTICAL to the Calls
+        list — no orphan in_progress / null-outcome / 0-turn rows inflate the count or distort
+        rates (those 150 orphans were making KPI say 2,842 while the list said 2,692). The
+        enrollment_rate headline and the ladder_distribution both computed from the same set, so
+        the two panels on one screen cannot contradict each other."""
+        raw_eps = await rs.list_episodes(version=version, cohort=cohort, limit=10000)
+        eps = [e for e in raw_eps if _is_completed(e)]
         compare_eps: Optional[list[Episode]] = None
         if compare_version is not None:
-            compare_eps = await rs.list_episodes(version=compare_version, cohort=cohort, limit=10000)
+            raw_cmp = await rs.list_episodes(version=compare_version, cohort=cohort, limit=10000)
+            compare_eps = [e for e in raw_cmp if _is_completed(e)]
         payload = compute_kpis(eps, compare_episodes=compare_eps)
         payload["version"] = version
         payload["cohort"] = cohort
@@ -637,14 +680,34 @@ def create_operate_router(read_store: Optional[ReadStore] = None) -> APIRouter:
     async def escalations_ep(
         lifecycle: Optional[str] = None, limit: int = 100
     ) -> dict[str, Any]:
-        """P5 Escalation queue: list by lifecycle with per-state badge counts."""
+        """P5 Escalation queue: list by lifecycle with per-state badge counts.
+        CB-60: each escalation row now carries `episode_cohort` (the cohort of the linked call)
+        so operators know which population the escalation came from and can apply the right filter
+        in the Calls list to find the call. The sidebar badge uses counts['unreviewed'] which
+        matches the segmented-control total, ensuring badge == reachable count.
+        Episode lookups for cohort are batched via a single de-duped episode-id fetch."""
         rows = await rs.list_escalations(lifecycle=lifecycle, limit=limit)
         all_rows = await rs.list_escalations(lifecycle=None, limit=10000)
         counts = {"unreviewed": 0, "reviewed": 0, "resolved": 0, "dismissed": 0}
         for r in all_rows:
             counts[r.lifecycle] = counts.get(r.lifecycle, 0) + 1
+        # CB-60: resolve cohort for each escalation's linked episode. Batch: one get_episode call
+        # per unique episode_id referenced in the page (bounded by `limit`, typically ≤100). We
+        # swallow any lookup failure so a dangling escalation returns episode_cohort=None rather
+        # than causing a 500 — the UI can show "unknown cohort" as a fallback label.
+        unique_ids = list(dict.fromkeys(e.episode_id for e in rows if e.episode_id))
+        cohort_by_ep: dict[str, Optional[str]] = {}
+        for eid in unique_ids:
+            try:
+                ep = await rs.get_episode(eid)
+                cohort_by_ep[eid] = ep.cohort if ep is not None else None
+            except Exception:
+                cohort_by_ep[eid] = None
         return {
-            "escalations": [escalation_to_dict(e) for e in rows],
+            "escalations": [
+                escalation_to_dict(e, episode_cohort=cohort_by_ep.get(e.episode_id or ""))
+                for e in rows
+            ],
             "count": len(rows),
             "counts": counts,
         }

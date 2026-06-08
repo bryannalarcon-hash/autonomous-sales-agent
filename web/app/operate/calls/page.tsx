@@ -11,6 +11,10 @@
 // headline (internal indices must not render as operator-facing labels).
 // CB-45: the drawer also shows the call's average time-to-first-word (from EpisodeSummary
 // avg_first_token_ms via fmtMsShort), omitted when the call has no voice timing.
+// CB-60: (1) seeded/sim stub rows get a visible "Seeded sample" badge (is_stub from the API) and are
+// excluded from "Real calls" by default via the cohort='live' filter (reachable via All cohorts);
+// (2) when the API's `total` exceeds the displayed `count`, a "showing N of total" disclosure appears
+// in the filter bar so operators know the list is capped (prevents mistaking 200 for "All calls").
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
@@ -103,6 +107,13 @@ function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
                 Escalated
               </span>
             ) : null}
+            {/* CB-60: stub badge in the drawer so the operator can see it when reviewing a
+                seeded call that appeared via All cohorts or an escalation link. */}
+            {c.is_stub ? (
+              <span className="tag" style={{ opacity: 0.7 }}>
+                Seeded sample
+              </span>
+            ) : null}
           </div>
           <div
             className="card solid card-pad"
@@ -140,6 +151,9 @@ export default function CallsPage() {
   // otherwise flood the log with short synthetic episodes — hidden by default, toggleable.
   const [liveOnly, setLiveOnly] = useState(true);
   const [rows, setRows] = useState<EpisodeSummary[]>([]);
+  // CB-60: total = completed rows matching the filter before the 200-row page cap.
+  // When total > rows.length the list is capped and we show "showing N of total".
+  const [total, setTotal] = useState<number | null>(null);
   const [sel, setSel] = useState<EpisodeSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -154,6 +168,7 @@ export default function CallsPage() {
       .then((res) => {
         if (!cancelled) {
           setRows(res.episodes);
+          setTotal(res.total ?? res.count);
           setError(null);
         }
       })
@@ -214,7 +229,18 @@ export default function CallsPage() {
               {liveOnly ? 'Real calls' : 'All cohorts'}
             </button>
             <div className="grow" />
-            <span className="muted" style={{ fontSize: 12.5 }}>{visible.length} calls</span>
+            {/* CB-60: population disclosure. When the page is capped (200 row limit), show
+                "showing N of total" so operators know they're seeing a slice, not all calls.
+                `visible` is the client-side id-search filter on top of the already-loaded page. */}
+            {total !== null && total > rows.length ? (
+              <span className="muted" style={{ fontSize: 12.5 }}>
+                {visible.length} calls &nbsp;<span style={{ opacity: 0.5 }}>(showing {rows.length} of {total})</span>
+              </span>
+            ) : (
+              <span className="muted" style={{ fontSize: 12.5 }}>
+                {visible.length} {liveOnly ? 'real calls' : 'calls'}
+              </span>
+            )}
             <button className="gctl">
               <Icon name="download" size={15} />
               Export
@@ -274,6 +300,13 @@ export default function CallsPage() {
                       </td>
                       <td>
                         <span className={`tag dot ${outcomeClass(c.outcome_key)}`}>{c.outcome}</span>
+                        {/* CB-60: seeded/sim stub badge — makes synthetic data visible when browsing
+                            All cohorts. Hidden on Real calls (cohort='live' already excludes them). */}
+                        {c.is_stub ? (
+                          <span className="tag" style={{ marginLeft: 5, fontSize: 10.5, opacity: 0.7 }}>
+                            Seeded sample
+                          </span>
+                        ) : null}
                       </td>
                       <td>
                         <span className="muted" style={{ fontSize: 12.5 }}>{c.ladder_label}</span>

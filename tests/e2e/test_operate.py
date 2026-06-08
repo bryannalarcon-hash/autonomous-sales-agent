@@ -13,6 +13,9 @@
 # CB-30: episode_detail/summary expose a top-level `golden` boolean; POST /api/episodes/{id}/golden
 # tags/untags a call (404 unknown id) and GET /api/episodes/golden enumerates the set newest-first as
 # full Call Review payloads (the literal /golden route must not be shadowed by the dynamic /{id} route).
+# CB-60: KPI tests updated — after the _is_completed denominator fix, v12 completed set excludes the
+# in_progress CALL-4821, so tiers become [4,2,0] (n=3, mean=2.0) instead of [0,4,2,0] (n=4, mean=1.5).
+# The v11 arm is unchanged (tiers [2,4], mean=3.0). Enrollment rate = 1/3 for v12 (not 0.25).
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -288,13 +291,16 @@ def test_kpis_carry_ladder_headline_and_distinct_enrollment_rate():
     r = client.get("/api/kpis", params={"version": "v12"})
     assert r.status_code == 200, r.text
     k = r.json()
-    # v12 set: tiers [0,4,2,0] -> weighted-ladder mean = 1.5; enrollment = 1 of 4 = 0.25.
-    assert abs(k["weighted_ladder_score"] - 1.5) < 1e-6
-    assert abs(k["enrollment_rate"] - 0.25) < 1e-6
+    # CB-60: KPI uses _is_completed — CALL-4821 (in_progress, 0 turns) is excluded.
+    # v12 completed set: CALL-4820 (tier=4), CALL-4819 (tier=2), CALL-4818 (tier=0) → n=3, mean=2.0.
+    # Previously tiers [0,4,2,0] → mean 1.5 with n=4 (before the _is_completed denominator fix).
+    assert abs(k["weighted_ladder_score"] - 2.0) < 1e-6
+    # enrollment_rate is rounded to 4dp by compute_kpis (1/3 → 0.3333); use 1e-4 tolerance.
+    assert abs(k["enrollment_rate"] - 1 / 3) < 1e-4
     # the two headline numbers are DISTINCT (different scales, computed from different fields).
     assert k["weighted_ladder_score"] != k["enrollment_rate"]
     assert k["ladder_max"] == 4
-    assert k["n"] == 4
+    assert k["n"] == 3
     # ladder distribution + archetype conversion present for the secondary panels, labeled.
     assert any(d["label"] == "Same-call enrollment" for d in k["ladder_distribution"])
     assert k["archetype_conversion"]
@@ -305,8 +311,9 @@ def test_kpis_compare_versions_arm():
     r = client.get("/api/kpis", params={"version": "v12", "compare_version": "v11"})
     assert r.status_code == 200, r.text
     cmp = r.json()["compare"]
-    # v11 set: tiers [2,4] -> ladder mean 3.0; v12 ladder mean 1.5; champion arm is v12 (the filter).
-    assert abs(cmp["champion_ladder_score"] - 1.5) < 1e-6
+    # CB-60: v12 completed-only = tiers [4,2,0] → mean 2.0; v11 tiers [2,4] → mean 3.0 (unchanged).
+    # Previously v12 mean was 1.5 (included the in_progress CALL-4821 tier=0 in the denominator).
+    assert abs(cmp["champion_ladder_score"] - 2.0) < 1e-6
     assert abs(cmp["baseline_ladder_score"] - 3.0) < 1e-6
     assert "delta" in cmp and "delta_ci" in cmp and "challenger_better" in cmp
     # enrollment rate carried distinctly in the compare arm too.
