@@ -37,6 +37,11 @@
 // zombie (Running + Draft simultaneously) renders as Draft only.
 // CB-72: dialog shows "≈ $X.XX" cost estimate; disabled launch button shows helper text; completion
 // banner on poll settle; term tooltips on Ladder/Significance/CI; small-n caution chip for n<10/arm.
+// CB-80: (L1) no-result/timed-out records suppress the guardrail chip (no run → no verdict);
+// (L2) drawer header uses effectiveState so a zombie reads "Draft" everywhere (card + drawer);
+// (L3) every blocked/rejected card always shows a one-line WHY — guardrail trip, approval hold, or
+// the fallback "Did not meet the promotion bar" when no guardrail_reason is stored; (L4) the CB-73
+// baseline note reworded to plain English; (L5) RunDrawer action row is a sticky footer.
 // Data from /api/experiments; the discovery-sequencing before/after is the headline demo artifact. All
 // semantic labels (state, dimension, version, population/cohort) are humanized before render — no raw
 // slug, `__…__` experiment suffix, or DRAFT-/exp- id renders. Cards/drawer show the human version +
@@ -174,6 +179,10 @@ function ExpDrawer({ e, storeChampionVersion, onClose }: { e: Experiment; storeC
   const router = useRouter();
   const tripped = e.guardrail === 'trip';
   const noResult = isNoResult(e);
+  // CB-80 L2: use the same state machine as the card face so a zombie reads "Draft" everywhere —
+  // not just on the card but also in the drawer header. effectiveState(e) returns 'draft' for a
+  // zombie (state=running, n=0, no target) instead of the raw 'running'.
+  const dispState = effectiveState(e);
   // CB-24: a rejected/blocked/failed experiment carries WHY in guardrail_reason — surface it
   // prominently (not only in the guardrail strip) so a failed run never reads as a silent "gone".
   // CB-71b: guardrail_reason is humanized via humanizeGuardrailReason on EVERY surface it renders
@@ -193,9 +202,14 @@ function ExpDrawer({ e, storeChampionVersion, onClose }: { e: Experiment; storeC
           <div className="grow">
             <div className="row" style={{ gap: 8, marginBottom: 4 }}>
               <span className="faint" style={{ fontSize: 11.5, fontWeight: 600 }}>{changeLabel(e)}</span>
-              <span className={`tag ${STATE_TAG[e.state]} dot`}>{e.state_label}</span>
-              {/* CB-71a: guardrail-regression chip visible on the drawer header (not drawer-body-only) */}
-              {tripped ? (
+              {/* CB-80 L2: use effectiveState (dispState) so a zombie renders "Draft" in the drawer
+                  header, matching the card face — never "Running" and "Draft" simultaneously. */}
+              <span className={`tag ${STATE_TAG[dispState]} dot`}>
+                {dispState === e.state ? e.state_label : 'Draft'}
+              </span>
+              {/* CB-71a: guardrail-regression chip visible on the drawer header (not drawer-body-only).
+                  CB-80 L1: suppress when noResult — no run completed, so no guardrail verdict exists. */}
+              {tripped && !noResult ? (
                 <span className="tag danger" style={{ gap: 5 }}>
                   <Icon name="shield" size={12} />
                   Guardrail regression
@@ -236,10 +250,11 @@ function ExpDrawer({ e, storeChampionVersion, onClose }: { e: Experiment; storeC
 
           {/* CB-73: when the experiment's baseline champion differs from the current store champion,
               explain it in one plain sentence so the operator knows why the header shows a different
-              version from what this experiment measured against. */}
+              version from what this experiment measured against.
+              CB-80 L4: reworded to plain English — no engineer-speak ("materialized"). */}
           {storeChampionVersion && e.champion_version && storeChampionVersion !== e.champion_version ? (
             <div style={{ fontSize: 12, color: 'var(--text-3)', fontStyle: 'italic', marginTop: -4 }}>
-              Baseline: {versionLabel(e.champion_version)} — the promoted champion&apos;s configuration isn&apos;t materialized on this machine; see Versions.
+              Tested against {versionLabel(e.champion_version)} (the live champion&apos;s saved settings aren&apos;t available here — see Versions).
             </div>
           ) : null}
 
@@ -856,25 +871,37 @@ function RunDrawer({
             </div>
           </div>
 
+        </div>
+
+        {/* CB-80 L5: sticky action footer — always visible regardless of drawer scroll position.
+            position:sticky + bottom:0 works inside an overflow:auto container; background +
+            border-top prevent content from bleeding through while scrolling. Low-risk: isolated
+            to this drawer, no layout changes outside of it. */}
+        <div
+          style={{
+            position: 'sticky',
+            bottom: 0,
+            padding: '12px 18px 14px',
+            background: 'var(--surface)',
+            borderTop: '1px solid var(--border)',
+          }}
+        >
           {err ? (
-            <div className="row" style={{ gap: 7, alignItems: 'center', color: 'var(--danger)', fontSize: 12.5 }}>
+            <div className="row" style={{ gap: 7, alignItems: 'center', color: 'var(--danger)', fontSize: 12.5, marginBottom: 8 }}>
               <Icon name="alert" size={14} />
               {err}
             </div>
           ) : null}
-
-          <div>
-            <button className="btn btn-primary" style={{ width: '100%' }} onClick={submit} disabled={!canSubmit}>
-              <Icon name="play" size={16} />
-              {busy ? 'Running…' : `Run experiment · ${effectiveN * 2} calls`}
-            </button>
-            {/* CB-72: visible helper text when the launch button is disabled (not just grayed out) */}
-            {!canSubmit && !busy ? (
-              <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 5, textAlign: 'center' }}>
-                Make a change above to enable the run
-              </div>
-            ) : null}
-          </div>
+          <button className="btn btn-primary" style={{ width: '100%' }} onClick={submit} disabled={!canSubmit}>
+            <Icon name="play" size={16} />
+            {busy ? 'Running…' : `Run experiment · ${effectiveN * 2} calls`}
+          </button>
+          {/* CB-72: visible helper text when the launch button is disabled (not just grayed out) */}
+          {!canSubmit && !busy ? (
+            <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 5, textAlign: 'center' }}>
+              Make a change above to enable the run
+            </div>
+          ) : null}
         </div>
       </div>
     </>
@@ -1070,8 +1097,10 @@ function LabPageInner() {
                         <span className="faint" style={{ fontSize: 11.5, fontWeight: 600 }}>{changeLabel(e)}</span>
                         {/* CB-71d: use effectiveState chip — zombie shows Draft, never Running+Draft */}
                         <span className={`tag ${STATE_TAG[dispState]} dot`}>{dispState === e.state ? e.state_label : 'Draft'}</span>
-                        {/* CB-71a: guardrail-regression chip VISIBLE ON THE CARD (not drawer-only) */}
-                        {e.guardrail === 'trip' ? (
+                        {/* CB-71a: guardrail-regression chip VISIBLE ON THE CARD (not drawer-only).
+                            CB-80 L1: suppress when isNoResult — no run completed so no guardrail
+                            determination was possible; showing the chip would be fabricated. */}
+                        {e.guardrail === 'trip' && !noRes ? (
                           <span className="tag danger" style={{ gap: 5 }}>
                             <Icon name="shield" size={12} />
                             Guardrail regression
@@ -1143,26 +1172,40 @@ function LabPageInner() {
                     ) : null}
                     {/* CB-24/CB-58/CB-71b: surface the humanized reason on the CARD — distinct
                         stories per terminal outcome. Legacy raw reason text passes through
-                        humanizeGuardrailReason so "challenger_better is False" never renders. */}
-                    {(e.state === 'blocked' || e.state === 'rejected') && cardReason ? (
-                      <div
-                        style={{
-                          padding: '9px 16px',
-                          background: 'var(--danger-soft)',
-                          borderTop: '1px solid var(--danger-border)',
-                          fontSize: 11.5,
-                          color: 'var(--danger)',
-                          display: 'flex',
-                          gap: 7,
-                          alignItems: 'center',
-                        }}
-                      >
-                        <Icon name="alert" size={13} />
-                        {e.state === 'blocked'
-                          ? (cardReason ?? 'Held for approval')
-                          : (cardReason ?? 'Did not pass the bar')}
-                      </div>
-                    ) : null}
+                        humanizeGuardrailReason so "challenger_better is False" never renders.
+                        CB-80 L3: always show a one-line WHY on blocked/rejected cards, even when
+                        guardrail_reason is absent. Derive from available fields: guardrail trip →
+                        "Rejected — guardrail regression"; extreme (pricing/approval) → "Held for
+                        approval"; otherwise → "Did not meet the promotion bar". cardReason, when
+                        present, takes priority over these fallbacks. */}
+                    {(e.state === 'blocked' || e.state === 'rejected') ? (() => {
+                      const whyText = e.state === 'blocked'
+                        ? (cardReason ?? 'Held for approval')
+                        : cardReason
+                          ? cardReason
+                          : e.guardrail === 'trip' && !noRes
+                            ? 'Rejected — guardrail regression'
+                            : e.is_extreme
+                              ? 'Held for approval'
+                              : 'Did not meet the promotion bar';
+                      return (
+                        <div
+                          style={{
+                            padding: '9px 16px',
+                            background: 'var(--danger-soft)',
+                            borderTop: '1px solid var(--danger-border)',
+                            fontSize: 11.5,
+                            color: 'var(--danger)',
+                            display: 'flex',
+                            gap: 7,
+                            alignItems: 'center',
+                          }}
+                        >
+                          <Icon name="alert" size={13} />
+                          {whyText}
+                        </div>
+                      );
+                    })() : null}
                     {/* CB-57/CB-58: honest sample display. Running → "Running — results land in one
                         batch" (no fabricated per-episode progress). Completed with data → n/target.
                         No-result/failed/timed-out → omit the bar entirely (CB-71c). */}

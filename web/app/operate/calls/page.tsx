@@ -36,13 +36,15 @@
 // (5) Empty filter results show the existing "No calls match" empty state (already correct behavior —
 //     justified: all outcome chips remain visible; hiding zero-count chips would require a per-outcome
 //     count fetch and would surprise operators expecting to see all filter options at all times.
+// CB-81 (O1): channel renders through channelLabel() (lib/labels) in both the drawer facts grid and
+// the drawer tag strip — raw "text" now maps to "Web chat", "voice" → "Web voice", "phone" → "Phone".
 'use client';
 
 import { useEffect, useMemo, useCallback, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchEpisodes, fmtDuration, fmtMsShort, fmtTimeAgo } from '@/lib/operate-api';
-import { archetypeLabel, kbVersionLabel, versionLabel } from '@/lib/labels';
+import { archetypeLabel, channelLabel, kbVersionLabel, versionLabel } from '@/lib/labels';
 import type { EpisodeSummary } from '@/lib/operate-types';
 
 // CB-66 (item 1): sortable column keys for the Calls table.
@@ -173,7 +175,7 @@ function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
   // All other facts are plain string tuples for the grid.
   const facts: [string, string][] = [
     ['Duration', fmtDuration(c.duration_ms)],
-    ['Channel', c.channel === 'voice' ? 'Web-voice' : c.channel],
+    ['Channel', channelLabel(c.channel)],
     ['When', fmtTimeAgo(c.created_at)],
     ['Qualified', c.qualified == null ? '—' : c.qualified ? 'Yes' : 'No'],
     ['Ladder tier', c.ladder_label],
@@ -211,7 +213,7 @@ function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
             <span className="tag accent">
               {versionLabel(c.version)} · {kbVersionLabel(c.kb_version)}
             </span>
-            <span className="tag">{c.channel === 'voice' ? 'Web-voice' : c.channel}</span>
+            <span className="tag">{channelLabel(c.channel)}</span>
             {c.escalated ? (
               <span className="tag warn">
                 <Icon name="alert" size={12} />

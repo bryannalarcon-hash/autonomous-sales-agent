@@ -1,10 +1,14 @@
-# qa7_cb65_leaksweep.py — CB-65/CB-70 regression: viewer-facing leak sweep across all surfaces.
+# qa7_cb65_leaksweep.py — CB-65/CB-70/CB-81 regression: viewer-facing leak sweep across all surfaces.
 # Walks every page (demo pre-consent, calls list both cohort modes, call review, escalations, KPI,
 # lab list + one lab detail, versions, approvals) and scans rendered innerText against a pattern list.
 # Each pattern class has an explicit allowlist with documented justification for any permitted hit.
 # The test PASSES only when zero non-allowlisted hits remain — it is the headline regression for CB-65.
 # CB-70 extension: includes the "-> [" arrow-bracket-list pattern on card/Past/detail TITLE elements
 # so a blank-name record falling back to a raw mutation string is caught immediately.
+# CB-81 extension: adds patterns for raw "text" channel slug + "sim-harness decision" rationale leak
+# (O1: channel must render as "Web chat" not "text"; O2: stub turn rationale must be humanized).
+# CB-81 (CB-NN strip): adds pattern for internal index tags (CB-NN, D#, W#, S#, P#, R#) leaking
+# from src/core gate-rationale strings into the operator call-review rendered text.
 # Does NOT click chat/chat links, start calls, or take any state-mutating action.
 # Requirements: Next.js dashboard at localhost:3000, FastAPI API at localhost:8000.
 # Run: python -m pytest tests/e2e/qa7_cb65_leaksweep.py -v --tb=short
@@ -85,6 +89,34 @@ LEAK_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
         "debug_label_consumer",
         re.compile(r"(?<!\w)debug(?!\w)", re.IGNORECASE),
         "Raw 'debug' label visible on the consumer-facing demo page header",
+    ),
+    # CB-81 O1: raw channel slug "text" must not render as-is in the calls list or call drawer.
+    # After the fix, "text" maps to "Web chat" via channelLabel(). We target the word in isolation
+    # so normal prose (e.g. "Enter text…") does not trigger a false positive — the channel label
+    # appears as a standalone tag or table cell, so we check for it as a complete word surrounded
+    # by whitespace or line boundaries. Use a narrow form: "Channel\ntext" or "Channel text" only.
+    (
+        "raw_channel_text",
+        re.compile(r"Channel\s+text\b", re.IGNORECASE),
+        "Raw channel slug 'text' visible in the Channel fact row (should be 'Web chat')",
+    ),
+    # CB-81 O2: "sim-harness decision" is the seeded-stub turn rationale string. After the fix,
+    # humanizeRationale maps it to "Simulated training call". Any raw occurrence is a leak.
+    (
+        "sim_harness_decision",
+        re.compile(r"sim-harness\s+decision", re.IGNORECASE),
+        "Raw 'sim-harness decision' rationale string visible in operator review (must be humanized)",
+    ),
+    # CB-81 (CB-NN strip): internal change-board index tags embedded by src/core in gate-rationale
+    # strings must be stripped by humanizeRationale before reaching the operator. Pattern specifically
+    # targets the "(CB-NN …)" parenthetical form that src/core embeds — e.g. "(CB-48 directness)".
+    # The broader inline "CB-NN" token form is also checked on the call-review page specifically
+    # (see test_call_review_no_cb_index_leak below). We keep this sweep-level pattern narrow to
+    # the parenthetical form so normal text containing CB- prefixes (e.g. version labels) won't fire.
+    (
+        "cb_index_parenthetical",
+        re.compile(r"\(CB-\d+[^)]*\)"),
+        "Internal CB-NN parenthetical tag '(CB-NN …)' visible in operator text from gate rationale",
     ),
 ]
 
@@ -312,6 +344,94 @@ def test_approvals_no_leaks(page: Page):
     _assert_no_leaks("approvals", findings, page)
 
 
+def test_call_review_no_cb_index_leak(page: Page):
+    """CB-81 (CB-NN strip): call review turn rationale must not contain 'CB-NN' internal index tags
+    stripped from src/core gate-rationale strings by humanizeRationale. Also asserts no raw
+    'sim-harness decision' rationale leaks on the review page."""
+    _require_services()
+    ep_id = None
+    # Prefer a stub episode (most likely to have sim-harness rationale).
+    for cohort in ("sim", None):
+        try:
+            q = f"{API_BASE}/api/episodes?limit=50" + (f"&cohort={cohort}" if cohort else "")
+            with urllib.request.urlopen(q, timeout=8) as r:
+                data = json.loads(r.read())
+            eps = data.get("episodes", [])
+            ep_id = eps[0]["episode_id"] if eps else None
+            if ep_id:
+                break
+        except Exception:
+            pass
+    if not ep_id:
+        pytest.skip("No episodes available to review")
+
+    page.goto(f"{DASHBOARD_BASE}/operate/review/{ep_id}", wait_until="networkidle", timeout=30_000)
+    page.wait_for_timeout(2000)
+    body = page.inner_text("body")
+
+    # (a) No raw CB-NN index in rendered text from gate rationale strings.
+    cb_re = re.compile(r"\(CB-\d+[^)]*\)")
+    cb_hits = sorted(set(cb_re.findall(body)))
+    if cb_hits:
+        shot_path = os.path.join(SCREENSHOT_DIR, "cb81_cb_index_in_review.png")
+        page.screenshot(path=shot_path)
+        pytest.fail(
+            f"CB-81 (CB-NN strip): internal CB-NN parenthetical found in call review for {ep_id}: "
+            f"{cb_hits!r}\nScreenshot: {shot_path}"
+        )
+
+    # (b) No raw "sim-harness decision" rationale.
+    if re.search(r"sim-harness\s+decision", body, re.IGNORECASE):
+        shot_path = os.path.join(SCREENSHOT_DIR, "cb81_sim_harness_in_review.png")
+        page.screenshot(path=shot_path)
+        pytest.fail(
+            f"CB-81 O2: 'sim-harness decision' rationale not humanized in call review for {ep_id}\n"
+            f"Screenshot: {shot_path}"
+        )
+
+
+def test_calls_channel_no_raw_text_slug(page: Page):
+    """CB-81 O1: the calls list and call drawer must not show raw 'text' for the channel field.
+    After the fix, channelLabel() maps 'text' → 'Web chat'. We look for 'Channel\\ntext' or
+    'Channel text' as that is how the facts grid renders the label + value pair."""
+    _require_services()
+    page.goto(f"{DASHBOARD_BASE}/operate/calls", wait_until="networkidle", timeout=30_000)
+    page.wait_for_timeout(1500)
+    # Switch to All cohorts to surface any text-channel sim/stub rows.
+    all_btn = page.locator("button:has-text('All cohorts'), button:has-text('All')")
+    if all_btn.count() > 0:
+        all_btn.first.click()
+        page.wait_for_timeout(1200)
+    body = page.inner_text("body")
+    if re.search(r"Channel\s+text\b", body, re.IGNORECASE):
+        shot_path = os.path.join(SCREENSHOT_DIR, "cb81_raw_channel_text.png")
+        page.screenshot(path=shot_path)
+        pytest.fail(
+            "CB-81 O1: raw channel slug 'text' visible in calls list (expected 'Web chat')\n"
+            f"Screenshot: {shot_path}"
+        )
+    # Open a drawer to check the inline channel tag.
+    cards = page.locator("tbody tr")
+    if cards.count() > 0:
+        cards.first.click()
+        page.wait_for_timeout(800)
+        drawer = page.locator(".drawer")
+        if drawer.count() > 0:
+            drawer_text = drawer.inner_text()
+            if re.search(r"Channel\s+text\b", drawer_text, re.IGNORECASE):
+                shot_path = os.path.join(SCREENSHOT_DIR, "cb81_raw_channel_text_drawer.png")
+                page.screenshot(path=shot_path)
+                pytest.fail(
+                    "CB-81 O1: raw channel slug 'text' visible in call drawer (expected 'Web chat')\n"
+                    f"Screenshot: {shot_path}"
+                )
+        # Close drawer
+        close_btns = page.locator(".drawer .gctl")
+        if close_btns.count() > 0:
+            close_btns.first.click()
+            page.wait_for_timeout(300)
+
+
 def test_lab_title_no_raw_mutation_string(page: Page):
     """CB-70 regression: blank-name records must never show a raw mutation string (-> [) as a title.
     Checks that card bold titles (.b elements) on the lab list contain no '-> [' pattern.
@@ -497,6 +617,37 @@ if __name__ == "__main__":
                         total_hits += len(real_hits)
         except Exception as e:
             print(f"  (lab_detail skipped: {e})")
+
+        # CB-81 O2 + CB-NN strip: call review for sim/stub episode
+        print("\n--- scanning call_review (CB-81 sim-harness + CB-NN strip) ---")
+        ep_id = None
+        for cohort in ("sim", None):
+            try:
+                q = f"{API_BASE}/api/episodes?limit=50" + (f"&cohort={cohort}" if cohort else "")
+                with urllib.request.urlopen(q, timeout=8) as r:
+                    data = json.loads(r.read())
+                eps = data.get("episodes", [])
+                ep_id = eps[0]["episode_id"] if eps else None
+                if ep_id:
+                    break
+            except Exception:
+                pass
+        if ep_id:
+            pg.goto(f"{DASHBOARD_BASE}/operate/review/{ep_id}", wait_until="networkidle", timeout=30_000)
+            pg.wait_for_timeout(2000)
+            body = pg.inner_text("body")
+            cb_hits = re.findall(r"\(CB-\d+[^)]*\)", body)
+            sim_hits = re.findall(r"sim-harness\s+decision", body, re.IGNORECASE)
+            if cb_hits:
+                print(f"  LEAK [cb_index_parenthetical]: {cb_hits[:4]}")
+                total_hits += len(cb_hits)
+            if sim_hits:
+                print(f"  LEAK [sim_harness_decision]: {sim_hits[:4]}")
+                total_hits += len(sim_hits)
+            if not cb_hits and not sim_hits:
+                print("  clean (no CB-NN parentheticals, no sim-harness decision)")
+        else:
+            print("  (skipped — no episodes available)")
 
         ctx.close()
         browser.close()

@@ -3,7 +3,10 @@
 // clicking a turn selects it. CB-04: the gate rationale (`.rv-rat`) leads with an internal gate-name
 // and embeds raw driver enum slugs (e.g. "pushiness_cap: bail_risk over cap…"), so it renders through
 // lib/labels.humanizeRationale ("Pushiness cap: walk-away risk over cap…") — DISPLAY ONLY; the raw
-// rationale stays on the turn record / in logs. Right: the BELIEF-TRAJECTORY replay — a scrubber over the turns with
+// rationale stays on the turn record / in logs. CB-81: humanizeRationale also strips internal index
+// tags that src/core may embed (e.g. "(CB-48 directness)") and translates "sim-harness decision"
+// to "Simulated training call" for seeded-stub turns — the per-turn rationale is already routed
+// through humanizeRationale so both fixes apply automatically at the existing render seam. Right: the BELIEF-TRAJECTORY replay — a scrubber over the turns with
 // tick marks at key decision turns, and a belief snapshot (Trust + Walk-away risk gauges, stage +
 // the selected turn's decision, slot mini-table) that reflects the NEAREST belief snapshot at/below
 // the selected turn. CB-05: per-driver velocity deltas (↑/↓/~) rendered inline next to each gauge

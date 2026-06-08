@@ -61,14 +61,6 @@
 > ```
 
 
-### CB-84 — CB-NN internal index leaks into operator call-review rationale
-- **Type / Surface / Size:** bug · `web` (review) · S
-- **Prereqs:** — (folded into CB-81's humanizeRationale)
-- **Current (QA10-chat SEV-2):** a review turn's reasoning note renders "...before any close attempt (CB-48 directness)" — a bare CB-NN index in an observable operator surface, violating the no-internal-indices rule.
-- **Desired:** humanizeRationale strips /(CB|D|W|S|P|R)-?\d+/ tags before render, keeping the human sentence.
-- **Acceptance:** leak sweep asserts no CB-NN in operator-review text; unit test on humanizeRationale.
-- **Refs:** QA10-chat SEV-2.
-
 ### CB-85 — Non-sequitur false-pivot + price persistence for the combative persona (brain quality)
 - **Type / Surface / Size:** bug · `core` (`gates`/`nlg`) · M · MEDIUM
 - **Prereqs:** —
@@ -77,25 +69,7 @@
 - **Acceptance:** scripted replay of the storm turn + the 3× terse dad asks; price range surfaces by ask 2; no "I don't have access" when KB carries the range.
 - **Refs:** QA10-chat SEV-2 (non-sequitur), SEV-3 (price determinism); builds on CB-62/77.
 
-### CB-80 — Lab display residue (no-result guardrail chip, zombie-draft drawer, reject-why, copy)
-- **Type / Surface / Size:** bug · `web` (lab) · S
-- **Prereqs:** —
-- **Important files (candidates):** `web/app/improve/lab/page.tsx` (`isNoResult`/`effectiveState` from CB-71).
-- **Current (QA10-lab, VERIFIED real):** (L1) a no-result/timed-out record still shows the "Guardrail regression" chip (CB-71 suppresses metrics, not the chip); (L2) a zombie draft (state=running, n=0) reads "Draft" on the card FACE but the DRAWER header still says "Running"; (L3) a rejected-despite-significance card (93% sig, +0.14) gives no one-line WHY; (L4) the CB-73 baseline note "isn't materialized on this machine" is engineer-speak; (L5, LOW) Run button below the drawer fold (sticky footer).
-- **Desired:** no-result → no guardrail chip; drawer uses effectiveState (zombie reads Draft everywhere); positive-but-rejected card carries a plain "why"; reword L4; optional sticky footer.
-- **Acceptance:** QA10 cards re-render truthfully; qa9fix_lab.py extended.
-- **WAIVED (refuted by orchestrator):** "Run button z-index intercept" — elementFromPoint at the scrolled-in button returns the button (agent didn't scroll); "See experiment → lab root / no per-call transcripts" — CB-55+QA9 prove detail+both arms open for SETTLED runs (QA10 clicked a still-RUNNING card); "Ladder/CI no tooltips" — 5 title= tooltips exist (hover-only).
-- **Refs:** QA10-lab HIGH-2/HIGH-3, MEDIUM-2/MEDIUM-4.
 
-### CB-81 — Operate label leaks: channel slug + stub rationale in review
-- **Type / Surface / Size:** bug · `web` (operate) · S
-- **Prereqs:** —
-- **Important files (candidates):** `web/app/operate/calls/page.tsx` (channel ~176/214 maps only `voice`), `web/app/operate/review/[id]/page.tsx` + `web/lib/labels.ts` (`humanizeRationale`).
-- **Current (QA10-ops, VERIFIED real):** (O1) CHANNEL renders raw `text`; (O2) seeded-stub turns render raw `"sim-harness decision"` rationale in review (CB-60 badged the list, not the review turn).
-- **Desired:** channel→human label (text→"Web-chat"); stub rationale humanized or turn carries a seeded hint.
-- **Acceptance:** leak sweep extended (channel + rationale); no raw `text`/`sim-harness decision` in operator text.
-- **WAIVED (refuted vs code+API):** "Open full call review empty href" — it's a button onClick=router.push; "Reviewed/Resolved tabs render 0" — API returns 8/8, Resolved rendered 8 (no refetch wait); "54-vs-41 cap" — API returns 54, no slice in code; "real-calls label disappears" — always renders; "no row-cap disclosure" — fires when capped; "no escalation→call link" — drawer has a View-call button.
-- **Refs:** QA10-ops SEV-2 #6, SEV-3 #9.
 
 ### CB-86 — Checkpoint-persist the lead at contact-capture (not only at /end)
 - **Type / Surface / Size:** change · `api` (`demo_routes` live_upsert + persistence) · M
@@ -219,6 +193,29 @@
 - **What changed:** terse re-asks ("just give me the number") after a prior price inquiry now force the KB-grounded answer (the verbose Karen asks already worked; the terse skeptic-dad asks didn't). Grounding guard (CB-53) stays the enforcement — no figures in instructions.
 - **Verification:** 18 tests; terse-non-price re-ask confirmed NOT hijacked (verifier); suites green as above.
 - **Follow-ups / known gaps:** real-model compliance with the explicit range → paid replay.
+
+### CB-84 — CB-NN internal index leaks into operator call-review rationale
+- **Type / Surface / Size:** bug · `web` (review) · S
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `web/lib/labels.ts` (`humanizeRationale` strips `(CB-NN …)` parentheticals + inline `(CB|D|W|S|P|R)-?\d+` tokens; raw rationale untouched on record/logs).
+- **What changed:** "...before any close attempt (CB-48 directness)" no longer leaks the CB-48 index into the observable operator review.
+- **Verification:** leak sweep asserts no CB-NN in operator-review text + unit test; 28 e2e green live.
+
+### CB-81 — Operate label leaks: channel slug + stub rationale in review
+- **Type / Surface / Size:** bug · `web` (operate) · S
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `web/lib/labels.ts` (`channelLabel()` text→"Web chat"/voice→"Web voice"/phone→"Phone"; `humanizeRationale` "sim-harness decision"→"Simulated training call"), `web/app/operate/calls/page.tsx` (both channel renders use channelLabel).
+- **What changed:** CHANNEL no longer shows raw `text`; seeded-stub rationale reads "Simulated training call".
+- **Verification:** leak sweep extended (raw_channel_text + sim_harness patterns); 28 e2e green; tsc clean.
+- **WAIVED (refuted vs code+API by orchestrator):** "Open full call review empty href" (button onClick=router.push); "Reviewed/Resolved render 0" (API 8/8; Resolved rendered 8 — no refetch await); "54-vs-41 cap" (API 54, no slice); "real-calls label disappears" (always renders); "no row-cap disclosure" (fires when capped); "no escalation→call link" (drawer has View-call).
+
+### CB-80 — Lab display residue (no-result guardrail chip, zombie-draft drawer, reject-why, footer)
+- **Type / Surface / Size:** bug · `web` (lab) · S
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `web/app/improve/lab/page.tsx` (L1 guardrail chip gated `&& !noRes`; L2 drawer header uses `effectiveState`; L3 rejected/blocked always renders a reason; L4 baseline note → "the live champion's saved settings aren't available here — see Versions"; L5 sticky action footer).
+- **What changed:** no false guardrail chip on no-result cards; zombie drafts read Draft everywhere; no silent rejection; plain baseline note; Run button always visible.
+- **Verification:** qa9fix_lab.py 14/14 live; full suite green.
+- **WAIVED (refuted by orchestrator):** "Run button z-index intercept" (elementFromPoint returns the button when scrolled); "See experiment → lab root / no transcripts" (CB-55+QA9 prove it for SETTLED runs; QA10 clicked a RUNNING card); "Ladder/CI no tooltips" (5 title= tooltips exist).
 
 ### CB-75 — Operate polish round 2 (label dup, hint→affordance, counts, sort, leaks)
 - **Type / Surface / Size:** bug · `web` (operate) · M

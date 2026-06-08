@@ -3,9 +3,10 @@
 // population/threshold slugs, and the gate-rationale gate-names + driver enum slugs) must NEVER render
 // in observable output — these turn them into human-readable labels (versionLabel / dimensionLabel /
 // archetypeLabel / populationLabel / humanizeDiffDescription / humanizeRationale / ladderTierLabel /
-// kbVersionLabel / humanizeGuardrailReason). Mirrors the inlined versionLabel logic in DashboardShell.tsx
-// / kpi / versions (kept in sync; do not import from those — they keep their own copy). Used by
-// improve/lab, improve/approvals, operate/kpi, operate/review pages, and the lab detail arm-call rows.
+// kbVersionLabel / humanizeGuardrailReason / channelLabel). Mirrors the inlined versionLabel logic in
+// DashboardShell.tsx / kpi / versions (kept in sync; do not import from those — they keep their own
+// copy). Used by improve/lab, improve/approvals, operate/kpi, operate/review, operate/calls pages,
+// and the lab detail arm-call rows.
 // CB-04: humanizeDiffDescription scrubs raw threshold keys (max_concession_band → "Pricing concession
 // band") out of the approvals diff sentence, and humanizeRationale scrubs gate-names + driver enum
 // slugs (pushiness_cap, bail_risk, …) out of the review-page `.rv-rat` rationale — display only; the
@@ -15,6 +16,11 @@
 // ("kb_v0") to a human-readable form ("Knowledge base v0") for header chips and inline tags.
 // CB-75: GATE_LABELS extended with establish_who_first + no_repeat_discovery (CB-34/CB-35 gate slugs
 // that appear in live-panel rationales). humanizeRationale now used in live/page.tsx too.
+// CB-81: channelLabel maps raw channel slugs (text, voice, phone) to operator-facing labels
+// ("Web chat", "Web voice", "Phone"). humanizeRationale extended to (a) map "sim-harness decision"
+// → "Simulated training call" so seeded-stub turn rationale never leaks the raw harness string, and
+// (b) strip internal index tags — "(CB-48 directness)", inline CB/D/W/S/P/R-NN tokens — that
+// src/core may embed in gate rationale strings; these are internal references, not operator text.
 
 // Strip the internal suffixes from a raw version id for display: the experiment dimension/seq suffix
 // ("champion_v0__playbooks_discovery_sequence__7" -> "champion_v0") and any short hash
@@ -204,6 +210,10 @@ export function humanizeDiffDescription(desc: string | null | undefined): string
 export function humanizeRationale(rationale: string | null | undefined): string {
   if (!rationale) return '';
   let out = rationale;
+  // CB-81: translate known harness/system strings before any other processing so they never leak.
+  // "sim-harness decision" is the turn rationale written by the sim harness for seeded-stub turns —
+  // it is a system annotation, not a gate rationale, and must render as a plain phrase.
+  if (/^sim-harness\s+decision\s*$/i.test(out.trim())) return 'Simulated training call';
   // 1. Leading gate-name prefix "<gate>: …" → human gate label.
   const m = out.match(/^([a-z][a-z0-9_]*?):\s*/);
   if (m && GATE_LABELS[m[1]]) {
@@ -230,6 +240,14 @@ export function humanizeRationale(rationale: string | null | undefined): string 
   // 4. Catch-all: any remaining bare multi-word snake_case token (e.g. an unmapped "<gate>_name" or a
   //    new driver slug) → spaced words, so no underscore-joined slug ever renders to the operator.
   out = out.replace(/\b[a-z]+(?:_[a-z0-9]+)+\b/g, (s) => s.replace(/_/g, ' '));
+  // 5. Strip internal index tags embedded by src/core in rationale strings. Gate rationales and NLG
+  //    strings in src/core may carry parenthetical "(CB-NN label)" trailers or inline CB/D/W/S/P/R
+  //    tokens (e.g. "(CB-48 directness)", "CB-50"). These are internal change-board and design-doc
+  //    references — they must NEVER render in the operator review surface (observable output rule).
+  //    Strip: parenthetical "(CB-NN …)" or inline \b(CB|D|W|S|P|R)-?\d+ tokens; collapse whitespace.
+  out = out.replace(/\s*\(\s*(?:CB|D|W|S|P|R)-?\d+[^)]*\)/gi, '');
+  out = out.replace(/\b(?:CB|D|W|S|P|R)-?\d+\b/g, '');
+  out = out.replace(/\s{2,}/g, ' ').trim();
   return out;
 }
 
@@ -270,6 +288,20 @@ export function kbVersionLabel(raw: string | null | undefined): string {
   if (m) return `Knowledge base v${m[1]}`;
   // Fallback: titleize the cleaned slug so no bare snake_case leaks.
   return titleCase(clean) || clean;
+}
+
+// CB-81: Map a raw channel slug to an operator-facing label. The backend stores the channel as a
+// lowercase slug ("text", "voice", "phone"). These must never render raw — translate to plain English
+// before any observable surface. Unknown slugs fall through to Title Case so no bare slug leaks.
+const CHANNEL_LABELS: Record<string, string> = {
+  text: 'Web chat',
+  voice: 'Web voice',
+  phone: 'Phone',
+};
+export function channelLabel(slug: string | null | undefined): string {
+  if (!slug) return '';
+  const trimmed = slug.trim().toLowerCase();
+  return CHANNEL_LABELS[trimmed] ?? titleCase(slug);
 }
 
 // CB-65: Humanize the guardrail_reason string from the experiment record for DISPLAY ONLY.
