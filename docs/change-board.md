@@ -60,6 +60,58 @@
 > - **Refs:** <spec docs / sections / design files>
 > ```
 
+### CB-83 — CRITICAL regression: contact-name extractor matches "it's free" (CB-76 misfire)
+- **Type / Surface / Size:** bug · `core` (`dst`) · S · CRITICAL (regression from CB-76)
+- **Prereqs:** — (fix folds into the uncommitted CB-76)
+- **Current (QA10-chat SEV-1, orchestrator-verified):** `_CONTACT_NAME_RE` captures any lowercase word after "it's"/"I'm" as a name — "Guarantee me a B or it's free" → name="free"; "I'm worried" → "worried". Live, a guarantee demand got the reply "Got it, Free — I've noted that down" (the contact-ack note with name="Free"): the objection was swallowed and the prospect addressed as "Free".
+- **Desired:** name group must be Capitalized (proper noun); drop the "it's <X>" intro form; stopword guard; only set contact_just_captured when a phone/email co-occurs OR an explicit "I'm/my name is <Cap>" intro. "I'm Dana Reyes 555-…" + "My name is Karen" must still capture.
+- **Acceptance:** the exact QA utterance captures no name; genuine intros still work; adversarial tests added; full suite green.
+- **Refs:** QA10-chat SEV-1; orchestrator regex repro 2026-06-08.
+
+### CB-84 — CB-NN internal index leaks into operator call-review rationale
+- **Type / Surface / Size:** bug · `web` (review) · S
+- **Prereqs:** — (folded into CB-81's humanizeRationale)
+- **Current (QA10-chat SEV-2):** a review turn's reasoning note renders "...before any close attempt (CB-48 directness)" — a bare CB-NN index in an observable operator surface, violating the no-internal-indices rule.
+- **Desired:** humanizeRationale strips /(CB|D|W|S|P|R)-?\d+/ tags before render, keeping the human sentence.
+- **Acceptance:** leak sweep asserts no CB-NN in operator-review text; unit test on humanizeRationale.
+- **Refs:** QA10-chat SEV-2.
+
+### CB-85 — Non-sequitur false-pivot + price persistence for the combative persona (brain quality)
+- **Type / Surface / Size:** bug · `core` (`gates`/`nlg`) · M · MEDIUM
+- **Prereqs:** —
+- **Current (QA10-chat):** (a) "you guys see the storm coming tonight?" → "Sounds good — let me get you scheduled" (ignored + misread as scheduling consent — no brief human ack then pivot); (b) the COMBATIVE dad's terse price re-asks ("Price. Just the number.") still got deflection + a FALSE "I don't have access to the exact pricing tiers right now" (the cooperative mom got "$300–600" on first ask) — CB-77's terse-recurrence didn't fire for this persona / the agent claimed no access to data it has.
+- **Desired:** a non-sequitur gets a one-clause ack before the pivot, never misread as consent; CB-77 terse-price forcing fires regardless of adversarial tone; the agent never claims it lacks pricing it can ground.
+- **Acceptance:** scripted replay of the storm turn + the 3× terse dad asks; price range surfaces by ask 2; no "I don't have access" when KB carries the range.
+- **Refs:** QA10-chat SEV-2 (non-sequitur), SEV-3 (price determinism); builds on CB-62/77.
+
+### CB-80 — Lab display residue (no-result guardrail chip, zombie-draft drawer, reject-why, copy)
+- **Type / Surface / Size:** bug · `web` (lab) · S
+- **Prereqs:** —
+- **Important files (candidates):** `web/app/improve/lab/page.tsx` (`isNoResult`/`effectiveState` from CB-71).
+- **Current (QA10-lab, VERIFIED real):** (L1) a no-result/timed-out record still shows the "Guardrail regression" chip (CB-71 suppresses metrics, not the chip); (L2) a zombie draft (state=running, n=0) reads "Draft" on the card FACE but the DRAWER header still says "Running"; (L3) a rejected-despite-significance card (93% sig, +0.14) gives no one-line WHY; (L4) the CB-73 baseline note "isn't materialized on this machine" is engineer-speak; (L5, LOW) Run button below the drawer fold (sticky footer).
+- **Desired:** no-result → no guardrail chip; drawer uses effectiveState (zombie reads Draft everywhere); positive-but-rejected card carries a plain "why"; reword L4; optional sticky footer.
+- **Acceptance:** QA10 cards re-render truthfully; qa9fix_lab.py extended.
+- **WAIVED (refuted by orchestrator):** "Run button z-index intercept" — elementFromPoint at the scrolled-in button returns the button (agent didn't scroll); "See experiment → lab root / no per-call transcripts" — CB-55+QA9 prove detail+both arms open for SETTLED runs (QA10 clicked a still-RUNNING card); "Ladder/CI no tooltips" — 5 title= tooltips exist (hover-only).
+- **Refs:** QA10-lab HIGH-2/HIGH-3, MEDIUM-2/MEDIUM-4.
+
+### CB-81 — Operate label leaks: channel slug + stub rationale in review
+- **Type / Surface / Size:** bug · `web` (operate) · S
+- **Prereqs:** —
+- **Important files (candidates):** `web/app/operate/calls/page.tsx` (channel ~176/214 maps only `voice`), `web/app/operate/review/[id]/page.tsx` + `web/lib/labels.ts` (`humanizeRationale`).
+- **Current (QA10-ops, VERIFIED real):** (O1) CHANNEL renders raw `text`; (O2) seeded-stub turns render raw `"sim-harness decision"` rationale in review (CB-60 badged the list, not the review turn).
+- **Desired:** channel→human label (text→"Web-chat"); stub rationale humanized or turn carries a seeded hint.
+- **Acceptance:** leak sweep extended (channel + rationale); no raw `text`/`sim-harness decision` in operator text.
+- **WAIVED (refuted vs code+API):** "Open full call review empty href" — it's a button onClick=router.push; "Reviewed/Resolved tabs render 0" — API returns 8/8, Resolved rendered 8 (no refetch wait); "54-vs-41 cap" — API returns 54, no slice in code; "real-calls label disappears" — always renders; "no row-cap disclosure" — fires when capped; "no escalation→call link" — drawer has a View-call button.
+- **Refs:** QA10-ops SEV-2 #6, SEV-3 #9.
+
+### CB-86 — Checkpoint-persist the lead at contact-capture (not only at /end)
+- **Type / Surface / Size:** change · `api` (`demo_routes` live_upsert + persistence) · M
+- **Prereqs:** CB-82 (done — booked closes now finalize via /end)
+- **Current:** CB-82 made any committed close fire /end → the lead persists then. But a chat that captures a phone and is ABANDONED before any terminal close (user closes the tab) still loses the lead — `_live_upsert` writes `lead_phone_hash=None` every turn. Deferred from CB-82 as invasive (raw_phone into the live_upsert hook signature + a mid-call Lead FK write before the episode row exists).
+- **Desired:** when contact is captured mid-call, write/upsert a minimal Lead (phone as sha256 only) so an abandoned-after-booking chat keeps it; FK ordering handled (lead before episode ref).
+- **Acceptance:** a chat that gives a phone then abandons (no /end) → the lead exists with the sha256 hash; no raw phone anywhere; live-call path unaffected.
+- **Refs:** CB-82 follow-up.
+
 ### CB-69 — Text-channel escalate: don't ask a question the session can't hear answered
 - **Type / Surface / Size:** design/bug · `core` (`nlg` escalate guidance) · `api` (`demo_routes` done semantics) · S–M
 - **Prereqs:** — (user decision wanted on the desired semantics)
@@ -139,6 +191,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-82 — Conversion/lead loss: only enrollment closes finalize (callback/consult/trial vanish)
+- **Type / Surface / Size:** bug · `api` (`demo_routes` done-condition + persistence) · M · HIGH
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `src/api/demo_routes.py` (done-condition at ~770: expanded from `attempt_close@enrollment` to ALL `attempt_close` tiers; file-top header updated), `tests/e2e/test_demo_call.py` (parametrize corrected + 11 new CB-82 regression tests: done flag × 4 tiers, episode outcome × 4 tiers, phone sha256 compliance, non-close purity, consent gate unchanged), `tests/e2e/test_cb63_chat_stream.py` (parametrize updated with CB-82 tiers).
+- **What changed:** one-line done-condition fix: `committed.decision.act in ("disqualify", "escalate", "attempt_close")` — dropped the `and tier == "enrollment"` guard so any committed close (callback/consultation/trial/enrollment) sets done=True, causing the client to fire /end which calls the persist hook and saves the episode + lead. Phone stored as sha256 only (the persist path was already correct; the capture hook test confirms it). Checkpoint-persist (lead at contact-capture) deferred as CB-86 (would require wiring raw_phone into the live_upsert signature, new lead FK write mid-call — invasive to the per-turn path).
+- **Verification:** 962 passed / 5 skipped (was 946). 16 new tests all green; zero regressions. Compliance assertion: `test_cb82_phone_stored_as_sha256_only_on_booked_close` serializes the full episode to JSON and asserts the raw phone never appears; `lead_phone_hash` is the sha256.
+- **Constraints checked:** buy-gate purity untouched (done only gates finalization; the commit decision is buy_gate in src/sim/prospect.py — unmodified); consent gate unchanged (test confirms 409 before consent regardless of close tier); R42 phone-hash-only compliance confirmed by test assertion on the episode JSON. `_finalize_auto_demo` already handled all tiers (derive_outcome call) — no change needed there.
+- **Follow-ups / known gaps:** CB-86 (checkpoint persist — lead/phone saved at contact-capture moment, not just at /end, so an abandoned-after-booking chat keeps the lead even if the user closes the tab before /end fires). CB-69 (escalate + trailing question still open).
 
 ### CB-76 — Listening v2: disjunctive/plural windows, deadline forms, never-deny, contact ack
 - **Type / Surface / Size:** bug · `core` (`dst`, `nlg`) · M

@@ -1,41 +1,44 @@
-# The /demo call routes for the thin FastAPI surface (plan U13; R1/R3/R33/R40/R41/R42), extracted
-# from src.api.server so that module stays a slim app-assembler. create_demo_router() builds an
-# APIRouter carrying the EXACT, frozen JSON contract the Next.js demo depends on: consent/start +
-# consent/respond drive the ConsentGate (AI disclosure, recording consent, minor->parental, with
-# detect_minor run on available signals so a suspected minor is gated INDEPENDENT of a client
-# is_minor flag, R40); /api/chat (GATED 409 by consent) runs one brain turn via VoiceSession — it
-# detect_minors the user text first (a self-reported minor flips need_parental -> 409), buffers/persists
-# an escalation with a PII-scrubbed moment, and reports `done` for terminal acts; CB-63: /api/chat now
-# STREAMS tokens as SSE when the client sends Accept: text/event-stream (progressive render + typing
-# indicator, eliminating the 5.7–9.1 s silence). SSE events: `token` chunks during NLG generation,
-# then a terminal `done` event carrying {reply, decision_act, done} — the same payload as the buffered
-# JSON fallback (backward-compatible: existing clients that POST without Accept:text/event-stream get
-# unchanged JSON). Streaming reuses handle_user_turn_stream (the VoiceSession streaming twin of
-# handle_user_turn) then commit_turn + post-turn hooks (escalation, close-tier, live upsert) AFTER the
-# stream completes — so consent gating, minor detection, timing stamps, cost accounting, and turn
-# persistence are IDENTICAL to the buffered path. LIVE PERSISTENCE (Layer 2): after each /api/chat
-# turn the live_upsert_hook (default: persist_call_live) upserts an in_progress Episode using a stable
-# episode_id + created_at stamped at session creation, so the Live monitor can query the call WHILE it
-# is happening; POST /api/demo/auto/start (CB-08 + CB-12) kicks off a SERVER-SIDE demo call (consent
-# pre-captured) that runs a REAL self-play — the agent brain vs an LLM-GENERATED ProspectSimulator
-# (src.sim, NOT a fixed script, so each demo varies) — streaming each committed turn through that same
-# per-turn live-upsert path as a background task, so the Live monitor populates without a phone AND the
-# demo survives the operator navigating away (it is not browser-bound); GET /api/demo/auto/stream?
-# episode_id=<id> (CB-12) is an SSE stream that emits a per-turn `turn` event (and a terminal `end`
-# event) so the live page appends turns in near-real-time instead of waiting on its 5 s poll (which
-# stays a fallback); CB-21 adds a `generating` event emitted BEFORE each brain turn (so the monitor
-# shows a "Generating…" spinner during the ~6 s compose window) and rides the committed reply text on
-# the `turn` event so the monitor can REVEAL it word-by-word (a token-stream-like effect on the demo
-# path); /api/livekit/token (503 without creds) mints a token via the injected builder AND stamps the
-# already-captured consent onto the room metadata (consent_state/recording_granted/jurisdiction/
-# phone_hash/conversable — no secrets) so the live voice worker SEEDS its ConsentGate from it instead
-# of deadlocking on a pending gate waiting for spoken consent; /api/session/{id}/end persists the
-# Episode (+escalations+lead) FK-safely (using the same episode_id so the final save upserts the
-# in_progress row) and EVICTS the session from the bounded LRU store (503 over cap); GET
-# /api/session/{id} + /api/health are introspection. Everything network/DB-bound is injected from
-# create_app (LLM factory, embedder, retrieve/hydrate/escalation/call-end/live-upsert hooks, token
-# builder) so tests run offline. PII is scrubbed in the VoiceSession before storage; the lead key is
-# the phone-hash.
+# The /demo call routes for the thin FastAPI surface (plan U13; R1/R3/R33/R40/R41/R42 + CB-82),
+# extracted from src.api.server so that module stays a slim app-assembler. create_demo_router()
+# builds an APIRouter carrying the EXACT, frozen JSON contract the Next.js demo depends on:
+# consent/start + consent/respond drive the ConsentGate (AI disclosure, recording consent,
+# minor->parental, with detect_minor run on available signals so a suspected minor is gated
+# INDEPENDENT of a client is_minor flag, R40); /api/chat (GATED 409 by consent) runs one brain
+# turn via VoiceSession — it detect_minors the user text first (a self-reported minor flips
+# need_parental -> 409), buffers/persists an escalation with a PII-scrubbed moment, and reports
+# `done` for terminal acts; CB-82: `done` is True for ANY committed close (attempt_close at any
+# tier — callback/consultation/trial/enrollment), not just enrollment, so every booking fires /end
+# and persists the episode+lead (raw phone NEVER stored; sha256 hash only, R42); CB-63: /api/chat
+# now STREAMS tokens as SSE when the client sends Accept: text/event-stream (progressive render +
+# typing indicator, eliminating the 5.7–9.1 s silence). SSE events: `token` chunks during NLG
+# generation, then a terminal `done` event carrying {reply, decision_act, done} — the same payload
+# as the buffered JSON fallback (backward-compatible: existing clients that POST without Accept:
+# text/event-stream get unchanged JSON). Streaming reuses handle_user_turn_stream (the VoiceSession
+# streaming twin of handle_user_turn) then commit_turn + post-turn hooks (escalation, close-tier,
+# live upsert) AFTER the stream completes — so consent gating, minor detection, timing stamps, cost
+# accounting, and turn persistence are IDENTICAL to the buffered path. LIVE PERSISTENCE (Layer 2):
+# after each /api/chat turn the live_upsert_hook (default: persist_call_live) upserts an in_progress
+# Episode using a stable episode_id + created_at stamped at session creation, so the Live monitor
+# can query the call WHILE it is happening; POST /api/demo/auto/start (CB-08 + CB-12) kicks off a
+# SERVER-SIDE demo call (consent pre-captured) that runs a REAL self-play — the agent brain vs an
+# LLM-GENERATED ProspectSimulator (src.sim, NOT a fixed script, so each demo varies) — streaming
+# each committed turn through that same per-turn live-upsert path as a background task, so the Live
+# monitor populates without a phone AND the demo survives the operator navigating away (it is not
+# browser-bound); GET /api/demo/auto/stream?episode_id=<id> (CB-12) is an SSE stream that emits a
+# per-turn `turn` event (and a terminal `end` event) so the live page appends turns in near-real-time
+# instead of waiting on its 5 s poll (which stays a fallback); CB-21 adds a `generating` event
+# emitted BEFORE each brain turn (so the monitor shows a "Generating…" spinner during the ~6 s
+# compose window) and rides the committed reply text on the `turn` event so the monitor can REVEAL it
+# word-by-word (a token-stream-like effect on the demo path); /api/livekit/token (503 without creds)
+# mints a token via the injected builder AND stamps the already-captured consent onto the room
+# metadata (consent_state/recording_granted/jurisdiction/phone_hash/conversable — no secrets) so the
+# live voice worker SEEDS its ConsentGate from it instead of deadlocking on a pending gate waiting
+# for spoken consent; /api/session/{id}/end persists the Episode (+escalations+lead) FK-safely
+# (using the same episode_id so the final save upserts the in_progress row) and EVICTS the session
+# from the bounded LRU store (503 over cap); GET /api/session/{id} + /api/health are introspection.
+# Everything network/DB-bound is injected from create_app (LLM factory, embedder, retrieve/hydrate/
+# escalation/call-end/live-upsert hooks, token builder) so tests run offline. PII is scrubbed in
+# the VoiceSession before storage; the lead key is the phone-hash (raw phone never stored, R42).
 from __future__ import annotations
 
 import asyncio
@@ -760,10 +763,14 @@ def create_demo_router(
         # live_episode_id ensures all upserts + the final /end persist target the same row.
         await _live_upsert(sess)
 
+        # CB-82: ANY committed close finalizes the conversation — not just enrollment. A callback
+        # booking, consultation, or trial is equally a real outcome that must persist (done=True so
+        # the client fires /end which calls call_end_persist_hook → episode + lead saved). The prior
+        # code gated on `tier == "enrollment"`, silently dropping sub-enrollment closes without ever
+        # reaching /end, leaving the episode in_progress and losing the lead/phone. Buy-gate purity
+        # is unchanged: done only gates finalization; the commit decision (buy_gate) is untouched.
         done = committed is not None and (
-            committed.decision.act in ("disqualify", "escalate") or (
-                committed.decision.act == "attempt_close" and committed.decision.tier == "enrollment"
-            )
+            committed.decision.act in ("disqualify", "escalate", "attempt_close")
         )
         return committed, bool(done)
 

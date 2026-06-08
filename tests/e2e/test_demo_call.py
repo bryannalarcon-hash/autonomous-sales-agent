@@ -1,9 +1,11 @@
-# End-to-end tests for the U13 web-demo call (plan U13; AE9 + R1/R3/R33/R40/R41/R42). Drives the
-# thin FastAPI surface (src.api.server) with fastapi.testclient.TestClient and an injected
+# End-to-end tests for the U13 web-demo call (plan U13; AE9 + R1/R3/R33/R40/R41/R42 + CB-82). Drives
+# the thin FastAPI surface (src.api.server) with fastapi.testclient.TestClient and an injected
 # MockLLMClient so NOTHING hits the network or a DB. Asserts the consent gate guards /api/chat
 # (409 until satisfied), the refusal path proceeds unrecorded (episode flagged not-recorded), the
 # suspected-minor path blocks on need_parental, sticky-voice assignment (new + returning caller),
-# and that any logged turn body is PII-scrubbed while the lead key stays the phone-hash (raw absent).
+# that any logged turn body is PII-scrubbed while the lead key stays the phone-hash (raw absent), and
+# (CB-82) that ANY committed close (callback/consultation/trial/enrollment) sets done=True so /end
+# fires and the episode + lead are persisted — not just enrollment.
 from __future__ import annotations
 
 import json
@@ -489,23 +491,29 @@ def _grant(client: TestClient, sid: str) -> None:
 @pytest.mark.parametrize(
     "act,tier,expected_done",
     [
-        ("attempt_close", "enrollment", True),   # an enrollment close ENDS the call
-        ("attempt_close", "trial", False),       # a trial close is a step, NOT the end
-        ("escalate", None, True),                # escalate is terminal (handed to a specialist)
-        ("disqualify", None, True),              # disqualify is terminal (not a fit)
-        ("ask", "goal", False),                  # discovery continues
+        # CB-82: ANY committed close is terminal — done=True for all four tiers.
+        ("attempt_close", "enrollment", True),      # enrollment close — always was terminal
+        ("attempt_close", "trial", True),           # CB-82: trial close is now terminal
+        ("attempt_close", "consultation", True),    # CB-82: consultation close is now terminal
+        ("attempt_close", "callback", True),        # CB-82: callback booking is now terminal
+        ("escalate", None, True),                   # escalate is terminal (handed to a specialist)
+        ("disqualify", None, True),                 # disqualify is terminal (not a fit)
+        ("ask", "goal", False),                     # discovery continues — NOT terminal
+        ("pitch", None, False),                     # pitch/talk — NOT terminal
     ],
 )
 def test_chat_done_flag_reflects_terminal_act(act, tier, expected_done):
-    """`done` is True ONLY for a terminal act: an enrollment close, an escalate, or a disqualify. A
-    non-enrollment close (trial) and ordinary discovery (ask) keep the call open (done False). This
-    replaces the prior vacuous `done in (True, False)` assertion with the exact contract.
+    """`done` is True for every terminal act: ANY committed close (attempt_close at ANY tier),
+    escalate, or disqualify. Non-close acts (ask, pitch, talk) keep the call open (done False).
+
+    CB-82 fix: the prior code set done=True ONLY for attempt_close@enrollment; sub-enrollment
+    closes (callback/consultation/trial) left done=False, so /end never fired and the lead was lost.
+    The fix expands the done condition to ALL attempt_close tiers (any committed booking finalizes).
 
     CB-50: a triggerless `escalate` is no longer terminal — the escalate_only_if_warranted gate
     redirects an escalate with NO genuine reason to a non-terminal selling act (the agent must not
     bail to a human as a default move). So the escalate case sends a GENUINE human request, which
-    WARRANTS the escalate and keeps it terminal — preserving this test's actual intent (a warranted
-    terminal escalate sets done=True) without re-encoding the old over-eager-escalate behavior."""
+    WARRANTS the escalate and keeps it terminal — preserving this test's actual intent."""
     app = create_app(llm_client_factory=lambda: _agent_mock(act=act, tier=tier), live_rag=False)
     client = TestClient(app)
     sid = _start(client, channel="text")["session_id"]
@@ -667,3 +675,204 @@ def test_cors_reads_allowed_origins_env_and_enables_credentials(monkeypatch):
     origins, allow_credentials = _resolve_cors(None)
     assert origins == ["https://app.example.com", "https://admin.example.com"]
     assert allow_credentials is True
+
+
+# ======================= CB-82: ALL COMMITTED CLOSES FINALIZE (bug regression) ===================
+#
+# A committed close (attempt_close at ANY tier) must set done=True so the client fires /end and the
+# episode + lead are persisted. The bug: only enrollment closes set done=True; callback/consultation/
+# trial left done=False, so /end never fired, the episode stayed in_progress (CB-60 excluded it
+# from the calls list), and the lead + phone were lost when the user left. QA caught this when a
+# mom booked a callback + gave her phone — the whole conversation never reached /operate.
+
+
+def _capture_call_end_hook():
+    """Returns (hook, captured_list). The hook mirrors the CallEndPersistHook signature but stays
+    DB-free. When raw_phone is supplied it server-derives the sha256 hash (as persist_call_end
+    does) so the captured Episode's lead_phone_hash reflects the real hashing path. Each invocation
+    appends the built Episode; tests can inspect outcome, phone-hash, qualified, metrics, and turns."""
+    captured: list[Any] = []
+
+    async def hook(session: Any, **kw: Any) -> Any:
+        from src.api.persistence import episode_from_session
+        from src.memory.schema import phone_hash as hash_phone
+
+        # Replicate the server-side hash derivation from persist_call_end: raw_phone wins over a
+        # client-supplied phone_hash — this is compliance-critical (server never trusts the hash).
+        raw = kw.get("raw_phone")
+        if raw:
+            try:
+                effective_hash: Optional[str] = hash_phone(raw)
+            except (ValueError, TypeError):
+                effective_hash = None
+        else:
+            effective_hash = kw.get("phone_hash")
+
+        ep = episode_from_session(
+            session,
+            config=kw["config"],
+            channel=kw["channel"],
+            phone_hash=effective_hash,
+            last_tier=kw.get("last_tier"),
+        )
+        captured.append(ep)
+        return ep
+
+    return hook, captured
+
+
+@pytest.mark.parametrize(
+    "tier,expected_outcome",
+    [
+        ("callback", "callback_booked"),
+        ("consultation", "consult_booked"),
+        ("trial", "trial_booked"),
+        ("enrollment", "enrolled"),
+    ],
+)
+def test_cb82_committed_close_at_any_tier_sets_done_true(tier, expected_outcome):
+    """CB-82 regression: a committed close at ANY tier (callback/consultation/trial/enrollment) must
+    return done=True in the /api/chat response so the client fires /end. Before the fix, only
+    enrollment closes set done=True — sub-enrollment commits silently dropped without persisting."""
+    app = create_app(
+        llm_client_factory=lambda: _agent_mock(act="attempt_close", tier=tier),
+        live_rag=False,
+    )
+    client = TestClient(app)
+    sid = _start(client, channel="text")["session_id"]
+    _grant(client, sid)
+
+    r = client.post("/api/chat", json={"session_id": sid, "text": "Yes, let's do it."})
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    assert payload["decision_act"] == "attempt_close", "brain routed to attempt_close"
+    assert payload["done"] is True, (
+        f"done must be True for a committed close at tier={tier!r} — "
+        f"before CB-82 fix, sub-enrollment tiers left done=False so /end never fired "
+        f"and the episode/lead were lost"
+    )
+
+
+@pytest.mark.parametrize("tier", ["callback", "consultation", "trial", "enrollment"])
+def test_cb82_end_fires_and_episode_carries_booked_outcome(tier):
+    """CB-82 regression — end-to-end: after done=True from a close at `tier`, calling /end persists
+    an Episode with the correct booked outcome. The call_end_persist_hook captures the Episode so
+    no DB is needed; the episode outcome must match _CLOSE_TIER_OUTCOME[tier]."""
+    hook, captured = _capture_call_end_hook()
+    app = create_app(
+        llm_client_factory=lambda: _agent_mock(act="attempt_close", tier=tier),
+        call_end_persist_hook=hook,
+        live_rag=False,
+    )
+    client = TestClient(app)
+    sid = _start(client, channel="text")["session_id"]
+    _grant(client, sid)
+
+    # The chat turn commits the close.
+    r = client.post("/api/chat", json={"session_id": sid, "text": "Yes, book it."})
+    assert r.status_code == 200, r.text
+    assert r.json()["done"] is True, f"done must be True for attempt_close@{tier}"
+
+    # The client fires /end (would be auto-fired by the demo UI when done=True).
+    r = client.post(f"/api/session/{sid}/end", json={"session_id": sid})
+    assert r.status_code == 200, r.text
+    end_payload = r.json()
+    assert end_payload["persisted"] is True
+
+    # The captured episode must carry the correct booked outcome.
+    assert len(captured) == 1, "call_end_persist_hook must have been called exactly once"
+    ep = captured[0]
+    from src.api.persistence import _CLOSE_TIER_OUTCOME
+    expected_outcome = _CLOSE_TIER_OUTCOME[tier][0]
+    assert ep.outcome == expected_outcome, (
+        f"episode outcome for attempt_close@{tier} must be {expected_outcome!r}, got {ep.outcome!r}"
+    )
+    assert ep.qualified is True, "a booked close must mark the episode as qualified"
+
+
+def test_cb82_phone_stored_as_sha256_only_on_booked_close():
+    """CB-82 + R42 compliance: after a committed callback booking + /end with a raw phone, the
+    persisted Episode carries lead_phone_hash=sha256(raw_phone) and the raw phone NEVER appears
+    anywhere in the episode (turns, outcome, metrics, or the hash field itself). This is
+    compliance-critical — raw phone must never be stored."""
+    raw_phone = "555-082-0001"
+    from src.memory.schema import phone_hash as sha_phone
+    expected_hash = sha_phone(raw_phone)
+
+    hook, captured = _capture_call_end_hook()
+    app = create_app(
+        llm_client_factory=lambda: _agent_mock(act="attempt_close", tier="callback"),
+        call_end_persist_hook=hook,
+        live_rag=False,
+    )
+    client = TestClient(app)
+    sid = _start(client, channel="text")["session_id"]
+    _grant(client, sid)
+
+    r = client.post("/api/chat", json={"session_id": sid, "text": "Book me a callback."})
+    assert r.status_code == 200, r.text
+    assert r.json()["done"] is True
+
+    # Fire /end with the raw phone (as the demo UI would after the caller provides it).
+    r = client.post(
+        f"/api/session/{sid}/end",
+        json={"session_id": sid, "raw_phone": raw_phone},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["persisted"] is True
+
+    assert len(captured) == 1
+    ep = captured[0]
+
+    # The lead key is the sha256 hash — never the raw phone.
+    assert ep.lead_phone_hash == expected_hash, (
+        f"lead_phone_hash must be sha256({raw_phone!r}), got {ep.lead_phone_hash!r}"
+    )
+    # Serialize everything to JSON and assert the raw phone NEVER appears.
+    import json as _json
+    ep_json = _json.dumps({
+        "outcome": ep.outcome,
+        "lead_phone_hash": ep.lead_phone_hash,
+        "qualified": ep.qualified,
+        "metrics": ep.metrics,
+        "turns": [t.to_dict() if hasattr(t, "to_dict") else str(t) for t in ep.turns],
+    })
+    assert raw_phone not in ep_json, (
+        f"raw phone {raw_phone!r} must NEVER appear in the persisted episode (R42)"
+    )
+
+
+def test_cb82_non_committed_turns_do_not_finalize():
+    """CB-82 purity: a talk/ask/pitch turn (no close attempt) must NOT set done=True — only a
+    genuine committed close, disqualify, or escalate is terminal. done=True on every turn would
+    break the buy-gate purity (done gates finalization, NOT the commit decision)."""
+    for act in ("ask", "pitch", "talk"):
+        app = create_app(
+            llm_client_factory=lambda a=act: _agent_mock(act=a),
+            live_rag=False,
+        )
+        client = TestClient(app)
+        sid = _start(client, channel="text")["session_id"]
+        _grant(client, sid)
+        r = client.post("/api/chat", json={"session_id": sid, "text": "What do you offer?"})
+        assert r.status_code == 200, r.text
+        assert r.json()["done"] is False, (
+            f"act={act!r} is not terminal — done must be False (finalization must not trigger)"
+        )
+
+
+def test_cb82_consent_gate_unchanged_no_consent_still_409():
+    """CB-82 does NOT touch the consent gate. A /api/chat call before consent still returns 409
+    even when the mock brain would return attempt_close. The gate fires before the brain."""
+    app = create_app(
+        llm_client_factory=lambda: _agent_mock(act="attempt_close", tier="callback"),
+        live_rag=False,
+    )
+    client = TestClient(app)
+    sid = _start(client, channel="text")["session_id"]
+    # NO consent granted — gate is still in pending state.
+    r = client.post("/api/chat", json={"session_id": sid, "text": "Book me."})
+    assert r.status_code == 409, (
+        "consent gate must block /api/chat regardless of the CB-82 done-condition fix"
+    )
+    assert r.json()["detail"]["reason"] == "consent_not_satisfied"

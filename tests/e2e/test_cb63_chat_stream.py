@@ -279,8 +279,11 @@ class TestDoneEventPayload:
     @pytest.mark.parametrize(
         "act,tier,expected_done",
         [
+            # CB-82: ANY committed close is terminal — done=True for all four tiers on both paths.
             ("attempt_close", "enrollment", True),
-            ("attempt_close", "trial", False),
+            ("attempt_close", "trial", True),           # CB-82: was False before the fix
+            ("attempt_close", "consultation", True),    # CB-82: all close tiers are terminal
+            ("attempt_close", "callback", True),        # CB-82: all close tiers are terminal
             ("escalate", None, True),
             ("disqualify", None, True),
             ("ask", "goal", False),
@@ -288,7 +291,8 @@ class TestDoneEventPayload:
     )
     def test_done_flag_in_sse_matches_buffered_contract(self, act, tier, expected_done):
         """The `done` field in the SSE `done` event matches the exact contract from the buffered path:
-        True only for enrollment close / escalate / disqualify; False for trial close and discovery."""
+        CB-82: done=True for ANY committed close (all four tiers) + escalate + disqualify;
+        done=False only for non-close acts (ask, pitch, talk, discovery)."""
         app = create_app(llm_client_factory=lambda: _agent_mock(act=act, tier=tier), live_rag=False)
         client = TestClient(app)
         sid = _start(client, channel="text")
