@@ -32,8 +32,11 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install . "sentence-transformers==5.5.1" "transformers==5.9.0"
 
-# 3) bake the embedder model into the image so the first live turn / KB ingest is offline + instant.
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')"
+# 3) bake the embedder model into the HF cache (HF_HOME) so runtime is offline + instant. The global
+#    HF_HUB_OFFLINE=1 (for runtime) would block THIS download, so override the offline flags to 0 for
+#    just this build step; runtime still loads from the baked /app/.hf cache.
+RUN HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 \
+    python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')"
 
 # 4) runtime assets: migrations, the startup scripts, the config (champion_v0.yaml).
 COPY migrations ./migrations
