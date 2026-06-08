@@ -566,7 +566,7 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
           </div>
           <h3>{live ? 'Call still in progress' : 'Nothing recorded yet'}</h3>
           <p>
-            <span className="mono">{ep.episode_id}</span> has no turns to review yet.{' '}
+            <span className="mono" title={ep.episode_id}>#{ep.episode_id.length > 14 ? ep.episode_id.slice(0, 12) + '…' : ep.episode_id}</span> has no turns to review yet.{' '}
             {live
               ? 'The transcript and decision trace will be here once the call wraps up.'
               : 'This call ended without a recorded transcript.'}
@@ -632,8 +632,9 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
                 index, demoted to a muted mono secondary line. The cohort id (`coh-…`) has no human
                 form so it's dropped — only the outcome accompanies the archetype here. */}
             <div className="rv-name">{ep.persona ? archetypeLabel(ep.persona) : 'Unknown archetype'} · {ep.outcome}</div>
-            <div className="rv-co mono" style={{ opacity: 0.7 }}>
-              #{ep.episode_id}
+            {/* CB-93: short ref, not the full 32-hex episode_id index (full id in the tooltip). */}
+            <div className="rv-co mono" style={{ opacity: 0.7 }} title={ep.episode_id}>
+              #{ep.episode_id.length > 14 ? ep.episode_id.slice(0, 12) + '…' : ep.episode_id}
             </div>
           </div>
           <div className="rv-stat">

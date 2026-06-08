@@ -61,6 +61,11 @@ LEAK_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
         "Raw kb_version slug ('kb_v0') in rendered text — must be 'Knowledge base v0'",
     ),
     (
+        "raw_uuid_index",
+        re.compile(r"\b(?:esc|ep-esc|ep|sp)-[0-9a-f]{20,}\b"),
+        "CB-93: raw 32-hex esc-/ep-/sp- UUID rendered as a full label (must be shortened)",
+    ),
+    (
         "dunder_colons",
         re.compile(r"\S+(?:__|::)\S+"),
         "Raw internal index with __ or :: separator in rendered text",

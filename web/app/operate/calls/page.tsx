@@ -193,8 +193,10 @@ function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
             <div className="b" style={{ fontSize: 15, fontFamily: 'var(--font-display)' }}>
               {c.persona ? archetypeLabel(c.persona) : 'Unknown archetype'} · {c.outcome}
             </div>
-            <div className="muted mono" style={{ fontSize: 11.5 }}>
-              #{c.episode_id}
+            {/* CB-93: the full 32-hex episode_id is an internal index — show a short ref (full id in
+                the title tooltip + the drawer's Copy affordance), never the whole UUID as a label. */}
+            <div className="muted mono" style={{ fontSize: 11.5 }} title={c.episode_id}>
+              #{shortId(c.episode_id)}
             </div>
           </div>
           <button className="gctl" onClick={onClose} style={{ width: 36, padding: 0, justifyContent: 'center' }}>
@@ -479,8 +481,9 @@ export default function CallsPage() {
                         <div className="b" style={{ fontSize: 13 }}>
                           {c.persona ? archetypeLabel(c.persona) : 'Unknown archetype'}
                         </div>
-                        <span className="mono muted" style={{ fontSize: 11 }}>
-                          #{c.episode_id}
+                        <span className="mono muted" style={{ fontSize: 11 }} title={c.episode_id}>
+                          {/* CB-93: short ref, not the full 32-hex index (full id in tooltip). */}
+                          #{shortId(c.episode_id)}
                         </span>
                       </td>
                       <td>

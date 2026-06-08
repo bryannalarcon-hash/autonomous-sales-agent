@@ -176,8 +176,9 @@ function Drawer({
           </div>
           <div className="grow">
             <div className="b" style={{ fontSize: 15, fontFamily: 'var(--font-display)' }}>{e.reason}</div>
-            <div className="muted" style={{ fontSize: 12 }}>
-              {e.escalation_id}
+            {/* CB-93: short ref, not the raw esc-<32hex> index (full id in the title tooltip). */}
+            <div className="muted" style={{ fontSize: 12 }} title={e.escalation_id}>
+              {e.escalation_id.length > 14 ? e.escalation_id.slice(0, 12) + '…' : e.escalation_id}
             </div>
           </div>
           <button className="gctl" onClick={onClose} style={{ width: 36, padding: 0, justifyContent: 'center' }}>
@@ -423,14 +424,20 @@ export default function EscalationsPage() {
                     <div className="esc-sev" style={{ background: `var(--${SEV_COLOR[sev]})` }} />
                     <div className="grow">
                       <div className="row" style={{ gap: 9, marginBottom: 5 }}>
-                        <span className="mono" style={{ fontSize: 12, color: 'var(--text-3)' }}>{e.escalation_id}</span>
+                        {/* CB-93: the raw esc-<32hex> UUID is an internal index — never render it as a
+                            primary label (no-internal-indices rule). Show a short ref; the reason tag
+                            + severity carry the human meaning. Full id stays in data-full-id. */}
+                        <span className="mono" style={{ fontSize: 12, color: 'var(--text-3)' }}
+                              title={e.escalation_id} data-full-id={e.escalation_id}>
+                          {e.escalation_id.length > 14 ? e.escalation_id.slice(0, 12) + '…' : e.escalation_id}
+                        </span>
                         <span className={`tag ${SEV_COLOR[sev]}`} style={{ textTransform: 'capitalize' }}>
                           {sev} severity
                         </span>
                         <span className="tag">{e.reason}</span>
                       </div>
                       <div className="b" style={{ fontSize: 14 }}>
-                        Call <span className="mono">{e.episode_id}</span>
+                        Call <span className="mono" title={e.episode_id} data-full-id={e.episode_id}>{e.episode_id.length > 14 ? e.episode_id.slice(0, 12) + '…' : e.episode_id}</span>
                         {/* CB-60 / CB-75: cohort hint on the card is now an affordance link to
                             the Calls list pre-activated in All cohorts mode (?cohort=all). */}
                         {e.episode_cohort && e.episode_cohort !== 'live' ? (

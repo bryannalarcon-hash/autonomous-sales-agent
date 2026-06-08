@@ -21,6 +21,7 @@ CONV_A = [
 CONV_B = [
     "Hi, my daughter is in 6th grade and needs help with reading comprehension.",
     "Wednesdays or Fridays after 4 work best, and state testing is end of the month.",
+    "Wait — did I already tell you when works for me? I can't remember.",  # CB-91 memory_check
     "That sounds good — let's set up a callback.",
     "I'm Dana Reyes, 555-014-9921. Phone is best.",
 ]
