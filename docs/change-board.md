@@ -60,13 +60,6 @@
 > - **Refs:** <spec docs / sections / design files>
 > ```
 
-### CB-83 — CRITICAL regression: contact-name extractor matches "it's free" (CB-76 misfire)
-- **Type / Surface / Size:** bug · `core` (`dst`) · S · CRITICAL (regression from CB-76)
-- **Prereqs:** — (fix folds into the uncommitted CB-76)
-- **Current (QA10-chat SEV-1, orchestrator-verified):** `_CONTACT_NAME_RE` captures any lowercase word after "it's"/"I'm" as a name — "Guarantee me a B or it's free" → name="free"; "I'm worried" → "worried". Live, a guarantee demand got the reply "Got it, Free — I've noted that down" (the contact-ack note with name="Free"): the objection was swallowed and the prospect addressed as "Free".
-- **Desired:** name group must be Capitalized (proper noun); drop the "it's <X>" intro form; stopword guard; only set contact_just_captured when a phone/email co-occurs OR an explicit "I'm/my name is <Cap>" intro. "I'm Dana Reyes 555-…" + "My name is Karen" must still capture.
-- **Acceptance:** the exact QA utterance captures no name; genuine intros still work; adversarial tests added; full suite green.
-- **Refs:** QA10-chat SEV-1; orchestrator regex repro 2026-06-08.
 
 ### CB-84 — CB-NN internal index leaks into operator call-review rationale
 - **Type / Surface / Size:** bug · `web` (review) · S
@@ -200,6 +193,15 @@
 - **Verification:** 962 passed / 5 skipped (was 946). 16 new tests all green; zero regressions. Compliance assertion: `test_cb82_phone_stored_as_sha256_only_on_booked_close` serializes the full episode to JSON and asserts the raw phone never appears; `lead_phone_hash` is the sha256.
 - **Constraints checked:** buy-gate purity untouched (done only gates finalization; the commit decision is buy_gate in src/sim/prospect.py — unmodified); consent gate unchanged (test confirms 409 before consent regardless of close tier); R42 phone-hash-only compliance confirmed by test assertion on the episode JSON. `_finalize_auto_demo` already handled all tiers (derive_outcome call) — no change needed there.
 - **Follow-ups / known gaps:** CB-86 (checkpoint persist — lead/phone saved at contact-capture moment, not just at /end, so an abandoned-after-booking chat keeps the lead even if the user closes the tab before /end fires). CB-69 (escalate + trailing question still open).
+
+### CB-83 — CRITICAL: contact-name extractor matched "it's free" (CB-76 follow-up)
+- **Type / Surface / Size:** bug · `core` (`dst`) · S · CRITICAL (regression from the shipped CB-76)
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `src/core/dst.py` (`_CONTACT_NAME_RE` rebuilt: case-sensitive name group `(?-i:([A-Z][a-z]+))`, dropped the `it's <X>` intro form, `_NAME_STOPWORDS` negative-lookahead; `update()` gate only sets `contact_just_captured` on an explicit-intro name OR a co-occurring phone/email), `tests/unit/test_cb7677_adversarial.py` (+21 tests).
+- **What changed:** the shipped CB-76 contact-ack matched any lowercase word after "it's"/"I'm" as a name — live, "Guarantee me a B or it's free" → "Got it, Free — I've noted that down", swallowing the guarantee objection and addressing the prospect as "Free". Now only a capitalized proper noun via an explicit intro (or contact alongside a phone/email) captures.
+- **Verification (orchestrator-spot-checked):** exact QA utterance + "it's free/fine", "I'm worried/looking" → no name; "I'm Dana Reyes 555-…", "My name is Karen", "I'm Dana" → captured. Adversarial 43; full repo 983p/5s (.venv) + 997p (system); zero regressions.
+- **Constraints checked:** Karen replay + qa3chat conv-2 contact ack preserved; R37/grounding/CB-61 invariants green.
+- **Follow-ups / known gaps:** none.
 
 ### CB-76 — Listening v2: disjunctive/plural windows, deadline forms, never-deny, contact ack
 - **Type / Surface / Size:** bug · `core` (`dst`, `nlg`) · M

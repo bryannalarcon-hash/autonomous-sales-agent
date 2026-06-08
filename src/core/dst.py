@@ -649,10 +649,30 @@ _CONTACT_PHONE_RE = re.compile(
     r"\b(?:\d{3}[\s\-\.]\d{3}[\s\-\.]\d{4}|\d{10}|\(\d{3}\)\s*\d{3}[\s\-\.]\d{4})\b"
 )
 _CONTACT_EMAIL_RE = re.compile(r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b")
-# A name introduction ("my name is X", "I'm X", "this is X", "call me X").
+# CB-76 round-3 (CRITICAL live-QA regression): words that look like a name after an intro verb but
+# are NOT names — kept as a stopword negative-lookahead for defense in depth even though the capture
+# group is now case-sensitive. The regression: "Guarantee me a B or it's free. Yes or no." captured
+# name="free" (re.I relaxed the [A-Z] guard) and the agent replied "Got it, Free — I've noted that
+# down.", swallowing a guarantee objection at the highest-stakes moment. Broad on hedges / feelings /
+# fillers that an LLM might capitalize at a sentence start.
+_NAME_STOPWORDS = (
+    r"free|fine|worried|looking|asking|calling|trying|sorry|okay|ok|yes|no|sure|maybe|"
+    r"just|here|there|not|good|great|interested|ready|done|confused|frustrated|busy|"
+    r"available|hoping|wondering|thinking|afraid|glad|happy|curious|concerned|unsure|"
+    r"urgent|nope|yeah|nah|hi|hey|hello|the|a|an|so|well|still|already|"
+    r"gonna|going|guarantee|cost|price"
+)
+# A name introduction — EXPLICIT intro forms ONLY: "my name is X", "I'm X", "this is X",
+# "call me X", "name's X". The "it's <X>" form is DROPPED entirely (CB-76 round-3): "it's
+# free/fine/urgent/no problem" is essentially never a name and was the source of the regression.
+# The captured name group is CASE-SENSITIVE — `(?-i:([A-Z][a-z]+))` — even though the surrounding
+# intro prefix matches case-insensitively (re.I). This means "Dana"/"Karen" match but "free",
+# "worried", "looking" (lowercase) do NOT, killing the over-match at the regex level. The stopword
+# lookahead is a second guard (rejects a capitalized "Free"/"Worried" too).
 _CONTACT_NAME_RE = re.compile(
-    r"\b(?:my\s+name\s+is|i'?m\s+(?!asking|calling\s+for|calling\s+about|trying|looking)|"
-    r"this\s+is|call\s+me|it'?s\s+)\s*([A-Z][a-z]{1,20})",
+    r"\b(?:my\s+name\s+is|i'?m|this\s+is|call\s+me|name'?s)\s+"
+    r"(?!(?:" + _NAME_STOPWORDS + r")\b)"
+    r"(?-i:([A-Z][a-z]+))",
     re.I,
 )
 
@@ -1188,17 +1208,18 @@ async def update(
     # is ONE-SHOT: it fires on the turn after capture and resets, so the ack is never repeated.
     # Detection is deterministic via heuristics (phone number pattern, email pattern, name intro) —
     # the full contact extraction lives in the demo/voice flow; this is the DST-side signal.
-    contact_captured = bool(
-        _CONTACT_PHONE_RE.search(norm)
-        or _CONTACT_EMAIL_RE.search(norm)
-        or _CONTACT_NAME_RE.search(norm)
-    )
-    if contact_captured:
+    # CB-76 round-3 (CRITICAL gate): a phone OR email OR an EXPLICIT-INTRO name (_CONTACT_NAME_RE now
+    # matches only "my name is / I'm <Cap>" forms with a case-sensitive name group) sets the flag.
+    # A bare capitalized word with no intro and no phone/email never triggers — the regression case
+    # "...or it's free. Yes or no." carries no contact context, so the guarantee objection is NOT
+    # swallowed by a spurious "Got it, Free —" ack.
+    phone_or_email = bool(_CONTACT_PHONE_RE.search(norm) or _CONTACT_EMAIL_RE.search(norm))
+    name_match = _CONTACT_NAME_RE.search(norm)  # explicit-intro name only (case-sensitive group)
+    if phone_or_email or name_match:
         updated.meta["contact_just_captured"] = True
-        # Try to extract the name for the ack ("Got it, Dana") from the name-intro pattern.
-        nm = _CONTACT_NAME_RE.search(norm)
-        if nm:
-            updated.meta["contact_name"] = nm.group(1).capitalize()
+        # Name for the ack ("Got it, Dana") — only from the explicit-intro pattern when present.
+        if name_match:
+            updated.meta["contact_name"] = name_match.group(1).capitalize()
     else:
         # Clear the one-shot flag so the ack fires ONLY on the turn after the capture turn.
         updated.meta["contact_just_captured"] = False

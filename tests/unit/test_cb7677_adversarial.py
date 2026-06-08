@@ -5,8 +5,11 @@
 # Collaborators: src/core/dst.py, src/core/gates.py, src/core/nlg.py
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from src.core import dst
 from src.core.dst import (
     _extract_callback_window,
     _extract_timeline,
@@ -22,7 +25,8 @@ from src.core.gates import (
     _TERSE_PRICE_REASK_RE,
     address_direct_input,
 )
-from src.core.belief_state import BeliefState
+from src.core.belief_state import DRIVERS, BeliefState
+from src.core.llm import MockLLMClient
 from src.config.settings import AgentConfig, Persona
 
 
@@ -411,4 +415,165 @@ class TestTersePriceRecurrenceFalsePositives:
         assert not recurs, (
             "FAIL: a non-price question ('what subjects do you cover?') after a prior price ask "
             "must NOT count as recurrent via the terse-price path. _question_recurs must be False."
+        )
+
+
+# ===========================================================================
+# 6. CONTACT-NAME over-match REGRESSION (CB-76 round-3, CRITICAL live-QA bug)
+# ===========================================================================
+
+def _flat_llm() -> MockLLMClient:
+    """Zero-delta scripted LLM: driver=0 deltas only, so DST leaves drivers at priors ($0)."""
+    return MockLLMClient([json.dumps({d: 0.0 for d in DRIVERS})])
+
+
+class TestContactNameOverMatchRegression:
+    """CRITICAL: _CONTACT_NAME_RE must not capture lowercase common words as names.
+
+    Live QA: "Guarantee me a B or it's free. Yes or no." captured name="free"; the agent replied
+    "Got it, Free — I've noted that down.", swallowing a guarantee objection at the highest-stakes
+    moment. Root: re.I relaxed the [A-Z] guard + the "it's <X>" intro form. Fixed by a case-sensitive
+    name group, dropping the "it's" form, a stopword guard, and a phone/email-or-explicit-intro gate."""
+
+    # --- The EXACT QA utterance ---
+
+    def test_exact_qa_guarantee_or_its_free_no_name(self):
+        """EXACT QA regression: 'Guarantee me a B or it's free. Yes or no.' must capture NO name."""
+        m = _CONTACT_NAME_RE.search("Guarantee me a B or it's free. Yes or no.")
+        assert m is None, (
+            f"CRITICAL REGRESSION: 'Guarantee me a B or it's free. Yes or no.' must NOT capture a "
+            f"name. Got: {m.group(1)!r}" if m else ""
+        )
+
+    async def test_exact_qa_guarantee_does_not_set_contact_flag(self):
+        """The EXACT QA utterance through a full DST update must NOT set contact_just_captured —
+        the guarantee objection must not be swallowed by a spurious 'Got it, Free —' ack."""
+        belief = BeliefState.fresh()
+        nb = await dst.update(
+            belief,
+            last_agent_act="attempt_close",
+            user_utterance="Guarantee me a B or it's free. Yes or no.",
+            llm_client=_flat_llm(),
+        )
+        assert not nb.meta.get("contact_just_captured"), (
+            "CRITICAL: the guarantee-demand turn must NOT set contact_just_captured"
+        )
+        assert not nb.meta.get("contact_name"), (
+            f"CRITICAL: the guarantee-demand turn must NOT capture a name; got "
+            f"{nb.meta.get('contact_name')!r}"
+        )
+
+    # --- "it's <X>" forms must never produce a name (form dropped) ---
+
+    @pytest.mark.parametrize("utterance", [
+        "or it's free",
+        "it's free",
+        "it's fine",
+        "it's urgent",
+        "it's no problem",
+    ])
+    def test_its_x_form_dropped(self, utterance):
+        """The 'it's <X>' intro form is dropped — these must capture NO name."""
+        m = _CONTACT_NAME_RE.search(utterance)
+        assert m is None, (
+            f"FAIL: '{utterance}' must NOT capture a name (the 'it's <X>' form is dropped). "
+            f"Got: {m.group(1)!r}" if m else ""
+        )
+
+    # --- "I'm <lowercase-word>" must not produce a name ---
+
+    @pytest.mark.parametrize("utterance", [
+        "I'm worried about the cost",
+        "I'm looking for help",
+        "I'm asking about your service",
+        "I'm calling for information",
+        "I'm just trying to understand",
+        "I'm not sure yet",
+        "I'm interested but skeptical",
+    ])
+    def test_im_lowercase_word_not_name(self, utterance):
+        """'I'm <lowercase common word>' must NOT match — the name group is case-sensitive."""
+        m = _CONTACT_NAME_RE.search(utterance)
+        assert m is None, (
+            f"FAIL: '{utterance}' must NOT capture a name. Got: {m.group(1)!r}" if m else ""
+        )
+
+    async def test_im_worried_no_contact_flag_via_dst(self):
+        """'I'm worried about the cost' through a full DST update must NOT set the contact flag."""
+        belief = BeliefState.fresh()
+        nb = await dst.update(
+            belief,
+            last_agent_act="answer_via_kb",
+            user_utterance="I'm worried about the cost",
+            llm_client=_flat_llm(),
+        )
+        assert not nb.meta.get("contact_just_captured"), (
+            "'I'm worried about the cost' must NOT set contact_just_captured"
+        )
+
+    # --- GENUINE cases must still work ---
+
+    def test_genuine_my_name_is_karen(self):
+        """'My name is Karen' must capture 'Karen' (the Karen replay must not regress)."""
+        m = _CONTACT_NAME_RE.search("My name is Karen")
+        assert m is not None and m.group(1) == "Karen", (
+            f"GENUINE: 'My name is Karen' must capture 'Karen'; got {m.group(1) if m else None!r}"
+        )
+
+    def test_genuine_im_dana(self):
+        """'I'm Dana' must capture 'Dana'."""
+        m = _CONTACT_NAME_RE.search("I'm Dana")
+        assert m is not None and m.group(1) == "Dana"
+
+    def test_genuine_dana_reyes_with_phone(self):
+        """'I'm Dana Reyes, 555-014-9921' captures name 'Dana' AND a phone (qa3chat conv-2 ack)."""
+        m = _CONTACT_NAME_RE.search("I'm Dana Reyes, 555-014-9921")
+        assert m is not None and m.group(1) == "Dana", (
+            f"GENUINE: must capture 'Dana'; got {m.group(1) if m else None!r}"
+        )
+        assert _CONTACT_PHONE_RE.search("I'm Dana Reyes, 555-014-9921"), (
+            "GENUINE: the phone number must also be detected"
+        )
+
+    async def test_genuine_dana_reyes_sets_contact_flag_and_name(self):
+        """Full DST update on 'I'm Dana Reyes, 555-014-9921' sets the flag + name='Dana'."""
+        belief = BeliefState.fresh()
+        nb = await dst.update(
+            belief,
+            last_agent_act="ask",
+            user_utterance="I'm Dana Reyes, 555-014-9921",
+            llm_client=_flat_llm(),
+        )
+        assert nb.meta.get("contact_just_captured") is True, (
+            "GENUINE: 'I'm Dana Reyes, 555-014-9921' must set contact_just_captured"
+        )
+        assert nb.meta.get("contact_name") == "Dana", (
+            f"GENUINE: name must be 'Dana'; got {nb.meta.get('contact_name')!r}"
+        )
+
+    async def test_genuine_my_name_is_karen_sets_flag(self):
+        """Full DST update on 'My name is Karen' (no phone/email) sets the flag via explicit intro."""
+        belief = BeliefState.fresh()
+        nb = await dst.update(
+            belief,
+            last_agent_act="ask",
+            user_utterance="My name is Karen",
+            llm_client=_flat_llm(),
+        )
+        assert nb.meta.get("contact_just_captured") is True, (
+            "GENUINE: an explicit-intro name with no phone/email still triggers the ack"
+        )
+        assert nb.meta.get("contact_name") == "Karen"
+
+    async def test_bare_capitalized_word_no_intro_no_flag(self):
+        """A bare capitalized word with no intro and no phone/email must NOT trigger the ack."""
+        belief = BeliefState.fresh()
+        nb = await dst.update(
+            belief,
+            last_agent_act="answer_via_kb",
+            user_utterance="Monday is when the test happens.",  # 'Monday' capitalized, no intro
+            llm_client=_flat_llm(),
+        )
+        assert not nb.meta.get("contact_just_captured"), (
+            "A bare capitalized word (no intro, no phone/email) must NOT set contact_just_captured"
         )
