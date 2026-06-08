@@ -13,6 +13,7 @@
 import { useEffect, useState } from 'react';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchVersions, rollbackVersion } from '@/lib/improve-api';
+import { kbVersionLabel } from '@/lib/labels';
 import type { VersionNode } from '@/lib/improve-types';
 
 // Pull the numeric ladder KPI out of a node's stored kpi snapshot. The backend stores it under the
@@ -86,7 +87,7 @@ function RollbackModal({
           </div>
           <h3 style={{ fontSize: 17 }}>Roll back to {versionLabel(v.version)}?</h3>
           <p className="muted" style={{ fontSize: 13, lineHeight: 1.55 }}>
-            This makes <b className="mono" style={{ color: 'var(--text)' }}>{versionLabel(v.version)} · {v.kb_version}</b> the live champion.
+            This makes <b className="mono" style={{ color: 'var(--text)' }}>{versionLabel(v.version)} · {kbVersionLabel(v.kb_version)}</b> the live champion.
             The current champion will be archived — no calls in flight are interrupted.
           </p>
           <div className="card solid card-pad" style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -219,7 +220,7 @@ export default function VersionsPage() {
                     <div className="row" style={{ gap: 9 }}>
                       <span className="b mono" style={{ fontSize: 14 }}>{versionLabel(v.version)}</span>
                       {v.is_champion ? <span className="tag accent dot">Champion</span> : null}
-                      <span className="tag">{v.kb_version}</span>
+                      <span className="tag">{kbVersionLabel(v.kb_version)}</span>
                       {v.dimension_label ? <span className="tag">{v.dimension_label}</span> : null}
                     </div>
                     <div className="row" style={{ gap: 16, marginTop: 9 }}>
@@ -248,7 +249,7 @@ export default function VersionsPage() {
             <div className="card solid card-pad" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
               {(
                 [
-                  ['Knowledge base', sel.kb_version],
+                  ['Knowledge base', kbVersionLabel(sel.kb_version)],
                   ['Parent', sel.parent_version ? versionLabel(sel.parent_version) : '—'],
                   ['Change', sel.dimension_label ?? '—'],
                   ['Created', sel.created_at ? new Date(sel.created_at).toLocaleDateString() : '—'],

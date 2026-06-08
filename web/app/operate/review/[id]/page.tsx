@@ -44,7 +44,7 @@ import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { Ring } from '@/components/cadence/Spark';
 import { fetchEpisode, fmtDuration, fmtFirstToken, fmtMsShort, fmtSpoke, setEpisodeGolden } from '@/lib/operate-api';
-import { archetypeLabel, humanizeRationale, versionLabel } from '@/lib/labels';
+import { archetypeLabel, humanizeRationale, kbVersionLabel, versionLabel } from '@/lib/labels';
 import type { BeliefSnapshot, EpisodeDetail, ProspectTurnState, TurnTiming } from '@/lib/operate-types';
 
 // CB-45: per-agent-turn voice-timing chips for the decision trace. Renders up to two small muted
@@ -670,7 +670,7 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
           <div className="rv-stat">
             <div className="l">Version</div>
             <div className="v">
-              {versionLabel(ep.version)} · {ep.kb_version}
+              {versionLabel(ep.version)} · {kbVersionLabel(ep.kb_version)}
             </div>
           </div>
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 9, alignItems: 'center' }}>

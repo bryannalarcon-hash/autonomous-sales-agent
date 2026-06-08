@@ -9,13 +9,14 @@
 // primary action routes to the Experiment Lab, where forking a DRAFT CHALLENGER is an explicit,
 // intentional step (R20: experiments mutate config, NEVER the live champion). Degrades to an
 // empty-state when the corpus is empty (or the API has not yet served the grouped shape).
-// The section-tree header label is uppercased by .nav-group, but the kb_version token (kb_v0) is
-// opted OUT of that transform so it renders lowercase (not the shouty "KB_V0").
+// The section-tree header label is uppercased by .nav-group, but the kb version tag uses
+// kbVersionLabel() (CB-65) so it renders as "Knowledge base v0", never the raw "kb_v0" slug.
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon, type IconName } from '@/components/cadence/Icon';
+import { kbVersionLabel } from '@/lib/labels';
 import { fetchKb } from '@/lib/improve-api';
 import type { KbResponse, KbSection } from '@/lib/improve-types';
 
@@ -105,13 +106,9 @@ export default function KbPage() {
         <div className="scroll" style={{ borderRight: '1px solid var(--border)', padding: 16, overflow: 'auto' }}>
           <div className="row" style={{ justifyContent: 'space-between', marginBottom: 12 }}>
             <span className="nav-group" style={{ margin: 0, padding: 0 }}>
-              {/* The label is intentionally SHOUTY (.nav-group uppercases it), but the kb_version
-                  token (`kb_v0`) is a lowercase id everywhere else — opt it out of the uppercase
-                  transform so it doesn't render as "KB_V0". */}
-              Knowledge base ·{' '}
-              <span style={{ textTransform: 'none', letterSpacing: 'normal' }}>
-                {kb?.kb_version ?? 'kb'}
-              </span>
+              {/* CB-65: kbVersionLabel translates raw slug (kb_v0 → "Knowledge base v0") so the
+                  nav-group .nav-group uppercase transform never sees the raw token. */}
+              {kbVersionLabel(kb?.kb_version ?? null)}
             </span>
           </div>
           <div className="col" style={{ gap: 3 }}>

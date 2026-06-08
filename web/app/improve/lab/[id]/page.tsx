@@ -5,6 +5,8 @@
 // all semantic labels (state, dimension, version, outcome) are humanized before render — no raw slug
 // (versionLabel/dimensionLabel from lib/labels; outcomeLabel from lib/improve-types). A draft / legacy /
 // timed-out run that persisted no arm episodes shows the summary + reason with an empty-calls note.
+// CB-65: ladderTierLabel/humanizeDiffDescription/humanizeGuardrailReason applied to arm rows + diff
+// header + guardrail reason card — no "tier 0"/"is False"/Python kwargs render to the operator.
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
@@ -13,7 +15,7 @@ import { Icon } from '@/components/cadence/Icon';
 import { fetchExperimentDetail } from '@/lib/improve-api';
 import type { ArmCall, ExperimentDetailResponse } from '@/lib/improve-types';
 import { outcomeLabel } from '@/lib/improve-types';
-import { dimensionLabel, versionLabel } from '@/lib/labels';
+import { dimensionLabel, humanizeDiffDescription, humanizeGuardrailReason, ladderTierLabel, versionLabel } from '@/lib/labels';
 
 function changeLabel(dimension: string, dimensionLabelText: string): string {
   return dimensionLabelText || dimensionLabel(dimension);
@@ -92,7 +94,7 @@ function ArmColumn({
               <span className="mono" style={{ fontSize: 11, color: 'var(--text-3)', width: 22 }}>{i + 1}</span>
               <span className={`tag ${outcomeTag(c.outcome)} dot`}>{outcomeLabel(c.outcome)}</span>
               <div className="grow" />
-              <span className="mono" style={{ fontSize: 11, color: 'var(--text-2)' }}>tier {c.ladder_tier}</span>
+              <span className="mono" style={{ fontSize: 11, color: 'var(--text-2)' }}>{ladderTierLabel(c.ladder_tier)}</span>
               <span className="mono" style={{ fontSize: 11, color: 'var(--text-3)' }}>· {c.turn_count} turns</span>
               <Icon name="arrowR" size={14} style={{ color: 'var(--accent)' }} />
             </button>
@@ -184,7 +186,7 @@ export default function ExperimentDetailPage({ params }: { params: { id: string 
                     <Icon name="arrowR" size={11} />
                     {versionLabel(e.challenger_version)}
                   </span>
-                  <span className="muted" style={{ fontSize: 12 }}>{e.diff_description}</span>
+                  <span className="muted" style={{ fontSize: 12 }}>{humanizeDiffDescription(e.diff_description)}</span>
                 </div>
               </div>
 
@@ -206,7 +208,7 @@ export default function ExperimentDetailPage({ params }: { params: { id: string 
                     <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--danger)' }}>
                       Why {e.state === 'blocked' ? 'it needs approval' : 'it ended'}
                     </div>
-                    <div style={{ fontSize: 13, color: 'var(--danger)', marginTop: 3, lineHeight: 1.5 }}>{failureReason}</div>
+                    <div style={{ fontSize: 13, color: 'var(--danger)', marginTop: 3, lineHeight: 1.5 }}>{humanizeGuardrailReason(failureReason)}</div>
                   </div>
                 </div>
               ) : null}

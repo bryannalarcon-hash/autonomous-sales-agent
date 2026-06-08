@@ -32,7 +32,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchEpisodes, fmtDuration, fmtMsShort, fmtTimeAgo } from '@/lib/operate-api';
-import { archetypeLabel, versionLabel } from '@/lib/labels';
+import { archetypeLabel, kbVersionLabel, versionLabel } from '@/lib/labels';
 import type { EpisodeSummary } from '@/lib/operate-types';
 
 // CB-66 (item 1): sortable column keys for the Calls table.
@@ -163,7 +163,7 @@ function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
             </span>
             <span className="tag">{c.ladder_label}</span>
             <span className="tag accent">
-              {versionLabel(c.version)} · {c.kb_version}
+              {versionLabel(c.version)} · {kbVersionLabel(c.kb_version)}
             </span>
             <span className="tag">{c.channel === 'voice' ? 'Web-voice' : c.channel}</span>
             {c.escalated ? (

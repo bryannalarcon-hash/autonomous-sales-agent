@@ -4,11 +4,13 @@
 // before the call UI unlocks, then a text console (R1) and a LiveKit web-voice control (R3) side by
 // side. This page owns the session: it holds the session_id + resolved ConsentState and derives the
 // gate (lib/consent.isCallEnabled) so the call UI stays disabled until consent is satisfied. `ended`
-// shows a polite end screen; `unrecorded` shows a visible "not being recorded" banner. A debug toggle
-// reveals internal decision_act labels for engineers only — never shown to the prospect by default.
+// shows a polite end screen; `unrecorded` shows a visible "not being recorded" banner.
 // CB-54: `handleConsentRequired` resets the consent state so the gate re-appears if TextConsole's
 // chat returns a 409 (session expired / orphaned by double-start); honest re-consent prompt instead
 // of a dead error message. TextConsole also calls /end on done=true to finalize the episode.
+// CB-65: the debug toggle was removed from the consumer-facing header — it leaked the word "debug"
+// as visible text to prospects and exposed an engineer-only control on the prospect surface. The
+// showDebug state (always false) is kept so the TextConsole API is unchanged.
 // Unlike /operate this is a LIGHTER prospect layout (no nav rail / DashboardShell) but uses the SAME
 // dark aurora + tokens + card/tag/button classes — not raw Tailwind bg-white/neutral-*.
 'use client';
@@ -76,18 +78,9 @@ export default function DemoPage() {
             <span>Operator dashboard</span>
             <Icon name="arrowR" className="gctl-chev" />
           </Link>
-          {/* Debug toggle — engineer-only; controls visibility of internal decision_act labels. */}
-          <label className="row gap6 faint" style={{ fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
-            <button
-              type="button"
-              className={`toggle${showDebug ? ' on' : ''}`}
-              aria-pressed={showDebug}
-              onClick={() => setShowDebug((v) => !v)}
-            >
-              <i />
-            </button>
-            debug
-          </label>
+          {/* CB-65: debug toggle removed from consumer-facing header — it leaked "debug" as visible text
+              and exposed an internal-only engineer toggle to prospects. The showDebug state is preserved
+              so the TextConsole prop still works (always false for consumers on this path). */}
         </header>
 
         <div className="page-scroll">

@@ -48,7 +48,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchActiveCalls, fetchLive, fetchSampleCall, fmtDuration, fmtFirstToken, fmtMsShort, initials } from '@/lib/operate-api';
-import { archetypeLabel, versionLabel } from '@/lib/labels';
+import { archetypeLabel, kbVersionLabel, versionLabel } from '@/lib/labels';
 import type { ActiveCallSummary, ActiveCallsResponse, BeliefSnapshot, LiveSnapshot, LiveTiming, Turn } from '@/lib/operate-types';
 import { ApiError, API_BASE, startAutoDemo } from '@/lib/api';
 
@@ -528,7 +528,7 @@ function CallMonitor({
             <div className="lv-pright">
               <div className="lv-dur">{fmtDuration(durationMs)}</div>
               <div className="lv-vtag">
-                {versionLabel(ep.version)} · {ep.kb_version}
+                {versionLabel(ep.version)} · {kbVersionLabel(ep.kb_version)}
               </div>
             </div>
           </div>

@@ -20,6 +20,7 @@ import { usePathname } from 'next/navigation';
 import { useEffect, useState, type ReactNode } from 'react';
 import { fetchVersions, fetchApprovals } from '@/lib/improve-api';
 import { fetchEscalations } from '@/lib/operate-api';
+import { kbVersionLabel } from '@/lib/labels';
 import { Icon, type IconName } from './Icon';
 
 // The agent's REAL persona, from the champion config (src/config/versions/champion_v0.yaml:
@@ -40,11 +41,11 @@ function versionLabel(raw: string): string {
   return base;
 }
 
-// The kb-version tag (e.g. "kb_v0") is an acceptable small version chip, but must render CLEANLY —
-// strip any internal `__…`/`-hash` suffix so no raw index leaks (it's not humanized like a champion
-// version, just trimmed). "kb_v0__playbooks__7" / "kb_v0-9c1f" -> "kb_v0".
+// CB-65: kbVersionTag is replaced by kbVersionLabel (from lib/labels) which translates the raw
+// kb_version slug ("kb_v0") to a human-readable form ("Knowledge base v0"). Kept as a thin alias
+// for any call-sites that haven't been updated yet.
 function kbVersionTag(raw: string): string {
-  return raw.split('__')[0].split('-')[0];
+  return kbVersionLabel(raw);
 }
 
 interface NavDest {

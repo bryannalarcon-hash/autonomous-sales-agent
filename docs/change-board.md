@@ -79,15 +79,6 @@
 - **Refs:** `src/api/operate.py::live_snapshot` + `live_ep`; LiveKit Agents room/participant model + SIP dispatch (`scripts/setup_sip_dispatch.py`, rule `SDR_hKYQYAwz96uA`); the disabled take-over control (`web/app/operate/live/page.tsx`); R37 in `src/core/respond.py`.
 - **Take-over spec (user, 2026-06-02) — refines CB-01.c:** on "Take over", the AI must (1) be INTERRUPTED mid-conversation and (2) speak a DEFAULT TTS hand-off line (e.g. "Let me bring in a specialist to help — one moment. They may type some of their responses, so there might be a brief pause between answers."). Then the OPERATOR talks into their own device (browser mic / WebRTC into the call's LiveKit room) and is heard by the caller through the phone — operator audio is published as a room participant, NOT a dial-in (presume the operator is NOT calling from their own phone number, so no SIP bridge / caller-ID concerns). The agent stops auto-generating; the operator may ALSO TYPE responses that are TTS'd to the caller ("the agent might be typing their responses"). So take-over = interrupt + disclosure TTS + operator mic→room audio + optional operator-typed→TTS, with the AI yielded. Consent/recording state must carry over; respect R37 (don't fork the brain — the brain just stops).
 
-### CB-65 — Viewer-facing leak sweep (slugs, IDs, debug artifacts)
-- **Type / Surface / Size:** bug · `web` (all surfaces) · `api` (label seams) · M
-- **Prereqs:** —
-- **Important files (candidates):** `src/api/labels.py` (translate at the seam), `web/app/operate/*`, `web/app/improve/*`, demo header.
-- **Current (QA6, all three reports):** raw run IDs as call names (`#RUN-…::challenger::6`); `kb_v0` chip on every page; `challenger_better is False` in reasons; raw config dump as "WHAT CHANGED" (`reorder discovery_sequence -> ['grade_level', …]`); `tier 1`/`tier 0` on lab rows where Calls says "No commitment"; Python decision dumps in tactic notes (`tier='callback' (trust=0.50, breakthrough=False)`); `"sim-harness decision"` rationale text; dead "debug" link in the CONSUMER demo header; full 32-hex IDs as primary labels; card titles `w2-detail`, `@n30`.
-- **Desired:** per the no-internal-indices rule: human labels in all rendered text; IDs shortened or demoted to tooltips/data-attrs; the debug link gone from consumer UI; tactic notes written as operator English.
-- **Acceptance:** automated sweep (qa6 scripts reusable) over demo+operate+improve finds zero `::`, `_v0`, snake_case enum, `is False`, or `->[` patterns in visible text.
-- **Refs:** QA6 leak sections of all three reports; `/tmp/qa6/04_leak_run_ids_top.png`.
-
 ---
 
 ## In Progress
@@ -139,6 +130,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-65 — Viewer-facing leak sweep (slugs, IDs, debug artifacts)
+- **Type / Surface / Size:** bug · `web` (all surfaces) · M
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `web/lib/labels.ts` (`kbVersionLabel`, `ladderTierLabel`, `humanizeGuardrailReason`; extended `humanizeDiffDescription`/`humanizeRationale`), applied across demo header (debug toggle REMOVED), DashboardShell chip, calls/review/live/versions/kb pages, lab list + detail; `tests/e2e/qa7_cb65_leaksweep.py` (NEW — 11-test playwright sweep over every surface, the standing regression), `tests/unit/test_cb65_labels.py`.
+- **What changed:** 11 leak classes found live and all translated at the render layer: `kb_v0` → "Knowledge base v0" everywhere; `tier 0/1` → ladder labels; `challenger_better is False` → plain English; config dumps → "New sequence: Grade level, Goal, …"; Python kwargs stripped from tactic notes; consumer debug toggle gone. Zero allowlist exceptions needed.
+- **Verification:** sweep AFTER = zero hits (re-run by orchestrator: 11/11); full suite 869 passed; every prior qa7 regression script re-run green.
+- **Constraints checked:** no DB writes; src/core untouched; raw values kept in data fields for automation.
+- **Follow-ups / known gaps:** none — the sweep runs as a permanent regression test.
 
 ### CB-68 — Ground the LLM's concession proposal (phantom discount terminally escalated a healthy close)
 - **Type / Surface / Size:** bug · `core` (`gates`) · S

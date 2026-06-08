@@ -43,7 +43,7 @@ import { Icon } from '@/components/cadence/Icon';
 import { fetchExperiments, fetchPlaybook, runExperiment } from '@/lib/improve-api';
 import type { Experiment, MetricChange, PlaybookResponse, RunExperimentRequest } from '@/lib/improve-types';
 import { metricBandFor, metricExplainer } from '@/lib/improve-types';
-import { dimensionLabel, populationLabel, versionLabel } from '@/lib/labels';
+import { dimensionLabel, humanizeDiffDescription, populationLabel, versionLabel } from '@/lib/labels';
 
 // Operator-facing "what changed" label for an experiment: prefer the backend's pre-translated
 // dimension_label, else derive a human label from the raw `dimension` slug. Never the raw `__…__` id.
@@ -199,7 +199,7 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
             <div className="faint" style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 7 }}>
               What changed · {e.dimension_label}
             </div>
-            <div className="mono" style={{ fontSize: 13, lineHeight: 1.6 }}>{e.diff_description}</div>
+            <div className="mono" style={{ fontSize: 13, lineHeight: 1.6 }}>{humanizeDiffDescription(e.diff_description)}</div>
           </div>
 
           {/* CB-25: "See experiment" -> the detail page listing this A/B's mock calls (both arms),
