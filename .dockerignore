@@ -1,0 +1,18 @@
+# .dockerignore — keep the API build context small. The Dockerfile only COPYs pyproject/README/src/
+# migrations/scripts/docker, but excluding the heavy trees here makes the context upload fast.
+.venv/
+**/__pycache__/
+**/*.pyc
+.git/
+handoff/
+web/node_modules/
+web/.next/
+node_modules/
+*.zip
+*.pdf
+tests/
+docs/
+ai-logging/
+*.egg-info/
+.pytest_cache/
+.env
