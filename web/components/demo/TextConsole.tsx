@@ -1,14 +1,18 @@
 // TextConsole — the text-chat panel (R1). POSTs /api/chat {session_id, text} and renders {reply}.
 // Gated: the input/send are disabled until consent is satisfied (controlled by `enabled`); a 409
-// from the backend surfaces as "consent required". The internal `decision_act` policy label is
-// debug-only and rendered ONLY when `showDebug` is on — it is NEVER shown to the prospect by
-// default (house rule: internal act labels never render in the prospect-facing surface).
+// from the backend surfaces as a re-consent prompt (CB-54: honest copy + onConsentRequired callback
+// so the page can re-show the gate rather than leaving the user in a dead end). The internal
+// `decision_act` policy label is debug-only and rendered ONLY when `showDebug` is on — it is NEVER
+// shown to the prospect by default (house rule: internal act labels never render in the
+// prospect-facing surface). CB-54: when done=true is returned by /api/chat the session is finalized
+// (POST /api/session/{id}/end) so the episode reaches a terminal status and appears in the Calls
+// list (previously the session lingered as in_progress indefinitely).
 // Styled in the dark "Cadence" design system (rendered inside the page's `.cadence` scope): a
 // .card shell, accent-gradient agent bubbles vs surface prospect bubbles, .input + .btn composer.
 'use client';
 
 import { useRef, useState } from 'react';
-import { sendChat, ApiError } from '@/lib/api';
+import { sendChat, sessionEnd, ApiError } from '@/lib/api';
 import { Icon } from '@/components/cadence/Icon';
 
 interface TextConsoleProps {
@@ -16,6 +20,11 @@ interface TextConsoleProps {
   enabled: boolean;
   /** Debug toggle: when true, render the internal decision_act tag on agent turns. */
   showDebug: boolean;
+  /**
+   * CB-54: called when the backend returns a consent 409, so the demo page can re-show the
+   * consent gate instead of leaving the user staring at a dead error message.
+   */
+  onConsentRequired?: () => void;
 }
 
 interface ChatTurn {
@@ -24,14 +33,18 @@ interface ChatTurn {
   decisionAct?: string;
 }
 
-export default function TextConsole({ sessionId, enabled, showDebug }: TextConsoleProps) {
+export default function TextConsole({ sessionId, enabled, showDebug, onConsentRequired }: TextConsoleProps) {
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
+  const [done, setDone] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  const canSend = enabled && !!sessionId && draft.trim().length > 0 && !sending;
+  // CB-54: track whether /end has already been called for this session so we never double-finalize.
+  const endedRef = useRef(false);
+
+  const canSend = enabled && !!sessionId && draft.trim().length > 0 && !sending && !done;
 
   async function handleSend() {
     if (!canSend || !sessionId) return;
@@ -46,9 +59,25 @@ export default function TextConsole({ sessionId, enabled, showDebug }: TextConso
         ...prev,
         { role: 'agent', text: res.reply, decisionAct: res.decision_act },
       ]);
+      if (res.done) {
+        // CB-54: terminal turn — finalize the episode so it appears in the Calls list and
+        // doesn't linger as in_progress. Fire-and-forget: a failure here doesn't block the UX.
+        setDone(true);
+        if (!endedRef.current && sessionId) {
+          endedRef.current = true;
+          void sessionEnd({ session_id: sessionId }).catch(() => {
+            // Swallow: /end is best-effort; the operator can still find the in-progress episode.
+          });
+        }
+      }
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
-        setError('Consent required before chatting.');
+        // CB-54: honest copy + actionable re-consent prompt instead of a dead error message.
+        // The error shows a "re-consent" link only when the parent provided the callback.
+        setError('Your session is no longer valid. Please complete consent again to continue.');
+        if (onConsentRequired) {
+          onConsentRequired();
+        }
       } else {
         setError(e instanceof ApiError ? e.message : 'Failed to send message.');
       }
@@ -114,10 +143,32 @@ export default function TextConsole({ sessionId, enabled, showDebug }: TextConso
             </div>
           ))
         )}
+
+        {/* CB-54: terminal state — polite end-of-call notice, input stays off. */}
+        {done && !error ? (
+          <p className="faint" style={{ fontSize: 13, textAlign: 'center', marginTop: 8 }}>
+            The conversation has ended. Refresh the page to start a new one.
+          </p>
+        ) : null}
       </div>
 
       {error ? (
-        <p style={{ padding: '0 16px 4px', fontSize: 11.5, color: 'var(--danger)' }}>{error}</p>
+        <div style={{ padding: '0 16px 8px' }}>
+          <p style={{ fontSize: 11.5, color: 'var(--danger)', marginBottom: onConsentRequired ? 6 : 0 }}>
+            {error}
+          </p>
+          {/* CB-54: when onConsentRequired is provided, the parent will re-show the gate. */}
+          {onConsentRequired ? (
+            <button
+              type="button"
+              onClick={() => { setError(null); onConsentRequired(); }}
+              className="btn btn-ghost"
+              style={{ fontSize: 12, padding: '4px 10px' }}
+            >
+              Re-open consent
+            </button>
+          ) : null}
+        </div>
       ) : null}
 
       <form
@@ -130,11 +181,11 @@ export default function TextConsole({ sessionId, enabled, showDebug }: TextConso
         <input
           type="text"
           value={draft}
-          disabled={!enabled || sending}
+          disabled={!enabled || sending || done}
           onChange={(e) => setDraft(e.target.value)}
-          placeholder={enabled ? 'Type a message…' : 'Consent required'}
+          placeholder={enabled && !done ? 'Type a message…' : done ? 'Conversation ended' : 'Consent required'}
           className="input"
-          style={{ flex: 1, opacity: !enabled || sending ? 0.55 : 1 }}
+          style={{ flex: 1, opacity: !enabled || sending || done ? 0.55 : 1 }}
         />
         <button
           type="submit"

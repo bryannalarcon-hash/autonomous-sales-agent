@@ -70,15 +70,6 @@
 - **Refs:** `src/api/operate.py::live_snapshot` + `live_ep`; LiveKit Agents room/participant model + SIP dispatch (`scripts/setup_sip_dispatch.py`, rule `SDR_hKYQYAwz96uA`); the disabled take-over control (`web/app/operate/live/page.tsx`); R37 in `src/core/respond.py`.
 - **Take-over spec (user, 2026-06-02) — refines CB-01.c:** on "Take over", the AI must (1) be INTERRUPTED mid-conversation and (2) speak a DEFAULT TTS hand-off line (e.g. "Let me bring in a specialist to help — one moment. They may type some of their responses, so there might be a brief pause between answers."). Then the OPERATOR talks into their own device (browser mic / WebRTC into the call's LiveKit room) and is heard by the caller through the phone — operator audio is published as a room participant, NOT a dial-in (presume the operator is NOT calling from their own phone number, so no SIP bridge / caller-ID concerns). The agent stops auto-generating; the operator may ALSO TYPE responses that are TTS'd to the caller ("the agent might be typing their responses"). So take-over = interrupt + disclosure TTS + operator mic→room audio + optional operator-typed→TTS, with the AI yielded. Consent/recording state must carry over; respect R37 (don't fork the brain — the brain just stops).
 
-### CB-54 — Demo chat dies after the first conversation (consent 409 wall + stuck sessions)
-- **Type / Surface / Size:** bug · `api` (`demo_routes`) · `web/app/demo` · M
-- **Prereqs:** —
-- **Important files (candidates):** `src/api/demo_routes.py` (chat 409 gate: consent `pending / need_parental / ended`, see ~:703–708), the demo page's consent-gate effect (likely double-firing `POST /api/consent/start` — 2× per page load, suspect React StrictMode/dev double-mount), session finalization path.
-- **Current:** after one completed conversation, every later session's `POST /api/chat` returns 409 "Consent required before chatting." despite consent/start + consent/respond both returning 200 — reproduced across 3 fresh sessions, both consent paths, reload+retry (QA6). Relatedly, a finished chat episode stayed "In progress" (wrong duration 6:25 vs ≥8:45 observed) and never appeared in the Calls list. UI offers no re-consent affordance; failed bubble retained; input stays enabled.
-- **Desired:** any number of consecutive demo conversations work; consent binds to the session the chat actually uses (fix the double-start race); a finished/abandoned chat episode is finalized (terminal status + real duration) and lands in the Calls list; on a real consent 409 the UI re-offers the gate with honest copy.
-- **Acceptance:** scripted repro (tests/e2e/qa6 adaptation): conv A completes → conv B in a fresh session completes (no 409); `/api/consent/start` fires once per gate; the finished episode shows terminal state + correct duration and is searchable in `/operate/calls`. Regression test on the consent-session binding.
-- **Refs:** QA6 qa-chat report (BLOCKER #1–3), qa-operate bug #7; `/tmp/qa6/transcript_2_stuck*.log`, `conv2_blocked.png`, `20_live_call_review.png`.
-
 ### CB-59 — One champion: experiments + KPI must target the LIVE champion (v1), not champion_v0.yaml
 - **Type / Surface / Size:** bug/change · `api` (`improve`, `operate`) · `web` (KPI) · M
 - **Prereqs:** —
@@ -193,6 +184,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-54 — Demo chat dies after the first conversation (consent 409 wall + stuck sessions)
+- **Type / Surface / Size:** bug · `web/app/demo` + `web/components/demo` · M (server unchanged)
+- **Completed:** 2026-06-07
+- **Files changed (actual):** `web/components/demo/ConsentFlow.tsx` (StrictMode dedup `startedRef` + stale-async `effectTokenRef` — the consented session is deterministically the one bound), `web/components/demo/TextConsole.tsx` (calls `/api/session/{id}/end` on done → episode finalizes + reaches Calls list; honest 409 copy + "Re-open consent" recovery), `web/app/demo/page.tsx` (re-gate callback), `tests/e2e/test_cb54_consent_session.py` (NEW, 17 server-contract tests), `tests/e2e/qa7_cb54.py` (NEW, live browser regression).
+- **What changed:** root cause was React StrictMode double-firing the consent-start effect → two sessions; the UNCONSENTED one could win the parent-state race → chat bound to a `pending` session → 409 for every subsequent visitor. The effect-token guard discards the stale session; finalization + 409 recovery added.
+- **Verification:** 17 server tests green (cross-session regression, double-start race, finalization, compliance invariants: no-consent 409, minor→need_parental, in-chat minor detection, sha256-only phone, AI disclosure). Live browser (qa7_cb54.py, 2 paid turns ≈$0.03): conv A then FRESH conv B both chat — the QA6 blocker is dead.
+- **Constraints checked:** consent/minor/PII gates proven unweakened; server untouched.
+- **Follow-ups / known gaps:** in dev, StrictMode still fires consent/start 2× by design (one orphan `pending` session, dev-only, never used, still 409-gated; single-fire in prod builds). Calls-list appearance of a *naturally finished* conversation rides on `/end` — verified at the contract level; blind QA round will confirm end-to-end.
 
 ### CB-61 — The agent doesn't LISTEN: DST drops caller-stated slots (deadline, callback time)
 - **Type / Surface / Size:** bug · `core` (`dst`, `gates`, `nlg`) · M–L

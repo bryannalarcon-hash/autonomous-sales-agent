@@ -6,9 +6,13 @@
 // to the demo page, which owns gating; this component just drives the conversation to a resolution.
 // Styled in the dark "Cadence" design system (rendered inside the page's `.cadence` scope) — uses
 // the shared .btn-*/.tag/.card tokens, not raw light Tailwind, so it matches the operator console.
+// CB-54: a ref-guard deduplicates the React StrictMode double-effect so only ONE server session
+// is ever created per ConsentFlow mount. The startedRef tracks whether a start() has been issued
+// for the current mount; the effectToken ref is bumped on each effect run so a stale async
+// continuation from a prior (unmounted) effect run cannot update state for the live mount.
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { consentRespond, consentStart, ApiError } from '@/lib/api';
 import type { ConsentChannel, ConsentState } from '@/lib/api-types';
 import { isEnded, needsParental } from '@/lib/consent';
@@ -33,22 +37,47 @@ export default function ConsentFlow({ jurisdiction, channel, onResolved }: Conse
   const [recordingConsent, setRecordingConsent] = useState<boolean | null>(null);
   const [isMinor, setIsMinor] = useState(false);
 
-  const start = useCallback(async () => {
+  // CB-54 deduplication: track whether a start() fetch is already in flight for THIS mount.
+  // React 18 StrictMode fires useEffect twice (mount → cleanup → remount) to expose
+  // side-effect bugs. Without a guard, two POST /api/consent/start requests are sent, creating
+  // two server sessions; the chat later uses whichever session_id the state settled on while
+  // consent/respond used the other one — a deterministic 409 ("state: pending"). The ref is
+  // reset in the effect cleanup so each real mount gets exactly one session.
+  const startedRef = useRef(false);
+
+  // effectToken: bumped in cleanup so any stale async tail from a prior effect run cannot
+  // apply its setSessionId/setPhase to the current mount's state.
+  const effectTokenRef = useRef(0);
+
+  const start = useCallback(async (token: number) => {
     setPhase('loading');
     setError(null);
     try {
       const res = await consentStart({ jurisdiction, channel });
+      // Discard the result if this effect run has been superseded (StrictMode cleanup fired).
+      if (effectTokenRef.current !== token) return;
       setSessionId(res.session_id);
       setDisclosure(res.disclosure_text);
       setPhase('collect');
     } catch (e) {
+      if (effectTokenRef.current !== token) return;
       setError(e instanceof ApiError ? e.message : 'Failed to start the consent flow.');
       setPhase('error');
     }
   }, [jurisdiction, channel]);
 
   useEffect(() => {
-    void start();
+    // Deduplicate: skip if a start() is already in flight for this mount (StrictMode guard).
+    if (startedRef.current) return;
+    startedRef.current = true;
+    const token = ++effectTokenRef.current;
+    void start(token);
+    return () => {
+      // Cleanup: reset the guard so a real remount (jurisdiction/channel change) works correctly.
+      // Also bump the token so the in-flight fetch for the unmounted mount is discarded.
+      startedRef.current = false;
+      effectTokenRef.current = token + 1; // invalidate the in-flight call's token
+    };
   }, [start]);
 
   const submit = useCallback(
@@ -89,7 +118,18 @@ export default function ConsentFlow({ jurisdiction, channel, onResolved }: Conse
     return (
       <div className="col gap12">
         <p style={{ fontSize: 13, color: 'var(--danger)' }}>{error}</p>
-        <button type="button" onClick={() => void start()} className="btn btn-primary" style={{ alignSelf: 'flex-start' }}>
+        <button
+          type="button"
+          onClick={() => {
+            // Retry: reset the dedup guard so start() can fire again for this mount.
+            startedRef.current = false;
+            const token = ++effectTokenRef.current;
+            startedRef.current = true;
+            void start(token);
+          }}
+          className="btn btn-primary"
+          style={{ alignSelf: 'flex-start' }}
+        >
           Retry
         </button>
       </div>

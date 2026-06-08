@@ -6,6 +6,9 @@
 // gate (lib/consent.isCallEnabled) so the call UI stays disabled until consent is satisfied. `ended`
 // shows a polite end screen; `unrecorded` shows a visible "not being recorded" banner. A debug toggle
 // reveals internal decision_act labels for engineers only — never shown to the prospect by default.
+// CB-54: `handleConsentRequired` resets the consent state so the gate re-appears if TextConsole's
+// chat returns a 409 (session expired / orphaned by double-start); honest re-consent prompt instead
+// of a dead error message. TextConsole also calls /end on done=true to finalize the episode.
 // Unlike /operate this is a LIGHTER prospect layout (no nav rail / DashboardShell) but uses the SAME
 // dark aurora + tokens + card/tag/button classes — not raw Tailwind bg-white/neutral-*.
 'use client';
@@ -38,6 +41,14 @@ export default function DemoPage() {
     },
     [],
   );
+
+  // CB-54: TextConsole calls this when /api/chat returns 409 (session not consented, e.g. orphaned
+  // by the React StrictMode double-start). Reset the gate so ConsentFlow re-appears and the user
+  // can re-consent without a dead-end error message.
+  const handleConsentRequired = useCallback(() => {
+    setConsentState(null);
+    setSessionId(null);
+  }, []);
 
   const callEnabled = isCallEnabled(consentState);
   const recorded = isRecorded(consentState);
@@ -126,7 +137,12 @@ export default function DemoPage() {
                       }}
                     >
                       <div style={{ height: '28rem' }}>
-                        <TextConsole sessionId={sessionId} enabled={callEnabled} showDebug={showDebug} />
+                        <TextConsole
+                          sessionId={sessionId}
+                          enabled={callEnabled}
+                          showDebug={showDebug}
+                          onConsentRequired={handleConsentRequired}
+                        />
                       </div>
                       {/* Equal-height wrapper so the voice panel matches the text console (N8 parity). */}
                       <div style={{ height: '28rem' }}>
