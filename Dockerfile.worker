@@ -1,0 +1,54 @@
+# Dockerfile.worker — the LiveKit voice WORKER service image for Railway (src/voice/worker.py).
+# A long-running process (NOT an HTTP server): it makes an OUTBOUND connection to LiveKit Cloud
+# (LIVEKIT_URL), is dispatched into /demo + phone rooms, and runs ElevenLabs Scribe v2 STT -> OUR
+# brain -> ElevenLabs TTS with Silero VAD. Shares the same Postgres (DATABASE_URL) so voice calls
+# persist into /operate, and bakes the BGE embedder so grounded answers cite the KB. Same proven
+# torch/sentence-transformers base as the API Dockerfile, plus the pinned livekit-agents 1.5.15 stack
+# (parity with the local grounded env). Selected on Railway via RAILWAY_DOCKERFILE_PATH=Dockerfile.worker.
+# Start: `python -m src.voice.worker start` (livekit-agents cli production mode). No port/domain.
+FROM python:3.10-slim
+
+# NOTE: unlike the API image we do NOT force HF_HUB_OFFLINE at runtime — the worker is online by
+# nature (LiveKit/ElevenLabs/OpenRouter) and Silero may fetch its VAD model; the BGE model is still
+# baked below so brain grounding loads instantly from the local HF cache.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HOME=/app/.hf \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+# 1) torch CPU first, pinned to the locally-verified version (same approach as the API image): the
+#    `+cpu` local tag pulls torch only from the pytorch CPU index, with PyPI as an extra index so
+#    torch's own deps resolve. Upgrade pip first.
+RUN pip install --upgrade pip && \
+    pip install "torch==2.12.0+cpu" \
+      --index-url https://download.pytorch.org/whl/cpu \
+      --extra-index-url https://pypi.org/simple
+
+# 2) project (base deps) + the ML stack + the PINNED livekit-agents 1.5.15 voice stack (exact parity
+#    with the local grounded env so plugin/agent APIs can't skew). torch is already satisfied.
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install . \
+      "sentence-transformers==5.5.1" "transformers==5.9.0" \
+      "livekit-agents==1.5.15" \
+      "livekit-plugins-elevenlabs==1.5.15" \
+      "livekit-plugins-silero==1.5.15" \
+      "livekit-plugins-openai==1.5.15" \
+      "livekit==1.1.8" "livekit-api==1.1.0"
+
+# 3) bake the BGE embedder into the HF cache (grounding) so the brain's live retrieve hook is instant.
+RUN HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 \
+    python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')"
+
+# 4) bake the Silero VAD model so the first call doesn't stall on a cold download (resilient: if the
+#    download API shifts, Silero still fetches at runtime since the worker is online).
+RUN python -c "from livekit.plugins import silero; silero.VAD.load()" || echo "silero prebake skipped (will fetch at runtime)"
+
+EXPOSE 0
+# livekit-agents production worker: reads LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET from env,
+# registers with LiveKit Cloud, and waits for dispatch. No HTTP port is served.
+CMD ["python", "-m", "src.voice.worker", "start"]
