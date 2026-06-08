@@ -85,20 +85,6 @@
 - **Acceptance:** the QA9-ops bug list re-checked item-by-item by a playwright script; leak sweep extended with the belief-panel surface.
 - **Refs:** QA9-ops bugs #2–#8, #10.
 
-### CB-76 — Listening v2: disjunctive/plural windows, more deadline forms, never-deny, contact ack
-- **Type / Surface / Size:** bug · `core` (`dst`, `nlg`) · M
-- **Current (QA9-chat CRITICAL):** "Wednesdays or Fridays after 4" (plural, disjunctive) never fills callback_window → asked "did I already tell you when works for me?" the agent CONFIDENTLY DENIED: "No, you haven't shared any times yet" (the final confirm later got it right from raw history — the slot was empty, the info wasn't). "state testing is end of the month" deadline form not extracted and never acknowledged. Name+phone accepted with zero acknowledgment (inconsistent with the Karen replay's echo).
-- **Desired:** (a) extractor covers plural/disjunctive day windows ("Wednesdays or Fridays after 4", capture the whole phrase) + deadline forms ("end of the month", "next month", "this semester"); (b) HARD NLG RULE: never assert the caller did NOT previously say something — when asked "did I tell you X", confirm from the visible history or hedge ("let me confirm: …?"), never deny; (c) contact details (name/phone/email) get a one-line acknowledgment when captured.
-- **Acceptance:** deterministic tests for each extraction form + the deny scenario (canned LLM); scripted replay of QA9 conv-2 shows ack at msg 1, no denial at msg 5, deadline acknowledged.
-- **Refs:** QA9-chat bugs #1, #2, #4; builds on CB-61.
-
-### CB-77 — Price persistence: terse re-asks must trigger the answer, range must carry numbers
-- **Type / Surface / Size:** bug · `core` (`gates` recurrence, `nlg`) · S–M
-- **Current (QA9-chat HIGH):** ask 1 got "a few hundred dollars a month" (no floor/ceiling); asks 2–3 ("just give me the number", "monthly cost. just the number.") got qualification/consult pivots — the terse re-asks share too few content words with ask 1 for `_question_recurs`, so CB-48's forcing never fired. Karen's replay (verbose asks) worked.
-- **Desired:** price-recurrence detection keys on price intent (price_inquiry act repetition / price tokens), not just shared content words; a direct price answer always carries the KB-grounded floor–ceiling (e.g. "$40–80/hr" or the monthly range), not "a few hundred".
-- **Acceptance:** deterministic test: three terse re-asks → second ask at latest is answer_via_kb with pricing facts in prompt; eval-judge directness axis on the skeptic persona improves.
-- **Refs:** QA9-chat bugs #3, #6; builds on CB-48/CB-62.
-
 ### CB-78 — First-message cold start (~10s to first token) + mid-stream double-send queueing
 - **Type / Surface / Size:** bug · `api`/`web` (demo) · S–M
 - **Current (QA9-chat MEDIUM/INFO):** a session's first message showed 16ms-to-indicator but 10.0s-to-first-text (later turns 9–13ms-to-first-text scale); suspects: first-turn lazy load (KB retrieve / route compile / OpenRouter connection warmup) — diagnose, don't guess. Mid-stream, a second Send was accepted and queued server-side (no client block) — no corruption, but the queue door is open.
@@ -184,6 +170,23 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-76 — Listening v2: disjunctive/plural windows, deadline forms, never-deny, contact ack
+- **Type / Surface / Size:** bug · `core` (`dst`, `nlg`) · M
+- **Completed:** 2026-06-08 (2 rounds + adversarial verifier)
+- **Files changed (actual):** `src/core/dst.py` (plural/disjunctive `_CALLBACK_WINDOW_RE` + `_normalize_plural_day`; plural branch GATED on `_SCHEDULING_CUES_RE` so venting/past-habit days don't lock — round-2 blocking fix; `_DEADLINE_CONTEXT_RE` widened with past-tense activity words; `_TIMELINE_RE` "end of the month/semester", "before finals", etc.; `_MEMORY_CHECK_RE` requiring a recall referent; contact name/phone/email detection → `contact_just_captured`), `src/core/nlg.py` (`_NEVER_DENY_NOTE`, `_CONTACT_ACK_NOTE`), `tests/unit/test_cb76_cb77.py` (65) + `tests/unit/test_cb7677_adversarial.py` (22).
+- **What changed:** the CRITICAL gaslighting bug fixed at BOTH layers — extraction now captures "Wednesdays or Fridays after 4"; and even when extraction misses, NLG is forbidden to deny the caller said something (hedges honestly instead — verified it does NOT force a false claim of having info it lacks). Deadlines extracted + acknowledged; captured contact gets a one-line ack on any act. Round-1 over-triggered the plural-day extractor (would fabricate "I have Friday noted" from "Fridays are crazy") — caught by the verifier, fixed with the scheduling-cue gate.
+- **Verification:** 87 item+adversarial tests; invariant set 167; full suites 946p/5s (.venv) + 960p (system); genuine disjunctive/singular cases regression-checked.
+- **Constraints checked:** R37; no LiveKit in src/core; never-deny vs honest-lacking tension resolved correctly.
+- **Follow-ups / known gaps:** real-model echo/ack/hedge phrasing → paid replay (QA round 3).
+
+### CB-77 — Price persistence: terse re-asks trigger the answer; range carries numbers
+- **Type / Surface / Size:** bug · `core` (`gates`, `nlg`) · S–M
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `src/core/gates.py` (`_TERSE_PRICE_REASK_RE` + `_has_prior_price_inquiry`; `_question_recurs` short-circuits true on an intent-keyed terse price re-ask — no content-word overlap needed — feeding the existing `address_direct_input`→`answer_via_kb` path), `src/core/nlg.py` (`_BUDGET_CONCERN_NOTE` demands the KB floor–ceiling range, forbids "a few hundred" when facts carry numbers).
+- **What changed:** terse re-asks ("just give me the number") after a prior price inquiry now force the KB-grounded answer (the verbose Karen asks already worked; the terse skeptic-dad asks didn't). Grounding guard (CB-53) stays the enforcement — no figures in instructions.
+- **Verification:** 18 tests; terse-non-price re-ask confirmed NOT hijacked (verifier); suites green as above.
+- **Follow-ups / known gaps:** real-model compliance with the explicit range → paid replay.
 
 ### CB-75 — Operate polish round 2 (label dup, hint→affordance, counts, sort, leaks)
 - **Type / Surface / Size:** bug · `web` (operate) · M

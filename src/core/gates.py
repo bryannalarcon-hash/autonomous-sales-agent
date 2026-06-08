@@ -2,6 +2,11 @@
 # each takes a PROPOSED Decision (from src/core/policy.py), the belief, and the AgentConfig, and
 # returns the ALLOWED/OVERRIDDEN Decision — gates have FINAL say over the LLM proposal (neuro-
 # symbolic: LLM proposes, gates decide). apply_gates() chains them in priority order.
+# CB-77 (e): _question_recurs extended with PRICE-INTENT RECURRENCE — terse price re-asks
+# ("just give me the number", "monthly cost. just the number.") share too few content words to hit
+# the existing overlap threshold. A thin price_inquiry turn after a prior price_inquiry now counts
+# as recurrent (keyed on intent, not just word overlap) via _TERSE_PRICE_REASK_RE +
+# _has_prior_price_inquiry, so address_direct_input forces answer_via_kb on the second price ask.
 #   de_escalate         — CB-37: hostility (belief.meta["hostility"]) or EXTREME bail
 #                         (>= extreme_bail_deescalate) -> escalate (graceful hand-off/exit); runs FIRST
 #                         so nothing downstream can re-introduce a pitch/close/re-ask on a hostile call.
@@ -532,18 +537,67 @@ def _content_words(text: Optional[str]) -> set[str]:
     return {w for w in words if w not in _RECUR_STOPWORDS and len(w) > 1}
 
 
-def _question_recurs(belief: BeliefState, history: Optional[Sequence[Any]]) -> bool:
-    """True when the prospect's CURRENT open_question substantially repeats one they asked EARLIER in
-    the call (CB-48). This is the "Marcus asked 4x and got evaded" signal: the same challenge re-asked
-    after an answer attempt. We compare CONTENT-word overlap (stop-words stripped) between the current
-    open_question and each PRIOR user turn; >=2 shared content words (or a near-total overlap of a
-    short question) counts as a recurrence. Conservative: a brand-new question won't match, so the
-    reactive-loop escape still fires for genuinely new questions."""
+# CB-77 (e): terse price re-ask patterns. "just give me the number", "monthly cost. just the number."
+# share too few content words with earlier price asks for the content-word overlap check to fire.
+# We detect them via a short terse-price regex and treat them as price_inquiry recurrences when
+# there was already a prior price_inquiry turn in history.
+_TERSE_PRICE_REASK_RE = re.compile(
+    r"\b(?:"
+    r"just\s+(?:give\s+me\s+the\s+(?:number|price|cost|amount|figure|range)|tell\s+me\s+the\s+(?:number|price|cost))|"
+    r"(?:the\s+)?(?:monthly|hourly|weekly|per.session)?\s*(?:cost|price|number|figure|rate|amount)\.?\s*just\s+the\s+(?:number|price|cost|figure|amount)|"
+    r"(?:just|only|simply)\s+(?:the\s+)?(?:number|price|cost|figure|amount|rate)"
+    r")\b",
+    re.I,
+)
+
+
+def _has_prior_price_inquiry(history: Optional[Sequence[Any]]) -> bool:
+    """True when a prior USER turn in history was classified as a price_inquiry (act recorded on the
+    turn dict) OR matches _PRICE_INQUIRY_RE text — indicates a price question was already asked."""
     if not history:
         return False
+    from src.core.dst import _PRICE_INQUIRY_RE  # import here to avoid circular dep at module load
+    user_turns = [t for t in history if isinstance(t, dict) and t.get("role") == "user"]
+    # Skip the last user turn (the current one); examine all earlier ones.
+    for turn in user_turns[:-1] if user_turns else []:
+        if turn.get("act") == "price_inquiry":
+            return True
+        text = turn.get("text", turn.get("content", ""))
+        if _PRICE_INQUIRY_RE.search(str(text or "")):
+            return True
+    return False
+
+
+def _question_recurs(belief: BeliefState, history: Optional[Sequence[Any]]) -> bool:
+    """True when the prospect's CURRENT open_question substantially repeats one they asked EARLIER in
+    the call (CB-48 + CB-77e extension). The "Marcus asked 4x and got evaded" signal: the same
+    challenge re-asked after an answer attempt. We compare CONTENT-word overlap (stop-words stripped)
+    between the current open_question and each PRIOR user turn; >=2 shared content words (or a
+    near-total overlap of a short question) counts as a recurrence. Conservative: a brand-new
+    question won't match, so the reactive-loop escape still fires for genuinely new questions.
+
+    CB-77 (e): PRICE-INTENT RECURRENCE EXTENSION — terse price re-asks ("just give me the number",
+    "monthly cost. just the number.") share too few content words to hit the overlap threshold, yet
+    they ARE price_inquiry recurrences. When the current act is price_inquiry AND there is a prior
+    price_inquiry turn in history, the terse-price-reask pattern OR a thin content overlap (≥1 word
+    instead of ≥2) is sufficient to count as recurrent — keying on INTENT, not just word overlap."""
+    if not history:
+        return False
+    current_is_price = (
+        getattr(belief, "last_user_act", None) == "price_inquiry"
+    )
+    # CB-77 (e): terse price re-ask: matches the explicit terse pattern AND there was a prior price ask.
+    if current_is_price and _TERSE_PRICE_REASK_RE.search(
+        str(getattr(belief, "open_question", "") or "")
+    ) and _has_prior_price_inquiry(history):
+        return True
     current = _content_words(getattr(belief, "open_question", None))
     if len(current) < 2:
-        return False  # too thin to judge recurrence reliably; treat as new (don't trap the agent)
+        # CB-77 (e): for a price_inquiry with a thin question (< 2 content words), still flag
+        # recurrence when there is a prior price_inquiry — intent-keyed, not word-overlap-keyed.
+        if current_is_price and _has_prior_price_inquiry(history):
+            return True
+        return False  # too thin for non-price intents; treat as new (don't trap the agent)
     # Look at PRIOR user turns only (skip the latest, which mirrors the current open_question).
     user_turns = [t for t in history if isinstance(t, dict) and t.get("role") == "user"]
     for turn in user_turns[:-1] if user_turns else []:

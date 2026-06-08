@@ -43,6 +43,23 @@
 #     an agent-directed confirmation request).
 #   - Defect 4: _extract_callback_window applies _CALLBACK_HEDGE_RE to soften hedged windows below
 #     the lock threshold (0.7 < 0.8) so "maybe Thursday could work?" stays re-confirmable.
+# CB-76 — listening v2:
+#   - (a) _extract_callback_window now captures PLURAL + DISJUNCTIVE day windows:
+#     "Wednesdays or Fridays after 4 work best for us" → callback_window with whole phrase as value;
+#     plural day names are normalised (Wednesdays→wednesday) before storage; the disjunction is kept
+#     in the stored string; confidence at 0.9 (firmly volunteered); hedged forms still soften (existing
+#     _CALLBACK_HEDGE_RE). The CB-67 deadline/context guard ("she has tutoring Thursdays") still blocks.
+#   - (b) _TIMELINE_RE coverage extended: "end of the month", "end of month", "by the end of the
+#     month", "next month", "this semester", "before finals" now fill the timeline slot.
+#   - (c) NEVER-DENY RULE: _classify_intent now detects the 'memory_check' intent shape — a question
+#     asking whether the caller already told us something ("did I already tell you when works?"). This
+#     routes as last_user_act='memory_check' so NLG's _NEVER_DENY_NOTE instruction forbids asserting
+#     the caller did NOT say something; if the slot is present in KNOWN_SO_FAR, echo it; if absent,
+#     hedge honestly ("I may have missed it — when works best?"). Both layers are safe: extraction
+#     catches the value; even when extraction misses, the NLG deny is forbidden.
+#   - (d) Contact acknowledgment: when a turn captures name/phone/email the meta flag
+#     'contact_just_captured' is set TRUE; the NLG _CONTACT_ACK_NOTE instruction then requires a
+#     one-clause ack on ANY act ("Got it, Dana — I'll use this number.") so it rides every act.
 from __future__ import annotations
 
 import os
@@ -171,8 +188,14 @@ _BUDGET_CONTEXT_RE = re.compile(r"\b(budget|afford|spend|pay|cost|price)\b|\$", 
 # was "big test in about three weeks" which the original regex silently dropped.  A hedge word
 # ("about", "roughly", "approximately", "around") before the count drops confidence from 0.85 to
 # 0.7 so the slot stays SOFT and can be confirmed, but it is at least captured (not dropped silently).
+# CB-76 (b): extended to cover "end of the month", "end of month", "by the end of the month",
+# "next month", "this semester", "before finals" — all common deadline forms that were silently dropped.
 _TIMELINE_RE = re.compile(
     r"\b(?:by\s+)?("
+    r"end\s+of\s+(?:the\s+)?month|"
+    r"end\s+of\s+(?:the\s+)?(?:week|semester|term|year|quarter)|"
+    r"this\s+(?:semester|term|month|week|year|quarter)|"
+    r"before\s+(?:finals?|midterms?|exams?|testing|the\s+test|the\s+exam)|"
     r"next\s+(?:week|month|year|spring|fall|summer|semester|term)|"
     r"in\s+(?:about|roughly|approximately|around|just\s+(?:over|under))?\s*\d+\s+(?:weeks?|months?)|"
     r"in\s+(?:about|roughly|approximately|around)?\s*"
@@ -193,8 +216,20 @@ _TIMELINE_HEDGE_RE = re.compile(
 # "Monday morning works for me"). Captured as callback_window so skip_known/no_repeat_discovery can
 # protect it from re-asking, and so NLG can echo it on a confirm-request turn.
 # Tight: requires a named day or a time expression + a scheduling cue to avoid false positives.
+# CB-76 (a): _DAY_NAMES now also matches plural day names (Wednesdays, Fridays) and DISJUNCTIVE
+# multi-day offers ("Wednesdays or Fridays after 4"). The full disjunction is captured via
+# _CALLBACK_DISJUNCTION_RE and preserved in the stored value; plural→singular is normalized.
 _DAY_NAMES = (
     r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"mon|tue|wed|thu|fri|sat|sun)"
+)
+# CB-76 (a): plural day name, e.g. "Wednesdays", "Fridays". Normalised to singular on storage.
+_DAY_NAMES_PLURAL = (
+    r"(?:mondays|tuesdays|wednesdays|thursdays|fridays|saturdays|sundays)"
+)
+# CB-76 (a): a single day name OR a plural day name (covers Wednesdays, Fridays, etc.)
+_DAY_NAMES_ANY = (
+    r"(?:mondays?|tuesdays?|wednesdays?|thursdays?|fridays?|saturdays?|sundays?|"
     r"mon|tue|wed|thu|fri|sat|sun)"
 )
 _TIME_OF_DAY = (
@@ -203,10 +238,29 @@ _TIME_OF_DAY = (
     r"(?:morning|afternoon|evening|night|noon)"
     r")"
 )
+# CB-76 (a): a DISJUNCTIVE multi-day availability offer —
+# "Wednesdays or Fridays after 4", "Tuesday or Thursday mornings".
+# Captures the whole phrase so the stored value is the complete availability statement.
+_CALLBACK_DISJUNCTION_RE = re.compile(
+    r"\b("
+    + _DAY_NAMES_ANY
+    + r"(?:\s*(?:morning|afternoon|evening|night|noon))?"
+    + r"(?:\s+(?:after|before|around|at|by)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm))?"
+    + r"\s+or\s+"
+    + _DAY_NAMES_ANY
+    + r"(?:\s*(?:morning|afternoon|evening|night|noon))?"
+    + r"(?:\s+(?:after|before|around|at|by)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm))?)"
+    + r"(?:\s+(?:after|before|around|at|by)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm))?"
+    r"\b",
+    re.I,
+)
 # A day name (with optional time) OR a bare "after/before <time>" with no day (lower confidence).
 _CALLBACK_WINDOW_RE = re.compile(
-    # Full: a named day, optionally followed by time qualifiers.
-    r"\b(" + _DAY_NAMES + r"(?:\s*(?:morning|afternoon|evening|night|noon))?"
+    # CB-76 (a): plural day name match (e.g. "Thursdays", "Wednesdays") — normalised on storage.
+    r"\b(" + _DAY_NAMES_PLURAL + r"(?:\s*(?:morning|afternoon|evening|night|noon))?"
+    r"(?:\s+(?:after|before|around|at)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm))?)\b"
+    # Full singular: a named day, optionally followed by time qualifiers.
+    r"|\b(" + _DAY_NAMES + r"(?:\s*(?:morning|afternoon|evening|night|noon))?"
     r"(?:\s+(?:after|before|around|at)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm))?)\b"
     r"|\b(" + _TIME_OF_DAY + r")\b",
     re.I,
@@ -223,9 +277,18 @@ _SCHEDULING_CUES_RE = re.compile(
 # "the exam is Thursday morning" must NOT become callback_window. Named-day branch requires a
 # scheduling-intent cue OR the absence of deadline context; deadline context wins (blocks the
 # named-day branch even when a scheduling cue is present in the same utterance).
+# CB-76 (a): added "tutoring" to the context block — "she has tutoring Thursdays" is an EXISTING
+# commitment, not a callback offer, so "Thursdays" there must not extract as callback_window.
+# CB-76 round-2 (defense in depth): added PAST-TENSE activity words — "tutored"/"tried"/"used to"/
+# "back in" mark a past habit or failed attempt, not a forward availability offer. "I tutored on
+# Mondays back in college" and "we tried Wednesdays before" must NOT extract a callback window.
+# (The plural-day scheduling-cue gate in _extract_callback_window is the primary guard; these
+# words add a second, independent block so a future plural form with a stray cue still can't slip.)
 _DEADLINE_CONTEXT_RE = re.compile(
     r"\b(test|exam|quiz|due|deadline|assignment|homework|midterm|finals?|"
-    r"presentation|project\s+due|appointment\s+for|school|class)\b",
+    r"presentation|project\s+due|appointment\s+for|school|class(?:es)?|"
+    r"tutor(?:ing|ed|s)?|lesson[s]?|practice[ds]?|"
+    r"tried|used\s+to|back\s+in)\b",
     re.I,
 )
 # CB-61 adversarial fix (Defect 4): hedge words that soften a callback_window extraction below the
@@ -368,6 +431,20 @@ def _extract_timeline(text: str) -> Optional[tuple[Any, float]]:
     return None
 
 
+def _normalize_plural_day(text: str) -> str:
+    """Normalise plural day names to their singular form for slot storage.
+
+    Strips the trailing 's' only on exact plural day-name tokens so "Wednesdays" → "wednesday"
+    and "Fridays" → "friday", while not touching arbitrary trailing 's' on other words."""
+    _PLURAL_TO_SINGULAR = {
+        "mondays": "monday", "tuesdays": "tuesday", "wednesdays": "wednesday",
+        "thursdays": "thursday", "fridays": "friday", "saturdays": "saturday",
+        "sundays": "sunday",
+    }
+    words = text.lower().split()
+    return " ".join(_PLURAL_TO_SINGULAR.get(w, w) for w in words)
+
+
 def _extract_callback_window(text: str) -> Optional[tuple[Any, float]]:
     """Extract a proposed callback day/time into the callback_window slot (CB-61 new slot).
 
@@ -382,24 +459,57 @@ def _extract_callback_window(text: str) -> Optional[tuple[Any, float]]:
 
     CB-61 adversarial fix (Defect 4): hedge words ("maybe Thursday could work?", "perhaps Friday")
     lower the confidence to 0.7 — below the 0.8 lock threshold — so a tentative window stays SOFT
-    and can be re-confirmed, mirroring the timeline hedge discipline."""
+    and can be re-confirmed, mirroring the timeline hedge discipline.
+
+    CB-76 (a): the DISJUNCTION branch fires FIRST — "Wednesdays or Fridays after 4" is captured as
+    the whole phrase at confidence 0.9 (a firmly volunteered availability statement). Plural day
+    names are normalised to singular before storage. The deadline/context guard still blocks forms
+    like "she has tutoring Thursdays" (tutoring added to _DEADLINE_CONTEXT_RE).
+
+    CB-76 round-2 (BLOCKING fix — plural-day over-trigger): a BARE plural day with NO scheduling
+    intent is venting / a past habit, NOT a forward availability offer ("Fridays are always crazy
+    for us", "we tried Wednesdays before", "I tutored on Mondays back in college"). The plural-day
+    branch therefore now ALSO requires a _SCHEDULING_CUES_RE hit (work(s) for me / call / available
+    / ...), mirroring the bare-time-of-day branch's existing cue gate. The SINGULAR-day branch keeps
+    its CB-61 behaviour (a singular "Thursday after 3pm" is specific enough on its own), and the
+    DISJUNCTION branch keeps firing without a cue word ("Wednesdays or Fridays after 4") because the
+    two-day disjunction is itself the availability signal."""
     text_norm = _normalize_punct(text or "")
+
+    # CB-76 (a): check for a disjunctive multi-day offer FIRST — it is the most specific shape and
+    # must win over the single-day branch that would only capture the first day of the pair. The
+    # two-day disjunction is itself the scheduling signal, so it needs no extra cue word.
+    disj = _CALLBACK_DISJUNCTION_RE.search(text_norm)
+    if disj:
+        # Deadline/context guard: "she has tutoring Thursdays or Fridays" is an existing schedule,
+        # not an availability offer. Block on deadline context the same as the single-day branch.
+        if not _DEADLINE_CONTEXT_RE.search(text_norm):
+            value = _normalize_plural_day(disj.group(1).strip())
+            conf = 0.7 if _CALLBACK_HEDGE_RE.search(text_norm) else 0.9
+            return value, conf
+
     m = _CALLBACK_WINDOW_RE.search(text_norm)
     if not m:
         return None
-    day_match = m.group(1)  # named-day branch
-    time_match = m.group(2)  # bare time-of-day branch
-    if day_match:
-        # CB-61 adversarial (Defect 1): if deadline-context words are present, the day is an
-        # academic deadline (test/exam/quiz), NOT a proposed callback window — return None.
+    plural_day_match = m.group(1)   # plural day name branch (CB-76a)
+    day_match = m.group(2)          # singular named-day branch
+    time_match = m.group(3)         # bare time-of-day branch
+    if plural_day_match or day_match:
+        matched = plural_day_match or day_match
+        # CB-61 adversarial (Defect 1) + CB-76 (a): if deadline-context words are present, the
+        # day is an academic/existing schedule, NOT a proposed callback window — return None.
         if _DEADLINE_CONTEXT_RE.search(text_norm):
             return None
-        # The named-day branch also requires either a scheduling cue OR the absence of
-        # any conflicting context (i.e. is a genuine scheduling statement). We accept the
-        # named-day if no deadline context blocks it (checked above).
+        # CB-76 round-2 (BLOCKING fix): a bare PLURAL day must carry scheduling intent to count as
+        # an offer. Without a _SCHEDULING_CUES_RE hit it's venting / a past habit, not availability
+        # ("Fridays are always crazy", "we tried Wednesdays before") — do NOT fabricate a window.
+        # The singular branch is exempt (CB-61: a single specific day is offer enough).
+        if plural_day_match and not _SCHEDULING_CUES_RE.search(text_norm):
+            return None
         # CB-61 adversarial (Defect 4): hedge softening — a tentative window must stay below lock.
         conf = 0.7 if _CALLBACK_HEDGE_RE.search(text_norm) else 0.9
-        return day_match.lower().strip(), conf
+        value = _normalize_plural_day(matched.strip())
+        return value, conf
     # Bare time-of-day: only capture when a scheduling cue is nearby (avoids false positives).
     if time_match and _SCHEDULING_CUES_RE.search(text_norm):
         conf = 0.7 if _CALLBACK_HEDGE_RE.search(text_norm) else 0.75
@@ -505,6 +615,47 @@ _HUMAN_REQUEST_RE = re.compile(
 # A question at all: a trailing '?' or a leading interrogative/request-to-explain.
 _QUESTION_RE = re.compile(r"\?|\b(what|how|when|where|why|who|which|can you|could you|do you|are there|is there|tell me about)\b", re.I)
 
+# CB-76 (c): NEVER-DENY RULE — the caller asking whether they already told us something. The agent
+# must NEVER assert the caller did NOT say something in response to this intent. Detection shape:
+# "did I already tell you [X]?" / "have I told you [X]?" / "did I mention [X]?" / "do you have [X]?"
+# broad enough to catch paraphrases; the NLG instruction is the enforcement layer.
+# CB-76 round-2 (NON-BLOCKING tightening): the "(did|have) I tell/mention/say..." form now requires
+# a RECALL REFERENT within ~40 chars after the verb — an "already" marker, a scheduling/time word
+# (when / what time), or a slot referent ("my number/availability/budget/..."). This keeps the
+# genuine recall questions ("did I already tell you when works for me?", "have I mentioned what time
+# works?") while NO LONGER firing on a rhetorical SHARE ("did I tell you my son hates math?") that
+# carries no recall referent — so the never-deny note doesn't inject on a pure rhetorical share.
+_RECALL_REFERENT = (
+    r"(?:already|when|what\s+time|what\s+times?|time\s+works?|"
+    r"my\s+(?:number|phone|email|availabilit\w*|schedule|budget|grade|name|time|preference)|"
+    r"availabilit\w*|good\s+(?:time|for))"
+)
+_MEMORY_CHECK_RE = re.compile(
+    r"\b(?:"
+    r"(?:did|have)\s+i\s+(?:already\s+)?(?:tell|told|mention|mentioned|say|said|give|gave|share|shared|"
+    r"let\s+you\s+know)\b(?=.{0,40}?" + _RECALL_REFERENT + r")|"
+    r"did\s+you\s+(?:get|catch|hear|note|write\s+down)\b.{0,30}?\bfrom\s+me\b|"
+    r"do\s+you\s+(?:have|know|remember)\b.{0,30}?\b(?:already|from\s+(?:me|what\s+i\s+said))\b|"
+    r"you\s+(?:already\s+)?(?:have|know|got)\b.{0,25}?\b(?:that|it|this|my\s+\w+)\b|"
+    r"i\s+(?:already|just|previously)\s+(?:told|mentioned|said|gave|shared)\b"
+    r")",
+    re.I,
+)
+# Contact fields that, when captured, should trigger a one-line acknowledgment on the next reply.
+# These are the raw-text cues for whether a turn delivers contact info. The actual extraction of
+# name/phone/email lives in the demo/voice flow (not DST), so we detect here via simple heuristics
+# that fire on the same turns without re-implementing full contact extraction.
+_CONTACT_PHONE_RE = re.compile(
+    r"\b(?:\d{3}[\s\-\.]\d{3}[\s\-\.]\d{4}|\d{10}|\(\d{3}\)\s*\d{3}[\s\-\.]\d{4})\b"
+)
+_CONTACT_EMAIL_RE = re.compile(r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b")
+# A name introduction ("my name is X", "I'm X", "this is X", "call me X").
+_CONTACT_NAME_RE = re.compile(
+    r"\b(?:my\s+name\s+is|i'?m\s+(?!asking|calling\s+for|calling\s+about|trying|looking)|"
+    r"this\s+is|call\s+me|it'?s\s+)\s*([A-Z][a-z]{1,20})",
+    re.I,
+)
+
 # CB-37: profanity / abuse / hostility markers. A hostile or abusive turn (or extreme bail) must
 # DE-ESCALATE — never pitch or re-ask. Deliberately broad on directed profanity + frustration markers;
 # the agent reacts to TONE, not just literal slurs. Used to set belief.meta["hostility"] = True.
@@ -608,7 +759,13 @@ def _classify_intent(utterance: str) -> tuple[Optional[str], Optional[str], Opti
     asking the agent to confirm a fact they already stated, typically the callback time ("please
     confirm they'll call Thursday after 3pm"). This routes through skip_known -> confirm_known so
     the NLG path echoes the stated time instead of replying vaguely. The confirm verb ("please
-    confirm / verify / double-check") must be present; a general question is NOT a confirm_request."""
+    confirm / verify / double-check") must be present; a general question is NOT a confirm_request.
+
+    CB-76 (c): detect 'memory_check' — the caller asking whether they already told us something
+    ("did I already tell you when works for me?", "have I mentioned what time I prefer?"). The
+    agent MUST NOT assert they did not — this is the NEVER-DENY shape. Routes as 'memory_check'
+    so the NLG _NEVER_DENY_NOTE instruction can enforce the rule; if the slot is in KNOWN_SO_FAR,
+    confirm it; if absent, hedge ("I may have missed it — when works best?"), never deny."""
     text = _normalize_punct((utterance or "").strip())
     if not text:
         return None, None, None
@@ -621,6 +778,13 @@ def _classify_intent(utterance: str) -> tuple[Optional[str], Optional[str], Opti
     # CB-61: explicit confirm/verify request — routes to confirm_known so the time is echoed.
     if _CONFIRM_REQUEST_RE.search(text):
         return "confirm_request", None, text[:300]
+
+    # CB-76 (c): memory-check — caller asking if they already told us something. Routes as
+    # 'memory_check' so the NLG never-deny rule applies. Checked AFTER confirm_request (an
+    # explicit "please confirm" is more specific) but BEFORE generic question classification so
+    # the NLG guard triggers; treat the text as an open_question so NLG can reference it.
+    if _MEMORY_CHECK_RE.search(text):
+        return "memory_check", None, text[:300]
 
     objection: Optional[str] = None
     for pat, key in _OBJECTION_PATTERNS:
@@ -1017,6 +1181,27 @@ async def update(
             if pending not in dl:
                 dl.append(pending)
             updated.meta["declined_slots"] = dl
+
+    # CB-76 (d): contact acknowledgment — when a turn delivers name/phone/email, set the
+    # 'contact_just_captured' flag TRUE so NLG's _CONTACT_ACK_NOTE instruction fires on the NEXT
+    # reply (ANY act), producing a one-clause ack ("Got it, Dana — I'll use this number."). The flag
+    # is ONE-SHOT: it fires on the turn after capture and resets, so the ack is never repeated.
+    # Detection is deterministic via heuristics (phone number pattern, email pattern, name intro) —
+    # the full contact extraction lives in the demo/voice flow; this is the DST-side signal.
+    contact_captured = bool(
+        _CONTACT_PHONE_RE.search(norm)
+        or _CONTACT_EMAIL_RE.search(norm)
+        or _CONTACT_NAME_RE.search(norm)
+    )
+    if contact_captured:
+        updated.meta["contact_just_captured"] = True
+        # Try to extract the name for the ack ("Got it, Dana") from the name-intro pattern.
+        nm = _CONTACT_NAME_RE.search(norm)
+        if nm:
+            updated.meta["contact_name"] = nm.group(1).capitalize()
+    else:
+        # Clear the one-shot flag so the ack fires ONLY on the turn after the capture turn.
+        updated.meta["contact_just_captured"] = False
 
     # Advance the EFSM stage from the (now-updated) belief so the policy knows WHERE the call is
     # (greeting -> discovery -> pitch -> close / objection) instead of being stuck at 'greeting'.

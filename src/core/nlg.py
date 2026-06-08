@@ -47,6 +47,16 @@
 # the streaming path flags decision.meta["repetition"] for observability only (can't un-speak a
 # token). Deterministic: the >8-word threshold is a hard count, not an LLM judgment. Shares
 # _CONTENT_WORD_RE so the definition of "content word" is the same as gates.py's CB-48 logic.
+# CB-76 (c) NEVER-DENY RULE: when last_user_act == 'memory_check' (caller asks "did I already tell
+# you X?"), _NEVER_DENY_NOTE is injected: the agent MUST NOT assert the caller did not say something.
+# If the slot is in KNOWN_SO_FAR, echo it; if absent, hedge honestly ("I may have missed it — when
+# works best?"). Two-layer safety: DST extraction captures the value when possible; even when it
+# missed, the deny is unconditionally forbidden by this instruction.
+# CB-76 (d) CONTACT ACK: when belief.meta['contact_just_captured'] is True, _CONTACT_ACK_NOTE is
+# injected so the reply opens with a one-clause acknowledgment ("Got it, Dana — I'll use this
+# number.") regardless of the gated act. The DST sets this flag one-shot (cleared on the next turn).
+# CB-77 (f): _BUDGET_CONCERN_NOTE is STRENGTHENED to demand the floor–ceiling numeric range from the
+# FACTS BLOCK when available. "a few hundred" is no longer acceptable when the facts carry "$X–$Y".
 from __future__ import annotations
 
 import re
@@ -232,18 +242,50 @@ _NO_RESTATE_INSTRUCTION = (
 # then (3) bridge to the exact-quote callback. The instruction carries no price figure itself — that
 # grounding constraint from CB-53 is inviolable. Both realize() and realize_stream() share it because
 # they both build from _build_messages().
+# CB-77 (f): STRENGTHENED — the model must extract and state the numeric floor–ceiling from the FACTS
+# BLOCK when one is present (e.g. "$40–80/hr" or "$300–600/month"). "a few hundred" is explicitly
+# forbidden when facts carry real numbers. The CB-53 grounding guard still prevents inventing figures.
 _BUDGET_CONCERN_NOTE = (
     "PRICE QUESTION POLICY (do not break): the prospect asked directly about cost. "
     "Step 1 — acknowledge any stated budget concern with genuine empathy FIRST (e.g. if they said "
     "'tight budget', say so explicitly: 'That makes sense — budget is a real consideration here'); "
     "NEVER reply with a chipper opener like 'Perfect!' or 'Great!' after someone mentions financial "
     "constraints. "
-    "Step 2 — give the honest KB-grounded ballpark range from the facts provided below (the range "
-    "figure MUST come from those facts, not invented); frame it as 'most families land around X "
-    "depending on the plan and goals — not a fixed price'. "
+    "Step 2 — give the SPECIFIC KB-grounded floor–ceiling range from the facts provided below "
+    "(e.g. '$40–80 per hour' or '$300–$600 per month' — use the EXACT numbers from the facts); "
+    "do NOT use vague language like 'a few hundred' or 'it varies' when the facts carry real numbers; "
+    "frame it as 'most families land around $X–$Y depending on the plan and goals'. "
     "Step 3 — offer the free consultation as the place to get an exact personalized quote. "
-    "If the facts do not include a price range, say plainly that price varies and the exact quote "
+    "If the facts do NOT include a price range, say plainly that price varies and the exact quote "
     "comes from the free consultation — do NOT invent a number."
+)
+
+# CB-76 (c) NEVER-DENY RULE: injected when last_user_act == 'memory_check'. The agent must NEVER
+# assert the caller did not say something. If the relevant slot is in KNOWN_SO_FAR, echo it back
+# verbatim. If the slot is absent from KNOWN_SO_FAR, hedge honestly without denying ("I want to
+# make sure I have this right — when does work best?") — do NOT say "No, you haven't told me" or
+# any equivalent confident denial. This is the QA9 failure mode: slot was empty (the disjunctive
+# window was missed) AND the agent confidently denied the caller stated it.
+_NEVER_DENY_NOTE = (
+    "NEVER-DENY RULE (do not break): the caller is asking whether they already told you something. "
+    "You MUST NOT assert they did not say it. "
+    "If the slot or answer is in KNOWN_SO_FAR, confirm it: echo the value back ('Yes — you mentioned "
+    "Wednesdays or Fridays after 4; I've noted that.'). "
+    "If it is NOT in KNOWN_SO_FAR, hedge honestly without denying: "
+    "'Let me make sure I have that right — when works best for you?' "
+    "NEVER say 'No, you haven't told me' or 'You didn't share that' or any equivalent denial."
+)
+
+# CB-76 (d) CONTACT ACK: injected when belief.meta['contact_just_captured'] is True (the DST sets
+# this one-shot flag when the turn delivers name/phone/email). The reply MUST open with a short,
+# warm acknowledgment that names the person if known and references the contact info captured, then
+# proceeds with the decided act. This rides ANY act — confirm, answer, pitch, close — so the
+# acknowledgment is never skipped because the routing chose a non-confirm act.
+_CONTACT_ACK_NOTE = (
+    "CONTACT ACK (do not skip): the caller JUST gave their contact info (name, phone, or email). "
+    "Open your reply with a SHORT, warm acknowledgment — e.g. 'Got it{name_clause} — I've noted "
+    "that down.' (one short clause, not a full sentence). Then continue with your response. "
+    "Do NOT skip or defer this acknowledgment regardless of the decided act."
 )
 
 # CB-64 (repetition residual): stop-words stripped before comparing a new reply against own_last_lines
@@ -356,7 +398,13 @@ def _build_messages(
 
     CB-64: `repetition_retry=True` (the blocking-path regenerate after _near_verbatim_repetition()
     fired) prepends _REPETITION_RETRY_RULE so the second attempt genuinely advances instead of
-    re-pitching. Never used on the streaming path."""
+    re-pitching. Never used on the streaming path.
+
+    CB-76 (c): when last_user_act == 'memory_check', _NEVER_DENY_NOTE is injected — the agent must
+    never assert the caller did not say something; confirm from KNOWN_SO_FAR or hedge honestly.
+
+    CB-76 (d): when belief.meta['contact_just_captured'] is True, _CONTACT_ACK_NOTE is injected so
+    the reply opens with a warm one-clause contact acknowledgment, regardless of the gated act."""
     guidance = _ACT_GUIDANCE.get(decision.act, "Respond helpfully and warmly.")
     if decision.act == "attempt_close" and decision.tier in _TIER_GUIDANCE:
         guidance = f"{guidance} {_TIER_GUIDANCE[decision.tier]}"
@@ -395,6 +443,19 @@ def _build_messages(
     # can fire on the same turn without conflicting (grounding checks facts; repetition checks phrasing).
     repetition_block = _REPETITION_RETRY_RULE if repetition_retry else ""
 
+    # CB-76 (c): NEVER-DENY RULE — inject when the caller asked if they already told us something.
+    last_act = getattr(belief, "last_user_act", None)
+    never_deny_block = _NEVER_DENY_NOTE if last_act == "memory_check" else ""
+
+    # CB-76 (d): CONTACT ACK — inject when the DST flagged that this turn captured contact info.
+    contact_captured = bool((belief.meta or {}).get("contact_just_captured"))
+    if contact_captured:
+        contact_name = (belief.meta or {}).get("contact_name", "")
+        name_clause = f", {contact_name}" if contact_name else ""
+        contact_ack_block = _CONTACT_ACK_NOTE.replace("{name_clause}", name_clause)
+    else:
+        contact_ack_block = ""
+
     parts = [
         # CB-64: repetition retry instruction (only on the second attempt — empty string otherwise).
         repetition_block,
@@ -407,6 +468,10 @@ def _build_messages(
         f"ACTIVE_OBJECTION: {belief.active_objection}" if belief.active_objection else "",
         # CB-62: budget-concern ack instruction (only on a direct price question — empty otherwise).
         budget_concern_block,
+        # CB-76 (c): never-deny rule (only on a memory_check turn — empty otherwise).
+        never_deny_block,
+        # CB-76 (d): contact acknowledgment instruction (only when contact was just captured).
+        contact_ack_block,
         # CB-48: the agent's own prior lines + a no-restate instruction (only when there are lines, so
         # the opening turn's prompt is unchanged).
         own_block,
