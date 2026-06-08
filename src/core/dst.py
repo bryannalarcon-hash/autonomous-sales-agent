@@ -1308,6 +1308,23 @@ async def update(
             if open_question is None:
                 open_question = _norm_utt[:300]
 
+        # CB-92: LIVE-PATH confirm_request override — the SAME regex-only gap (audit after CB-89/91).
+        # CB-61's confirm-echo (an explicit "please confirm they'll call Thursday" → confirm_known →
+        # NLG echoes the booked time) keys on last_user_act=='confirm_request', which only the regex
+        # fallback sets — the live LLM never returns it, so the dedicated confirm-echo didn't fire live.
+        # Fix: after the LLM result, if _CONFIRM_REQUEST_RE matches (a tight, agent-directed confirm
+        # verb — NOT "confirm with my wife", which CB-61 r2 already excludes) and the LLM returned a
+        # weak intent, override to confirm_request. Gated to weak acts so a live objection/human_request
+        # is preserved (CB-61 r2's "live objection wins over confirm-routing" gate still applies after).
+        if (
+            classified_act in _MEMORY_CHECK_WEAK_ACTS
+            and objection is None
+            and _CONFIRM_REQUEST_RE.search(_norm_utt)
+        ):
+            classified_act = "confirm_request"
+            if open_question is None:
+                open_question = _norm_utt[:300]
+
         # CB-90 (a) round-2: LIVE-PATH guarantee/efficacy upgrade — SCOPED to a guarantee-of-outcome
         # DEMAND ONLY. The ONLY documented live-path failure is a guarantee demand ("Guarantee me a
         # B or it's free") the LLM mislabels as 'statement' so the objection is silently dropped.

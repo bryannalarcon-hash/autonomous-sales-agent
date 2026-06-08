@@ -163,6 +163,15 @@
 - **Constraints checked:** buy-gate purity untouched; phone sha256-only (R42) preserved; consent gate unchanged; R37 brain-parity unaffected; no gates.py changes needed.
 - **Follow-ups / known gaps:** CB-87 tests injected a custom hook that read `last_close_tier` directly from `**kw` (bypassing `_default_live_upsert`), masking this gap. Future CB-87-style tests that cover the default wiring should use `live_upsert_hook=None` + `live_rag=True` + patch `persist_call_live`.
 
+### CB-92 — Audit: confirm_request also needed a live-path override (CB-61 confirm-echo)
+- **Type / Surface / Size:** bug · `core` (`dst`) · S · (preventative — closes the regex-intent audit)
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `src/core/dst.py` (live-path confirm_request override in `update()`, mirroring CB-89/91).
+- **What changed:** the same regex-only gap as CB-89/91 — CB-61's confirm-echo keys on `last_user_act=='confirm_request'`, which only the regex fallback set; the live LLM never returns it, so the dedicated confirm-echo ("please confirm they'll call Thursday" → confirm_known → echo the time) didn't fire live. Added the override (gated to weak LLM acts + the CB-61 r2 "confirm with <person>" exclusion preserved). Found preventatively by auditing all `_classify_intent` intents after CB-91 — the 3rd instance of this class. AUDIT COMPLETE: social_aside (CB-89), memory_check (CB-91), confirm_request (CB-92) all have live overrides; human_request/price_inquiry/objection are in the LLM vocab or grounded (CB-67).
+- **Verification:** "please confirm they'll call Thursday"/"can you confirm someone reaches out" → confirm_request live; "confirm with my wife first" → NOT confirm_request (CB-61 r2 exclusion); CB-61/CB-50 invariants 56; full suite 844p.
+- **Constraints checked:** R37; gated to weak acts (objection/human_request preserved); CB-61 r2 decision-maker exclusion intact.
+- **Follow-ups / known gaps:** none — the regex-intent live-path class is now fully audited.
+
 ### CB-91 — CRITICAL: never-deny (memory_check) not on the live LLM path → gaslighting returned
 - **Type / Surface / Size:** bug · `core` (`dst`) · S · CRITICAL
 - **Completed:** 2026-06-08
