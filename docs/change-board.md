@@ -95,14 +95,6 @@
 - **Refs:** CB-61 replay transcript /tmp/qa7/cb61_replay_transcript.txt (turn 6); CB-68 Done entry.
 
 
-### CB-79 — One-time reset of the dev DB's polluted champion (needs user authorization — DB write)
-- **Type / Surface / Size:** chore · `db` (dev only) · S
-- **Prereqs:** CB-73 (done — stops further pollution)
-- **Current:** the dev DB's champion is a TEST CHALLENGER `champion_v0__playbooks_discovery_sequence__7` (left by DB-gated tests BEFORE CB-73's teardown landed); ~758 lineage rows, ~4900 episodes accumulated. CB-73 froze the counts going forward but a fix may not mutate existing rows without authorization. CB-73's drawer mismatch line currently fires on 9 real experiments because of this.
-- **Desired (USER DECISION):** authorize a one-time dev-DB cleanup — reset is_champion to a real version (or re-promote champion_v0 cleanly) and optionally prune the test lineage rows + orphan episodes. Dry-run first; destructive → explicit go required.
-- **Acceptance:** dev champion is a real version; the CB-73 mismatch line stops firing on legitimate records; counts sane.
-- **Refs:** CB-73 Done entry; orchestrator DB query 2026-06-08.
-
 ### CB-01 — Active-calls queue with per-call take-over
 - **Type / Surface / Size:** feature · `/operate/live` · `api` · `voice-worker` · L
 - **Prereqs:** — *(no other CB blocks it; internally it has 3 work units that order themselves: the list endpoint → the queue UI → the take-over mechanism. Split into `CB-01.a/.b/.c` when pulled.)*
@@ -164,6 +156,14 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-79 — One-time reset of the dev DB's polluted champion (user-authorized DB write)
+- **Type / Surface / Size:** chore · `db` (dev only) · S
+- **Completed:** 2026-06-08 (user-authorized)
+- **What changed:** dry-ran the lineage state (758 rows: 1 real `champion_v0`, 754 churned `v0/v1-<hash>` test rows, 2 test-challengers; is_champion was on the test-challenger `champion_v0__playbooks_discovery_sequence__7`). Reset transactionally: `is_champion=false` on all non-champion_v0 rows, `is_champion=true` on `champion_v0` (the real, materializable bootstrap with a yaml). Exactly 2 rows flipped. Churned hash rows left untouched (invisible to operators — the API shows only the latest pair — and CB-73's teardown stops new churn); episode pruning deliberately NOT done (FK risk, no operator-facing benefit).
+- **Verification:** post-write `SELECT ... WHERE is_champion` → exactly 1 row (`champion_v0`); live `/api/versions` + `/api/experiments` both report `champion_version=champion_v0` → operator header honest, CB-73 drawer-mismatch line stops firing on the 9 champion_v0-baselined experiments.
+- **Constraints checked:** dry-run before write; transactional (BEGIN/COMMIT); minimal blast radius (2-row UPDATE, no DELETE); is_champion is a plain boolean (no FK risk).
+- **Follow-ups / known gaps:** 754 churned lineage hashes + test episodes remain (inert, invisible); prune only if a clean corpus is wanted later (separate authorization).
 
 ### CB-87 — Correct CB-82: persist a booking WITHOUT ending the conversation (+ CB-86 lead checkpoint)
 - **Type / Surface / Size:** bug · `api` (`demo_routes`, `persistence`) · M · HIGH (regression from CB-82)
