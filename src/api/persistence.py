@@ -6,19 +6,15 @@
 #     trajectory, deriving the terminal OUTCOME + commitment-LADDER tier from the last committed agent
 #     decision, stamping version+kb_version, persona, channel, lead_phone_hash, and
 #     metrics["recorded"]; pure (no DB) so it is trivially testable.
-#   - persist_call_live(session, ...) upserts an in_progress Episode per turn so the Live monitor
-#     can query calls WHILE they are happening. Uses a stable episode_id + created_at passed by the
-#     caller (both must stay constant across upserts). Anonymous (lead_phone_hash=None). Swallows DB
-#     errors so a persistence hiccup never crashes the call path. CB-31: an optional `live_partial`
-#     carries the in-progress (not-yet-committed) agent reply being streamed to TTS, written to
-#     metrics["live_partial"] so the monitor can render words filling in before the turn commits.
-#     CB-33: cohort defaults to "live" but reads LIVE_PERSIST_COHORT — the DB-gated tests set it to
-#     "test" so their live upserts are excluded from the operator monitor (no phantom active call).
-#     CB-44 (timing observability): an optional `turn_timings` (committed agent turn_id -> the 4 ms
-#     numbers, stamped by the voice worker) is written to metrics["turn_timings"] so operate can attach
-#     per-turn timing onto episode_detail/summary; an optional `live_timing` (first_token_ms + a stream-
-#     start stamp for the active turn) is written to metrics["live_timing"] so live_snapshot can surface
-#     the in-flight time-to-first-token + streaming elapsed. Both are metadata only (no decision change).
+#   - persist_call_live(session, ...) upserts an Episode per turn so the Live monitor can query calls
+#     WHILE they are happening. Uses a stable episode_id + created_at. CB-87: when last_close_tier is
+#     supplied (the agent offered a sub-enrollment close), the episode is stamped with the derived
+#     booked outcome (e.g. callback_booked) instead of "in_progress" so the booking APPEARS in
+#     /operate while the conversation continues — decoupling PERSISTENCE from CONVERSATION-END (CB-82's
+#     error). When phone_hash is supplied the episode carries the lead key (no raw phone ever). CB-87
+#     also adds best-effort mid-call lead upsert: when phone_hash is set the store upserts a minimal
+#     Lead row so an abandoned-after-booking chat keeps the lead even if /end never fires (absorbs
+#     CB-86). CB-31: live_partial. CB-33: LIVE_PERSIST_COHORT. CB-44: turn_timings/live_timing.
 #   - persist_call_end(session, ...) saves it via the store in FK-safe order (lead -> episode ->
 #     escalations) and persists per-lead memory (persist_lead_after_call, phone-hash only). The lead
 #     key is SINGLE-SOURCED server-side: raw_phone -> schema.phone_hash(raw_phone); a bound-hash call
@@ -160,37 +156,43 @@ async def persist_call_live(
     live_partial: Optional[str] = None,
     live_timing: Optional[dict[str, Any]] = None,
     turn_timings: Optional[dict[int, dict[str, Any]]] = None,
+    last_close_tier: Optional[str] = None,
+    phone_hash: Optional[str] = None,
 ) -> Optional[Episode]:
-    """Upsert an in_progress Episode each turn so the Live monitor can query calls mid-call.
+    """Upsert an Episode each turn so the Live monitor can query calls mid-call.
 
-    Builds an Episode with outcome="in_progress", lead_phone_hash=None (anonymous — avoids the lead
-    FK requirement AND any PII during the call), cohort="live", and the SAME episode_id + created_at
-    passed on every call (so consecutive upserts land on the same row via save_episode's ON CONFLICT).
-    Accumulated turns (with belief snapshots) and turn_count reflect the state AFTER the current turn.
-    The store is imported lazily so this module stays DB-free at import time. Swallows/logs DB errors
-    like persist_call_end does — a persistence hiccup must NEVER crash the live call path. Returns the
-    Episode on success or None on error.
+    Builds an Episode with the SAME episode_id + created_at on every call (so consecutive upserts
+    land on the same row via save_episode's ON CONFLICT). Accumulated turns (with belief snapshots)
+    and turn_count reflect the state AFTER the current turn. The store is imported lazily so this
+    module stays DB-free at import time. Swallows/logs DB errors — a persistence hiccup must NEVER
+    crash the live call path. Returns the Episode on success or None on error.
 
-    CB-31: `live_partial` is the in-progress agent reply text being STREAMED to TTS for the turn that
-    has NOT committed yet — when set it is written to metrics["live_partial"] so operate.live_snapshot
-    can surface it and the monitor renders the words filling in before the turn commits. It is metadata
-    only (NOT a committed Turn); when absent (the per-turn / connect-time upsert) the key is omitted, so
-    the next upsert after the turn commits clears it.
+    CB-87 (outcome stamp): when last_close_tier is supplied (the agent offered a sub-enrollment
+    close — callback/consultation/trial), the episode is stamped with the derived booked outcome
+    (e.g. callback_booked/consult_booked/trial_booked) and qualified=True instead of "in_progress".
+    This decouples PERSISTENCE from CONVERSATION-END — the booking appears in /operate immediately
+    via the live-upsert row while the conversation continues (done stays False for the chat turn).
+    Semantics: we stamp on the agent's attempt_close turn since in the demo channel the human's
+    acceptance isn't a separate API signal; this is the simplest correct choice.
 
-    CB-33: the cohort is normally "live" (a real call). The DB-gated tests that drive THIS function
-    against the shared dev Postgres set LIVE_PERSIST_COHORT="test" so their in_progress upserts are
-    tagged "test" — operate._is_active excludes that cohort, so a pytest run can't flash a phantom
-    "active" call on the operator monitor. Prod leaves the env unset -> "live" (unchanged behavior).
+    CB-87 (lead checkpoint, absorbs CB-86): when phone_hash is supplied, a minimal Lead row is
+    upserted (phone_hash key only, no raw phone) BEFORE the episode save, so the episode FK target
+    exists AND an abandoned-after-booking chat keeps the lead even if /end never fires. Best-effort
+    (swallowed alongside the episode error) — never crashes the call path.
+
+    CB-31: `live_partial` is the in-progress agent reply being STREAMED to TTS — written to
+    metrics["live_partial"] so the monitor renders words filling in before the turn commits.
+
+    CB-33: LIVE_PERSIST_COHORT="test" (set by DB-gated tests) tags upserts so operate._is_active
+    excludes them — no phantom "active" call on the monitor during pytest runs.
 
     CB-44 (timing): `turn_timings` (committed agent turn_id -> the 4 ms numbers) is written to
-    metrics["turn_timings"] so the live call's already-committed turns carry timing too; `live_timing`
-    (the active streaming turn's first_token_ms + stream-start stamp) is written to metrics["live_timing"]
-    so operate.live_snapshot can surface the in-flight time-to-first-token + streaming elapsed. Both are
-    metadata only; absent (a per-turn / connect-time upsert) the keys are omitted so a committed/quiet
-    state shows no live_timing (the next upsert clears it).
+    metrics["turn_timings"]; `live_timing` (the active streaming turn's first_token_ms + stream-start
+    stamp) to metrics["live_timing"]. Both are metadata only; absent keys are cleared on the next upsert.
     """
     try:
         from src.memory import store
+        from src.memory.schema import Lead
 
         state = session.state
         turns: list[Turn] = list(state.turns)
@@ -224,16 +226,35 @@ async def persist_call_live(
         # tagged "test" (excluded from the live monitor by operate._is_active) — never a phantom call.
         cohort = os.environ.get("LIVE_PERSIST_COHORT", "live")
 
+        # CB-87 outcome stamp: when a close tier has been offered, stamp the derived booked outcome so
+        # the booking appears in /operate while the conversation continues. Without a close tier the
+        # episode stays "in_progress" (the call is still discovering). The outcome is derived from
+        # last_close_tier alone (same mapping as episode_from_session / derive_outcome).
+        if last_close_tier:
+            outcome, ladder_tier, qualified, _ = derive_outcome("attempt_close", last_close_tier)
+        else:
+            outcome, ladder_tier, qualified = "in_progress", 0, False
+
+        # CB-87 lead checkpoint (absorbs CB-86): upsert a minimal Lead BEFORE the episode so the FK
+        # target exists when phone_hash is known. Best-effort — failure is swallowed with the episode.
+        # Raw phone is NEVER passed here; the hash is the only identifier (R42).
+        effective_hash: Optional[str] = phone_hash
+        if effective_hash:
+            try:
+                await store.upsert_lead_by_phone(Lead(phone_hash=effective_hash))
+            except Exception:
+                pass  # best-effort; the call path must never crash on a lead upsert failure
+
         episode = Episode(
             episode_id=episode_id,
             turns=turns,
-            outcome="in_progress",
-            ladder_tier=0,
-            qualified=False,
+            outcome=outcome,
+            ladder_tier=ladder_tier,
+            qualified=qualified,
             version=stamp.get("version", ""),
             kb_version=stamp.get("kb_version", ""),
             channel=channel,
-            lead_phone_hash=None,
+            lead_phone_hash=effective_hash,
             persona=persona_name,
             cohort=cohort,
             escalated=False,

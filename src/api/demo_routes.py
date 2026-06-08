@@ -1,4 +1,4 @@
-# The /demo call routes for the thin FastAPI surface (plan U13; R1/R3/R33/R40/R41/R42 + CB-82),
+# The /demo call routes for the thin FastAPI surface (plan U13; R1/R3/R33/R40/R41/R42 + CB-87),
 # extracted from src.api.server so that module stays a slim app-assembler. create_demo_router()
 # builds an APIRouter carrying the EXACT, frozen JSON contract the Next.js demo depends on:
 # consent/start + consent/respond drive the ConsentGate (AI disclosure, recording consent,
@@ -6,9 +6,12 @@
 # INDEPENDENT of a client is_minor flag, R40); /api/chat (GATED 409 by consent) runs one brain
 # turn via VoiceSession — it detect_minors the user text first (a self-reported minor flips
 # need_parental -> 409), buffers/persists an escalation with a PII-scrubbed moment, and reports
-# `done` for terminal acts; CB-82: `done` is True for ANY committed close (attempt_close at any
-# tier — callback/consultation/trial/enrollment), not just enrollment, so every booking fires /end
-# and persists the episode+lead (raw phone NEVER stored; sha256 hash only, R42); CB-63: /api/chat
+# `done` for terminal acts; CB-87 (corrects CB-82): `done` fires ONLY on genuinely terminal acts
+# (enrollment close, escalate, disqualify) — sub-enrollment closes (callback/consultation/trial)
+# do NOT set done (the conversation continues), but DO persist + appear in /operate via the live-
+# upsert stamping the booked outcome (last_close_tier -> persist_call_live with outcome stamp) and
+# the lead checkpoint (phone_hash upserted mid-call so an abandoned chat keeps the lead, CB-86);
+# raw phone NEVER stored, sha256 hash only (R42); CB-63: /api/chat
 # now STREAMS tokens as SSE when the client sends Accept: text/event-stream (progressive render +
 # typing indicator, eliminating the 5.7–9.1 s silence). SSE events: `token` chunks during NLG
 # generation, then a terminal `done` event carrying {reply, decision_act, done} — the same payload
@@ -350,13 +353,19 @@ def create_demo_router(
         return None
 
     async def _live_upsert(sess: "_Session") -> None:
-        """Upsert an in_progress Episode after each successful turn (Layer 2 live persistence).
+        """Upsert an Episode after each successful turn (Layer 2 live persistence — CB-87 extended).
 
         Uses the session's stable live_episode_id + live_created_at so every upsert lands on the
         same row. The final /end persist uses the same episode_id so it finalizes that same row.
         Only fires when live_upsert_hook is set (mirrors the escalation_persist_hook pattern —
         tests inject a capture hook; prod create_app wires persist_call_live). Skips silently when
-        no hook is provided so /api/chat stays DB-free when not opted in. Failures are swallowed."""
+        no hook is provided so /api/chat stays DB-free when not opted in. Failures are swallowed.
+
+        CB-87: passes last_close_tier (the most-recently-offered close tier, if any) and phone_hash
+        (the session's bound lead hash, if any) to the hook so persist_call_live can (a) stamp the
+        booked outcome instead of "in_progress" once a close was offered (the episode appears in
+        /operate with its outcome while the conversation continues), and (b) upsert a minimal Lead row
+        so an abandoned-after-booking chat keeps the lead even if /end never fires (absorbs CB-86)."""
         if sess.voice_session is None or live_upsert_hook is None:
             return
         try:
@@ -366,6 +375,8 @@ def create_demo_router(
                 channel=sess.channel,
                 episode_id=sess.live_episode_id,
                 created_at=sess.live_created_at,
+                last_close_tier=sess.last_close_tier,
+                phone_hash=sess.phone_hash,
             )
         except Exception:
             pass  # swallow — persist_call_live already logs; never crash the call path
@@ -763,14 +774,19 @@ def create_demo_router(
         # live_episode_id ensures all upserts + the final /end persist target the same row.
         await _live_upsert(sess)
 
-        # CB-82: ANY committed close finalizes the conversation — not just enrollment. A callback
-        # booking, consultation, or trial is equally a real outcome that must persist (done=True so
-        # the client fires /end which calls call_end_persist_hook → episode + lead saved). The prior
-        # code gated on `tier == "enrollment"`, silently dropping sub-enrollment closes without ever
-        # reaching /end, leaving the episode in_progress and losing the lead/phone. Buy-gate purity
-        # is unchanged: done only gates finalization; the commit decision (buy_gate) is untouched.
+        # CB-87 (corrects CB-82): `done` ENDS the interactive conversation, so it must reflect the
+        # HUMAN accepting — not merely the AGENT offering. In interactive /api/chat, `committed` is the
+        # AGENT's gated turn: act == "attempt_close" means the agent OFFERED a close (e.g. "would you
+        # like me to book that?"), NOT that the prospect accepted. CB-82 ended the chat on that offer,
+        # cutting the human off mid-booking (live QA: both convos died on the agent's "which day?"
+        # question). So `done` fires only on genuinely terminal states: an enrollment close (the
+        # strongest, accepted commit), escalate, or disqualify. Sub-enrollment bookings (callback /
+        # consultation / trial) DO persist + appear in /operate — but via the live-upsert stamping the
+        # booked outcome (not in_progress) and the lead checkpoint on contact-capture (CB-86), NOT by
+        # ending the conversation. This decouples PERSISTENCE from CONVERSATION-END (CB-82's error).
         done = committed is not None and (
-            committed.decision.act in ("disqualify", "escalate", "attempt_close")
+            committed.decision.act in ("disqualify", "escalate")
+            or (committed.decision.act == "attempt_close" and committed.decision.tier == "enrollment")
         )
         return committed, bool(done)
 

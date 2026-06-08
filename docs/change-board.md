@@ -61,14 +61,6 @@
 > ```
 
 
-### CB-86 — Checkpoint-persist the lead at contact-capture (not only at /end)
-- **Type / Surface / Size:** change · `api` (`demo_routes` live_upsert + persistence) · M
-- **Prereqs:** CB-82 (done — booked closes now finalize via /end)
-- **Current:** CB-82 made any committed close fire /end → the lead persists then. But a chat that captures a phone and is ABANDONED before any terminal close (user closes the tab) still loses the lead — `_live_upsert` writes `lead_phone_hash=None` every turn. Deferred from CB-82 as invasive (raw_phone into the live_upsert hook signature + a mid-call Lead FK write before the episode row exists).
-- **Desired:** when contact is captured mid-call, write/upsert a minimal Lead (phone as sha256 only) so an abandoned-after-booking chat keeps it; FK ordering handled (lead before episode ref).
-- **Acceptance:** a chat that gives a phone then abandons (no /end) → the lead exists with the sha256 hash; no raw phone anywhere; live-call path unaffected.
-- **Refs:** CB-82 follow-up.
-
 ### CB-69 — Text-channel escalate: don't ask a question the session can't hear answered
 - **Type / Surface / Size:** design/bug · `core` (`nlg` escalate guidance) · `api` (`demo_routes` done semantics) · S–M
 - **Prereqs:** — (user decision wanted on the desired semantics)
@@ -148,6 +140,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-87 — Correct CB-82: persist a booking WITHOUT ending the conversation (+ CB-86 lead checkpoint)
+- **Type / Surface / Size:** bug · `api` (`demo_routes`, `persistence`) · M · HIGH (regression from CB-82)
+- **Completed:** 2026-06-08 (supersedes CB-82's done-expansion; absorbs CB-86)
+- **Files changed (actual):** `src/api/demo_routes.py` (`done` reverted to enrollment-close/escalate/disqualify only; `_live_upsert` now passes `last_close_tier` + `phone_hash` to the hook), `src/api/persistence.py` (`persist_call_live` accepts `last_close_tier` → stamps the derived booked outcome instead of "in_progress"; accepts `phone_hash` → upserts a minimal Lead FK-safely mid-call, sha256 only), `tests/e2e/test_demo_call.py` + `test_cb63_chat_stream.py` (CB-82 contract re-specced + 4 CB-87 regression tests).
+- **What changed:** CB-82 conflated PERSISTENCE with CONVERSATION-END — in interactive /api/chat `committed` is the AGENT's turn, so `attempt_close` = the agent OFFERED a close, not that the human accepted; CB-82 ended both replay convos on the agent's "which day?" question. Now a sub-enrollment booking (callback/consult/trial) does NOT end the chat (it continues) but DOES persist + appear in /operate via the live-upsert outcome stamp, and the lead persists at contact-capture (sha256) so an abandoned-after-booking chat keeps it. Only enrollment/escalate/disqualify end the conversation.
+- **Verification:** 76 demo/stream/consent tests + 4 new CB-87 regressions (callback offer → done=False & conversation continues; live-upsert carries callback_booked; contact capture persists the lead hash; enrollment still done+persists); full suite 1036p/5s; phone sha256-only asserted on the persisted JSON.
+- **Constraints checked:** buy-gate purity untouched; consent gate unchanged; R37/R42; no raw phone anywhere.
+- **Follow-ups / known gaps:** outcome is stamped on the agent's offer (in the demo channel the human's acceptance isn't a separate API signal) — documented in persist_call_live; a future voice-channel "yes" signal could refine it. Final live confirmation replay pending (orchestrator).
 
 ### CB-85 — Non-sequitur false-pivot + price honesty under pressure
 - **Type / Surface / Size:** bug · `core` (`dst`/`gates`/`nlg`) · M · MEDIUM

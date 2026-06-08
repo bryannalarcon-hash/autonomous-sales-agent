@@ -5,7 +5,9 @@
 # persisted (live upsert + turn state) after a streamed turn; (5) the `done` event payload shape
 # matches the buffered JSON contract; (6) terminal acts (disqualify/escalate/enrollment) set
 # done=True in the SSE done event; (7) buffered fallback (no Accept: text/event-stream header) is
-# unchanged. All tests are DB-free ($0 spend): TestClient + MockLLMClient, no real LLM calls.
+# unchanged. CB-87 (corrects CB-82): sub-enrollment closes (callback/consultation/trial) keep
+# done=False on the SSE path (same as buffered). All tests are DB-free ($0 spend): TestClient +
+# MockLLMClient, no real LLM calls.
 from __future__ import annotations
 
 import json
@@ -279,20 +281,22 @@ class TestDoneEventPayload:
     @pytest.mark.parametrize(
         "act,tier,expected_done",
         [
-            # CB-82: ANY committed close is terminal — done=True for all four tiers on both paths.
+            # CB-87 (corrects CB-82): enrollment close ends the conversation on the SSE path too.
             ("attempt_close", "enrollment", True),
-            ("attempt_close", "trial", True),           # CB-82: was False before the fix
-            ("attempt_close", "consultation", True),    # CB-82: all close tiers are terminal
-            ("attempt_close", "callback", True),        # CB-82: all close tiers are terminal
+            # CB-87: sub-enrollment closes keep done=False on the SSE path — conversation continues.
+            # Booking persists + appears in /operate via live-upsert outcome stamp, NOT by ending chat.
+            ("attempt_close", "trial", False),          # CB-87: offer keeps convo open
+            ("attempt_close", "consultation", False),   # CB-87: offer keeps convo open
+            ("attempt_close", "callback", False),       # CB-87: offer keeps convo open
             ("escalate", None, True),
             ("disqualify", None, True),
             ("ask", "goal", False),
         ],
     )
     def test_done_flag_in_sse_matches_buffered_contract(self, act, tier, expected_done):
-        """The `done` field in the SSE `done` event matches the exact contract from the buffered path:
-        CB-82: done=True for ANY committed close (all four tiers) + escalate + disqualify;
-        done=False only for non-close acts (ask, pitch, talk, discovery)."""
+        """The `done` field in the SSE `done` event matches the exact contract from the buffered path.
+        CB-87 (corrects CB-82): done=True only for enrollment/escalate/disqualify; sub-enrollment
+        closes (callback/consultation/trial) keep done=False on both SSE and buffered paths."""
         app = create_app(llm_client_factory=lambda: _agent_mock(act=act, tier=tier), live_rag=False)
         client = TestClient(app)
         sid = _start(client, channel="text")
