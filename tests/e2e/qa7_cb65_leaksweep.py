@@ -1,8 +1,10 @@
-# qa7_cb65_leaksweep.py — CB-65 regression: viewer-facing leak sweep across all surfaces.
+# qa7_cb65_leaksweep.py — CB-65/CB-70 regression: viewer-facing leak sweep across all surfaces.
 # Walks every page (demo pre-consent, calls list both cohort modes, call review, escalations, KPI,
 # lab list + one lab detail, versions, approvals) and scans rendered innerText against a pattern list.
 # Each pattern class has an explicit allowlist with documented justification for any permitted hit.
 # The test PASSES only when zero non-allowlisted hits remain — it is the headline regression for CB-65.
+# CB-70 extension: includes the "-> [" arrow-bracket-list pattern on card/Past/detail TITLE elements
+# so a blank-name record falling back to a raw mutation string is caught immediately.
 # Does NOT click chat/chat links, start calls, or take any state-mutating action.
 # Requirements: Next.js dashboard at localhost:3000, FastAPI API at localhost:8000.
 # Run: python -m pytest tests/e2e/qa7_cb65_leaksweep.py -v --tb=short
@@ -308,6 +310,55 @@ def test_approvals_no_leaks(page: Page):
     _require_services()
     findings = _navigate_and_scan(page, "approvals", f"{DASHBOARD_BASE}/improve/approvals", extra_wait_ms=1500)
     _assert_no_leaks("approvals", findings, page)
+
+
+def test_lab_title_no_raw_mutation_string(page: Page):
+    """CB-70 regression: blank-name records must never show a raw mutation string (-> [) as a title.
+    Checks that card bold titles (.b elements) on the lab list contain no '-> [' pattern.
+    If the known QA9 blank-name record is present, verifies it shows a humanized title."""
+    _require_services()
+    page.goto(f"{DASHBOARD_BASE}/improve/lab", wait_until="networkidle")
+    page.wait_for_timeout(1500)
+    # Switch to Past tab to surface the blank-name discovery_sequence records.
+    past_btn = page.locator("button:has-text('Past')")
+    if past_btn.count() > 0:
+        past_btn.first.click()
+        page.wait_for_timeout(800)
+    # All bold card titles must not contain raw mutation strings.
+    titles = page.locator("[data-kind='exp-card'] .b").all_inner_texts()
+    bad_titles = [t for t in titles if "-> [" in t or t.strip().lower() == "draft"]
+    if bad_titles:
+        shot_path = os.path.join(SCREENSHOT_DIR, "cb70_title_leak.png")
+        page.screenshot(path=shot_path)
+        pytest.fail(
+            f"CB-70: raw mutation string or 'draft' found in card title(s): {bad_titles!r}\n"
+            f"Screenshot: {shot_path}"
+        )
+    # Also verify the known QA9 blank-name record if present.
+    try:
+        with urllib.request.urlopen(f"{API_BASE}/api/experiments", timeout=8) as r:
+            data = json.loads(r.read())
+        exps = data.get("experiments", [])
+        # The QA9 record: name is the raw mutation string.
+        raw_name_exp = next(
+            (e for e in exps if e.get("name", "").startswith("reorder discovery_sequence -> [")),
+            None,
+        )
+        if raw_name_exp:
+            exp_id = raw_name_exp["experiment_id"]
+            url = f"{DASHBOARD_BASE}/improve/lab/{urllib.parse.quote(exp_id)}"
+            page.goto(url, wait_until="networkidle")
+            page.wait_for_timeout(1500)
+            body = page.inner_text("body")
+            if "-> [" in body:
+                shot_path = os.path.join(SCREENSHOT_DIR, "cb70_detail_leak.png")
+                page.screenshot(path=shot_path)
+                pytest.fail(
+                    f"CB-70: raw mutation string '-> [' found on detail page for {exp_id}\n"
+                    f"Screenshot: {shot_path}"
+                )
+    except Exception:
+        pass  # experiment list unavailable — title check above is sufficient
 
 
 # ---------------------------------------------------------------------------

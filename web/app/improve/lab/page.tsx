@@ -5,10 +5,11 @@
 // diff line, the lift block (enroll, ladder, 95% CI, significance) + guardrail strip, and a
 // state-dependent CTA (a blocked challenger links to the Approval Queue, per the handoff §183). The
 // "Run experiment" control opens a RunDrawer: pick a dimension (Discovery sequencing reorder, or a
-// threshold + new value), see an explicit "this runs N real model calls" cost note, submit to
-// /api/experiments/run. CB-15: that run is ASYNC — the POST returns 202 with a `running` record, the
-// drawer closes IMMEDIATELY, the running card shows at once, and the /api/experiments poll transitions
-// it running -> result (the page never freezes; the backend settles every run to a terminal state).
+// threshold + new value), see an explicit "this runs N real model calls + $ estimate" cost note, submit
+// to /api/experiments/run. CB-15: that run is ASYNC — the POST returns 202 with a `running` record,
+// the drawer closes IMMEDIATELY, the running card shows at once, and the /api/experiments poll
+// transitions it running -> result (the page never freezes; the backend settles every run to a terminal
+// state). When a previously-running experiment settles, a dismissible completion banner appears.
 // CB-19: arriving via /improve/lab?episode=<id> (from a call's "Use in experiment") auto-opens the
 // RunDrawer pre-seeded + showing the reviewed call's context, so the operator reviews + launches the
 // scaffolded experiment — never a blank lab landing.
@@ -27,6 +28,15 @@
 // CB-58: distinct terminal stories per outcome — rejected-insignificant ≠ guardrail-regressed ≠
 // failed/timed-out. The guardrail strip says "needs approval" only for blocked state; failed/timed-out
 // cards never show fabricated lift metrics; no Python flag phrasing renders.
+// CB-70: blank experiment name falls back to humanizeDiffDescription(diff_description) inside titleOf
+// so card/Past row/detail header all show e.g. "New sequence: Subject, Grade level, …" rather than
+// the raw mutation string. The change label (dimension_label) remains the subtitle; humanized diff is
+// the title only when name is empty/draft and diff_description is present.
+// CB-71: one state machine for all records — guardrail-regression chip on cards; humanizeGuardrailReason
+// on every reason surface; no-result records (timeout/crash reason text) suppress metrics + sample bar;
+// zombie (Running + Draft simultaneously) renders as Draft only.
+// CB-72: dialog shows "≈ $X.XX" cost estimate; disabled launch button shows helper text; completion
+// banner on poll settle; term tooltips on Ladder/Significance/CI; small-n caution chip for n<10/arm.
 // Data from /api/experiments; the discovery-sequencing before/after is the headline demo artifact. All
 // semantic labels (state, dimension, version, population/cohort) are humanized before render — no raw
 // slug, `__…__` experiment suffix, or DRAFT-/exp- id renders. Cards/drawer show the human version +
@@ -34,7 +44,8 @@
 // changeLabel()); the population/cohort value (e.g. legacy `held_out`) is humanized via
 // lib/labels.populationLabel so no raw snake_case slug leaks next to "Champion v1 · …". An
 // experiment whose raw `name` is empty or the placeholder "draft" (case-insensitive) shows the
-// human change label as its title instead (titleOf), so no bold "draft" renders.
+// humanized diff description as its title instead (titleOf via CB-70), so no bold "draft" or raw
+// mutation string renders.
 'use client';
 
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -43,7 +54,7 @@ import { Icon } from '@/components/cadence/Icon';
 import { fetchExperiments, fetchPlaybook, runExperiment } from '@/lib/improve-api';
 import type { Experiment, MetricChange, PlaybookResponse, RunExperimentRequest } from '@/lib/improve-types';
 import { metricBandFor, metricExplainer } from '@/lib/improve-types';
-import { dimensionLabel, humanizeDiffDescription, populationLabel, versionLabel } from '@/lib/labels';
+import { dimensionLabel, humanizeDiffDescription, humanizeGuardrailReason, populationLabel, versionLabel } from '@/lib/labels';
 
 // Operator-facing "what changed" label for an experiment: prefer the backend's pre-translated
 // dimension_label, else derive a human label from the raw `dimension` slug. Never the raw `__…__` id.
@@ -51,12 +62,26 @@ function changeLabel(e: Experiment): string {
   return e.dimension_label || dimensionLabel(e.dimension);
 }
 
-// Card/drawer title for an experiment. The raw `name` can be empty or the unhelpful placeholder
-// "draft" (an un-renamed draft run); in those cases fall back to the human change label already on
-// the card (e.g. "Objection rebuttals") so no bold "draft" renders as a title.
+// CB-70: detect a raw mutation string in the name field — the backend sometimes persists the raw
+// diff_description string (e.g. "reorder discovery_sequence -> ['subject', 'grade_level', …]") as
+// the name when the operator did not supply one. These must NEVER render verbatim as titles.
+const RAW_MUTATION_RE = /^(reorder|set|perturb)\s+[a-z_]+/i;
+
+// Card/drawer title for an experiment. The raw `name` can be empty, the unhelpful placeholder
+// "draft", or a raw mutation string stored verbatim as the name. In all those cases, fall back
+// first to humanizeDiffDescription(diff_description) (CB-70: "reorder discovery_sequence -> [...]"
+// becomes "New sequence: Subject, Grade level, …") and only then to the human change label, so no
+// raw mutation string or bold "draft" renders as a title. Applies to card list, Past rows, and the
+// detail header — a single seam, so all surfaces inherit the fix.
 function titleOf(e: Experiment): string {
   const name = (e.name ?? '').trim();
-  if (!name || name.toLowerCase() === 'draft') return changeLabel(e);
+  const isRawMutation = RAW_MUTATION_RE.test(name) && name.includes('->');
+  if (!name || name.toLowerCase() === 'draft' || isRawMutation) {
+    // CB-70: prefer the humanized diff description so blank/raw-name records get a meaningful title;
+    // fall back to the change label only if no diff_description is stored.
+    const humanDiff = humanizeDiffDescription(e.diff_description);
+    return humanDiff || changeLabel(e);
+  }
   return name;
 }
 
@@ -73,6 +98,32 @@ const STATE_TAG: Record<Experiment['state'], string> = {
 
 const ACTIVE_STATES: Experiment['state'][] = ['draft', 'running', 'passed', 'blocked'];
 
+// CB-71 — ONE truthful display state machine for all records (including legacy rows).
+//
+// "No result" detection: prefer a stored guardrail_reason that ends with "no result recorded"
+// (the two known legacy strings from _settle_failed_run: "the run timed out after Ns — no result
+// recorded" / "the run failed with an error (…) — no result recorded"). When that phrase is absent
+// we fall back to n=0 as a secondary signal. This keeps backward-compat with any future reason text
+// while being explicit about the KNOWN strings (the comment is the source of truth here).
+function isNoResult(e: Experiment): boolean {
+  if (e.guardrail_reason && e.guardrail_reason.endsWith('no result recorded')) return true;
+  return e.n === 0 && e.state === 'rejected';
+}
+
+// A zombie record has state="running" but also has no n and effectively no real run started —
+// seen as "Running" + "Draft · not yet sampled" simultaneously. Treat as Draft.
+function effectiveState(e: Experiment): Experiment['state'] {
+  if (e.state === 'running' && e.n === 0 && !e.target) return 'draft';
+  return e.state;
+}
+
+// CB-72: per-call cost estimate constant. Measured average from production runs ≈ $0.025/call
+// (two arms × N calls each; rate measured across OpenRouter usage). Labeled "approximate".
+const CALLS_COST_ESTIMATE = 0.025; // USD per model call, approximate (≈$0.025/call measured average)
+
+// CB-72: small-n caution threshold — below this per-arm count, results are directional only.
+const SMALL_N_THRESHOLD = 10;
+
 function pts(v: number): string {
   return `${v > 0 ? '+' : ''}${Math.round(v * 100)} pts`;
 }
@@ -80,10 +131,11 @@ function dec(v: number): string {
   return `${v > 0 ? '+' : ''}${v.toFixed(2)}`;
 }
 
-function Cell({ l, v, good, last }: { l: string; v: string; good?: boolean; last?: boolean }) {
+// CB-72: 'tip' prop adds a title= tooltip so operators can hover to see term definitions.
+function Cell({ l, v, good, last, tip }: { l: string; v: string; good?: boolean; last?: boolean; tip?: string }) {
   const color = good === true ? 'var(--ok)' : good === false ? 'var(--danger)' : 'var(--text)';
   return (
-    <div style={{ padding: '11px 14px', borderRight: last ? 0 : '1px solid var(--border)' }}>
+    <div title={tip} style={{ padding: '11px 14px', borderRight: last ? 0 : '1px solid var(--border)' }}>
       <div className="faint" style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em' }}>
         {l}
       </div>
@@ -94,10 +146,11 @@ function Cell({ l, v, good, last }: { l: string; v: string; good?: boolean; last
   );
 }
 
-function Stat({ l, v, good, mono }: { l: string; v: string; good?: boolean | null; mono?: boolean }) {
+// CB-72: `tip` adds a one-line title= tooltip so operators can hover/tap to learn term definitions.
+function Stat({ l, v, good, mono, tip }: { l: string; v: string; good?: boolean | null; mono?: boolean; tip?: string }) {
   const color = good === true ? 'var(--ok)' : good === false ? 'var(--danger)' : 'var(--text)';
   return (
-    <div>
+    <div title={tip}>
       <div className="faint" style={{ fontSize: 11, fontWeight: 600 }}>
         {l}
       </div>
@@ -117,16 +170,21 @@ function Stat({ l, v, good, mono }: { l: string; v: string; good?: boolean | nul
   );
 }
 
-function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
+function ExpDrawer({ e, storeChampionVersion, onClose }: { e: Experiment; storeChampionVersion?: string | null; onClose: () => void }) {
   const router = useRouter();
   const tripped = e.guardrail === 'trip';
+  const noResult = isNoResult(e);
   // CB-24: a rejected/blocked/failed experiment carries WHY in guardrail_reason — surface it
   // prominently (not only in the guardrail strip) so a failed run never reads as a silent "gone".
+  // CB-71b: guardrail_reason is humanized via humanizeGuardrailReason on EVERY surface it renders
+  // (legacy records may carry raw "challenger_better is False" Python tokens).
   // CB-58: only show the "why it ended" callout once (here), not again in the guardrail strip.
   const isFailed = e.state === 'rejected' || e.state === 'blocked';
-  const failureReason = (isFailed || tripped) ? e.guardrail_reason : null;
-  // CB-58: a run that produced no comparison (n=0, failed/timed-out) has no real lift data to show.
-  const hasRealLift = e.n > 0;
+  const rawReason = (isFailed || tripped) ? e.guardrail_reason : null;
+  const failureReason = rawReason ? humanizeGuardrailReason(rawReason) : null;
+  // CB-71c: no-result records show NO metrics/CI/sample bar regardless of stored n.
+  // CB-58: a run that produced no comparison has no real lift data to show.
+  const hasRealLift = !noResult && e.n > 0;
   return (
     <>
       <div className="scrim" onClick={onClose} />
@@ -136,6 +194,13 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
             <div className="row" style={{ gap: 8, marginBottom: 4 }}>
               <span className="faint" style={{ fontSize: 11.5, fontWeight: 600 }}>{changeLabel(e)}</span>
               <span className={`tag ${STATE_TAG[e.state]} dot`}>{e.state_label}</span>
+              {/* CB-71a: guardrail-regression chip visible on the drawer header (not drawer-body-only) */}
+              {tripped ? (
+                <span className="tag danger" style={{ gap: 5 }}>
+                  <Icon name="shield" size={12} />
+                  Guardrail regression
+                </span>
+              ) : null}
             </div>
             <div className="b" style={{ fontSize: 15.5, fontFamily: 'var(--font-display)' }}>{titleOf(e)}</div>
           </div>
@@ -168,6 +233,15 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
               <div className="muted" style={{ fontSize: 12 }}>Ladder {e.challenger_kpi.toFixed(2)} · {populationLabel(e.population)}</div>
             </div>
           </div>
+
+          {/* CB-73: when the experiment's baseline champion differs from the current store champion,
+              explain it in one plain sentence so the operator knows why the header shows a different
+              version from what this experiment measured against. */}
+          {storeChampionVersion && e.champion_version && storeChampionVersion !== e.champion_version ? (
+            <div style={{ fontSize: 12, color: 'var(--text-3)', fontStyle: 'italic', marginTop: -4 }}>
+              Baseline: {versionLabel(e.champion_version)} — the promoted champion&apos;s configuration isn&apos;t materialized on this machine; see Versions.
+            </div>
+          ) : null}
 
           {/* CB-24: an explicit "why it ended this way" callout for a rejected/blocked/failed run — so
               the operator is never left guessing why an experiment "failed without telling me why". */}
@@ -210,19 +284,44 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
             <Icon name="arrowR" size={15} />
           </button>
 
-          {/* CB-58: only show lift stats when the run actually completed a comparison (n > 0).
-              A timed-out or crashed run never produced data — showing zeroed schema defaults as
-              metrics fabricates results that never existed. */}
+          {/* CB-58/CB-71c: only show lift stats when the run actually completed a comparison AND is
+              not a no-result record. A timed-out or crashed run never produced data — showing zeroed
+              schema defaults as metrics fabricates results that never existed. */}
           {hasRealLift ? (
             <div className="card solid card-pad">
               <div className="faint" style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 10 }}>
                 Lift (challenger − champion)
               </div>
+              {/* CB-72: small-n caution chip when per-arm sample is below the meaningful threshold */}
+              {e.n < SMALL_N_THRESHOLD ? (
+                <div className="row" style={{ gap: 6, alignItems: 'center', marginBottom: 9, padding: '6px 9px', borderRadius: 8, background: 'var(--warn-soft)', border: '1px solid var(--warn-border)' }}>
+                  <Icon name="alert" size={13} style={{ color: 'var(--warn)' }} />
+                  <span style={{ fontSize: 11.5, color: 'var(--warn)', fontWeight: 600 }}>
+                    Small sample — directional only (n={e.n}/arm; results aren&apos;t a stable statistic)
+                  </span>
+                </div>
+              ) : null}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
                 <Stat l="Same-call enroll" v={pts(e.enroll_delta)} good={e.enroll_delta > 0} />
-                <Stat l="Ladder score" v={dec(e.delta)} good={e.delta > 0} />
-                <Stat l="95% CI" v={`[${e.delta_ci[0].toFixed(2)}, ${e.delta_ci[1].toFixed(2)}]`} mono />
-                <Stat l="Significance" v={`${Math.round(e.significance * 100)}%`} good={e.challenger_better ? true : null} />
+                {/* CB-72: tooltips on LADDER Δ, 95% CI, and Significance for non-engineers */}
+                <Stat
+                  l="Ladder Δ"
+                  v={dec(e.delta)}
+                  good={e.delta > 0}
+                  tip="Average commitment level reached by the challenger minus the champion. 0 = no commitment → 4 = same-call enrollment."
+                />
+                <Stat
+                  l="95% CI"
+                  v={`[${e.delta_ci[0].toFixed(2)}, ${e.delta_ci[1].toFixed(2)}]`}
+                  mono
+                  tip="95% confidence interval for the Ladder Δ. When both bounds are on the same side of 0, the result is statistically significant."
+                />
+                <Stat
+                  l="Significance"
+                  v={`${Math.round(e.significance * 100)}%`}
+                  good={e.challenger_better ? true : null}
+                  tip="How confident we are the challenger's lift is real (not random noise). ≥95% = statistically significant."
+                />
               </div>
               <div
                 className="row"
@@ -248,7 +347,7 @@ function ExpDrawer({ e, onClose }: { e: Experiment; onClose: () => void }) {
                 </span>
               </div>
             </div>
-          ) : e.state === 'rejected' ? (
+          ) : (e.state === 'rejected' || noResult) ? (
             <div className="card solid card-pad">
               <div className="faint" style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 7 }}>
                 Run outcome
@@ -736,14 +835,19 @@ function RunDrawer({
             </div>
           </div>
 
-          {/* CB-57: explicit cost note using the EFFECTIVE (floored/capped) n, not the raw input.
-              If the requested n was below the minimum sample, note the floor so the operator knows. */}
+          {/* CB-57/CB-72: explicit cost note using the EFFECTIVE (floored/capped) n. Includes a
+              $ estimate clearly labeled approximate (CB-72: ≈$X.XX, single CALLS_COST_ESTIMATE
+              constant). If the requested n was below the minimum, note the floor. */}
           <div className="row" style={{ gap: 8, alignItems: 'flex-start', padding: '10px 12px', borderRadius: 10, background: 'var(--accent-soft)', border: '1px solid var(--accent-border)' }}>
             <Icon name="bolt" size={15} style={{ color: 'var(--accent-strong)', marginTop: 1 }} />
             <div>
               <span style={{ fontSize: 12.5, color: 'var(--accent-strong)', fontWeight: 600 }}>
                 This runs {effectiveN * 2} real model calls ({effectiveN} per arm × champion and challenger) and spends model credit.
               </span>
+              {/* CB-72: $ cost estimate — clearly labeled approximate */}
+              <div style={{ fontSize: 11.5, color: 'var(--accent-strong)', marginTop: 3, opacity: 0.85 }}>
+                ≈ ${(effectiveN * 2 * CALLS_COST_ESTIMATE).toFixed(2)} (approximate)
+              </div>
               {wasFloored ? (
                 <div style={{ fontSize: 11.5, color: 'var(--accent-strong)', marginTop: 3, opacity: 0.8 }}>
                   Your input ({n}) is below the minimum sample of {N_MIN} — the run will use {effectiveN} calls per arm.
@@ -759,10 +863,18 @@ function RunDrawer({
             </div>
           ) : null}
 
-          <button className="btn btn-primary" onClick={submit} disabled={!canSubmit}>
-            <Icon name="play" size={16} />
-            {busy ? 'Running…' : `Run experiment · ${effectiveN * 2} calls`}
-          </button>
+          <div>
+            <button className="btn btn-primary" style={{ width: '100%' }} onClick={submit} disabled={!canSubmit}>
+              <Icon name="play" size={16} />
+              {busy ? 'Running…' : `Run experiment · ${effectiveN * 2} calls`}
+            </button>
+            {/* CB-72: visible helper text when the launch button is disabled (not just grayed out) */}
+            {!canSubmit && !busy ? (
+              <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 5, textAlign: 'center' }}>
+                Make a change above to enable the run
+              </div>
+            ) : null}
+          </div>
         </div>
       </div>
     </>
@@ -783,12 +895,20 @@ function LabPageInner() {
   const [reviewEpisode, setReviewEpisode] = useState<string | undefined>(undefined);
   // experiment_ids freshly started this session, so a new card reads "Just run" until it settles.
   const [freshIds, setFreshIds] = useState<Set<string>>(new Set());
+  // CB-72: completion banner shown when a previously-running experiment settles to a terminal state.
+  // Dismissed by the operator; auto-cleared when they navigate away.
+  const [completionNotice, setCompletionNotice] = useState<{ title: string; state: string } | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // CB-73: the live store champion (may differ from an experiment's champion_version when tests or
+  // a rollback changed the lineage after the experiment ran — the drawer shows a mismatch note).
+  const [storeChampionVersion, setStoreChampionVersion] = useState<string | null | undefined>(undefined);
 
   const load = useCallback(async (): Promise<Experiment[] | undefined> => {
     try {
       const res = await fetchExperiments();
       setRows(res.experiments);
+      setStoreChampionVersion(res.store_champion_version ?? null);
       setError(null);
       return res.experiments;
     } catch (e) {
@@ -830,7 +950,12 @@ function LabPageInner() {
         const cur = res?.find((e) => e.experiment_id === exp.experiment_id);
         // Stop once the run settled out of `running`/`draft`, or the safety cap is hit.
         const settled = cur != null && cur.state !== 'running' && cur.state !== 'draft';
-        if ((settled || ticks >= MAX_TICKS) && pollRef.current) {
+        if (settled && pollRef.current) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+          // CB-72: show a dismissible completion banner when the previously-running experiment settles.
+          setCompletionNotice({ title: titleOf(cur), state: cur.state });
+        } else if (ticks >= MAX_TICKS && pollRef.current) {
           clearInterval(pollRef.current);
           pollRef.current = null;
         }
@@ -849,6 +974,39 @@ function LabPageInner() {
     <div className="page">
       <div className="page-scroll scroll">
         <div className="pad">
+          {/* CB-72: dismissible completion banner — shown when a polled experiment settles from
+              running to a terminal state. Uses the same notice strip idiom as improve/fidelity. */}
+          {completionNotice ? (
+            <div
+              className="row"
+              style={{
+                gap: 9,
+                alignItems: 'center',
+                padding: '10px 14px',
+                borderRadius: 10,
+                background: completionNotice.state === 'passed' ? 'var(--ok-soft)' : completionNotice.state === 'rejected' ? 'var(--surface-2)' : 'var(--accent-soft)',
+                border: `1px solid ${completionNotice.state === 'passed' ? 'var(--ok-border)' : completionNotice.state === 'rejected' ? 'var(--border)' : 'var(--accent-border)'}`,
+                marginBottom: 12,
+              }}
+            >
+              <Icon
+                name={completionNotice.state === 'passed' ? 'bolt' : 'flask'}
+                size={15}
+                style={{ color: completionNotice.state === 'passed' ? 'var(--ok)' : 'var(--accent-strong)', flexShrink: 0 }}
+              />
+              <span style={{ fontSize: 13, fontWeight: 550, color: completionNotice.state === 'passed' ? 'var(--ok)' : 'var(--text-2)', flex: 1 }}>
+                Experiment completed — &ldquo;{completionNotice.title}&rdquo; settled as {completionNotice.state}.
+              </span>
+              <button
+                className="gctl"
+                onClick={() => setCompletionNotice(null)}
+                style={{ width: 28, padding: 0, justifyContent: 'center', flexShrink: 0 }}
+                aria-label="Dismiss"
+              >
+                <Icon name="x" size={14} />
+              </button>
+            </div>
+          ) : null}
           <div className="row" style={{ marginBottom: 16, gap: 12 }}>
             <div className="seg">
               <button className={tab === 'active' ? 'on' : ''} onClick={() => setTab('active')}>
@@ -891,107 +1049,157 @@ function LabPageInner() {
             </div>
           ) : (
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
-              {visible.map((e) => (
-                <div
-                  key={e.experiment_id}
-                  className="card"
-                  style={{ cursor: 'pointer', overflow: 'hidden' }}
-                  onClick={() => setSel(e)}
-                >
-                  <div className="card-pad" style={{ paddingBottom: 12 }}>
-                    <div className="row" style={{ gap: 8, marginBottom: 9 }}>
-                      <span className="faint" style={{ fontSize: 11.5, fontWeight: 600 }}>{changeLabel(e)}</span>
-                      <span className={`tag ${STATE_TAG[e.state]} dot`}>{e.state_label}</span>
-                      {e.state === 'passed' && e.challenger_better && !e.is_extreme ? (
-                        <span className="tag ok">
-                          <Icon name="bolt" size={12} />
-                          Auto-promote ready
+              {visible.map((e) => {
+                // CB-71d: zombie detection — state="running" with no n and no target means this record
+                // never actually started a run; render as Draft so "Running + Draft" never co-exists.
+                const dispState = effectiveState(e);
+                // CB-71c: no-result detection — timeout/crash reason or n=0+rejected
+                const noRes = isNoResult(e);
+                // CB-71b: always humanize the card reason text (legacy records carry raw Python tokens)
+                const cardReason = e.guardrail_reason ? humanizeGuardrailReason(e.guardrail_reason) : null;
+                return (
+                  <div
+                    key={e.experiment_id}
+                    className="card"
+                    data-kind="exp-card"
+                    style={{ cursor: 'pointer', overflow: 'hidden' }}
+                    onClick={() => setSel(e)}
+                  >
+                    <div className="card-pad" style={{ paddingBottom: 12 }}>
+                      <div className="row" style={{ gap: 8, marginBottom: 9, flexWrap: 'wrap' }}>
+                        <span className="faint" style={{ fontSize: 11.5, fontWeight: 600 }}>{changeLabel(e)}</span>
+                        {/* CB-71d: use effectiveState chip — zombie shows Draft, never Running+Draft */}
+                        <span className={`tag ${STATE_TAG[dispState]} dot`}>{dispState === e.state ? e.state_label : 'Draft'}</span>
+                        {/* CB-71a: guardrail-regression chip VISIBLE ON THE CARD (not drawer-only) */}
+                        {e.guardrail === 'trip' ? (
+                          <span className="tag danger" style={{ gap: 5 }}>
+                            <Icon name="shield" size={12} />
+                            Guardrail regression
+                          </span>
+                        ) : null}
+                        {dispState === 'passed' && e.challenger_better && !e.is_extreme ? (
+                          <span className="tag ok">
+                            <Icon name="bolt" size={12} />
+                            Auto-promote ready
+                          </span>
+                        ) : null}
+                        {freshIds.has(e.experiment_id) ? (
+                          <span className="tag info">
+                            <Icon name="spark" size={12} />
+                            Just run
+                          </span>
+                        ) : null}
+                      </div>
+                      <div className="b" style={{ fontSize: 15, fontFamily: 'var(--font-display)', letterSpacing: '-0.02em' }}>{titleOf(e)}</div>
+                      <div className="row" style={{ gap: 8, marginTop: 6 }}>
+                        <span className="tag">
+                          {versionLabel(e.champion_version)}
+                          <Icon name="arrowR" size={11} />
+                          {versionLabel(e.challenger_version)} · {changeLabel(e)}
                         </span>
-                      ) : null}
-                      {freshIds.has(e.experiment_id) ? (
-                        <span className="tag info">
-                          <Icon name="spark" size={12} />
-                          Just run
-                        </span>
-                      ) : null}
+                        <span className="muted" style={{ fontSize: 12 }}>{populationLabel(e.population)}</span>
+                      </div>
                     </div>
-                    <div className="b" style={{ fontSize: 15, fontFamily: 'var(--font-display)', letterSpacing: '-0.02em' }}>{titleOf(e)}</div>
-                    <div className="row" style={{ gap: 8, marginTop: 6 }}>
-                      <span className="tag">
-                        {versionLabel(e.champion_version)}
-                        <Icon name="arrowR" size={11} />
-                        {versionLabel(e.challenger_version)} · {changeLabel(e)}
-                      </span>
-                      <span className="muted" style={{ fontSize: 12 }}>{populationLabel(e.population)}</span>
-                    </div>
+                    {/* CB-58/CB-71c: only show the lift cells when the run produced real data AND is
+                        not a no-result record. A timed-out/crashed run has stored n but no real data —
+                        never render those as if they were a meaningful result. */}
+                    {!noRes && e.n > 0 ? (
+                      <>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', borderTop: '1px solid var(--border)' }}>
+                          <Cell l="Enroll Δ" v={pts(e.enroll_delta)} good={e.enroll_delta > 0} />
+                          {/* CB-72: tooltips on card Ladder Δ and Significance labels */}
+                          <Cell
+                            l="Ladder Δ"
+                            v={dec(e.delta)}
+                            good={e.delta > 0}
+                            tip="Average commitment level reached (0 none → 4 enrolled). Positive = challenger did better."
+                          />
+                          <Cell
+                            l="Significance"
+                            v={`${Math.round(e.significance * 100)}%`}
+                            last
+                            tip="Confidence the lift is real, not noise. ≥95% = statistically significant."
+                          />
+                        </div>
+                        {/* CB-72: small-n caution chip below the metric cells when n < 10/arm */}
+                        {e.n < SMALL_N_THRESHOLD ? (
+                          <div
+                            style={{
+                              padding: '7px 14px',
+                              borderTop: '1px solid var(--warn-border)',
+                              background: 'var(--warn-soft)',
+                              fontSize: 11,
+                              color: 'var(--warn)',
+                              display: 'flex',
+                              gap: 6,
+                              alignItems: 'center',
+                            }}
+                          >
+                            <Icon name="alert" size={12} />
+                            Small sample — directional only
+                          </div>
+                        ) : null}
+                      </>
+                    ) : null}
+                    {/* CB-24/CB-58/CB-71b: surface the humanized reason on the CARD — distinct
+                        stories per terminal outcome. Legacy raw reason text passes through
+                        humanizeGuardrailReason so "challenger_better is False" never renders. */}
+                    {(e.state === 'blocked' || e.state === 'rejected') && cardReason ? (
+                      <div
+                        style={{
+                          padding: '9px 16px',
+                          background: 'var(--danger-soft)',
+                          borderTop: '1px solid var(--danger-border)',
+                          fontSize: 11.5,
+                          color: 'var(--danger)',
+                          display: 'flex',
+                          gap: 7,
+                          alignItems: 'center',
+                        }}
+                      >
+                        <Icon name="alert" size={13} />
+                        {e.state === 'blocked'
+                          ? (cardReason ?? 'Held for approval')
+                          : (cardReason ?? 'Did not pass the bar')}
+                      </div>
+                    ) : null}
+                    {/* CB-57/CB-58: honest sample display. Running → "Running — results land in one
+                        batch" (no fabricated per-episode progress). Completed with data → n/target.
+                        No-result/failed/timed-out → omit the bar entirely (CB-71c). */}
+                    {dispState === 'running' ? (
+                      <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
+                        <div className="row" style={{ gap: 7, alignItems: 'center' }}>
+                          <span className="faint" style={{ fontSize: 11 }}>Running</span>
+                          <span className="muted" style={{ fontSize: 11 }}>— results land in one batch</span>
+                        </div>
+                        <div className="bar" style={{ marginTop: 5 }}>
+                          <i style={{ width: '30%', background: 'var(--accent)', opacity: 0.5 }} />
+                        </div>
+                      </div>
+                    ) : !noRes && e.n > 0 ? (
+                      <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
+                        <div className="row" style={{ justifyContent: 'space-between', marginBottom: 5 }}>
+                          <span className="faint" style={{ fontSize: 11 }}>Sample</span>
+                          <span className="mono" style={{ fontSize: 11.5 }}>{e.n} / {e.target || '—'}</span>
+                        </div>
+                        <div className="bar">
+                          <i
+                            style={{
+                              width: `${e.target ? Math.min(100, (e.n / e.target) * 100) : 0}%`,
+                              background: e.target && e.n >= e.target ? 'var(--ok)' : 'var(--accent)',
+                            }}
+                          />
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
-                  {/* CB-58: only show the lift cells when the run produced real data (n > 0). A
-                      failed/timed-out run has n=0 and all schema defaults at zero — never render
-                      those as if they were a meaningful result. */}
-                  {e.n > 0 ? (
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', borderTop: '1px solid var(--border)' }}>
-                      <Cell l="Enroll Δ" v={pts(e.enroll_delta)} good={e.enroll_delta > 0} />
-                      <Cell l="Ladder Δ" v={dec(e.delta)} good={e.delta > 0} />
-                      <Cell l="Significance" v={`${Math.round(e.significance * 100)}%`} last />
-                    </div>
-                  ) : null}
-                  {/* CB-24/CB-58: surface the failure/rejection reason on the CARD — distinct
-                      stories per terminal outcome. "Needs approval" only on blocked state. */}
-                  {e.state === 'blocked' || e.state === 'rejected' ? (
-                    <div
-                      style={{
-                        padding: '9px 16px',
-                        background: 'var(--danger-soft)',
-                        borderTop: '1px solid var(--danger-border)',
-                        fontSize: 11.5,
-                        color: 'var(--danger)',
-                        display: 'flex',
-                        gap: 7,
-                        alignItems: 'center',
-                      }}
-                    >
-                      <Icon name="alert" size={13} />
-                      {e.state === 'blocked'
-                        ? (e.guardrail_reason ?? 'Held for approval')
-                        : (e.guardrail_reason ?? 'Did not pass the bar')}
-                    </div>
-                  ) : null}
-                  {/* CB-57/CB-58: honest sample display. Running → "Running — results land in one
-                      batch" (no fabricated per-episode progress). Completed with data → n/target.
-                      Failed/timed-out with no data (n=0) → omit the bar entirely. */}
-                  {e.state === 'running' ? (
-                    <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
-                      <div className="row" style={{ gap: 7, alignItems: 'center' }}>
-                        <span className="faint" style={{ fontSize: 11 }}>Running</span>
-                        <span className="muted" style={{ fontSize: 11 }}>— results land in one batch</span>
-                      </div>
-                      <div className="bar" style={{ marginTop: 5 }}>
-                        <i style={{ width: '30%', background: 'var(--accent)', opacity: 0.5 }} />
-                      </div>
-                    </div>
-                  ) : e.n > 0 ? (
-                    <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
-                      <div className="row" style={{ justifyContent: 'space-between', marginBottom: 5 }}>
-                        <span className="faint" style={{ fontSize: 11 }}>Sample</span>
-                        <span className="mono" style={{ fontSize: 11.5 }}>{e.n} / {e.target || '—'}</span>
-                      </div>
-                      <div className="bar">
-                        <i
-                          style={{
-                            width: `${e.target ? Math.min(100, (e.n / e.target) * 100) : 0}%`,
-                            background: e.target && e.n >= e.target ? 'var(--ok)' : 'var(--accent)',
-                          }}
-                        />
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
       </div>
-      {sel ? <ExpDrawer e={sel} onClose={() => setSel(null)} /> : null}
+      {sel ? <ExpDrawer e={sel} storeChampionVersion={storeChampionVersion} onClose={() => setSel(null)} /> : null}
       {runOpen ? (
         <RunDrawer
           onClose={() => {

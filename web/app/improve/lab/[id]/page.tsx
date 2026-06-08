@@ -7,6 +7,8 @@
 // timed-out run that persisted no arm episodes shows the summary + reason with an empty-calls note.
 // CB-65: ladderTierLabel/humanizeDiffDescription/humanizeGuardrailReason applied to arm rows + diff
 // header + guardrail reason card — no "tier 0"/"is False"/Python kwargs render to the operator.
+// CB-70: detail header uses the same titleOf logic (humanizeDiffDescription fallback) so a blank-name
+// or raw-mutation-name record never shows the raw mutation string as the page title.
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
@@ -19,6 +21,26 @@ import { dimensionLabel, humanizeDiffDescription, humanizeGuardrailReason, ladde
 
 function changeLabel(dimension: string, dimensionLabelText: string): string {
   return dimensionLabelText || dimensionLabel(dimension);
+}
+
+// CB-70: same raw-mutation detection as the lab list page — must never render as a page title.
+const RAW_MUTATION_RE = /^(reorder|set|perturb)\s+[a-z_]+/i;
+
+// Derive the display title for the detail header. Mirrors the lab page's titleOf logic:
+// blank / "draft" / raw mutation strings → humanized diff description → change label.
+function titleOfDetail(
+  name: string | null | undefined,
+  diffDescription: string | null | undefined,
+  dimension: string,
+  dimensionLabelText: string,
+): string {
+  const n = (name ?? '').trim();
+  const isRawMutation = RAW_MUTATION_RE.test(n) && n.includes('->');
+  if (!n || n.toLowerCase() === 'draft' || isRawMutation) {
+    const humanDiff = humanizeDiffDescription(diffDescription);
+    return humanDiff || changeLabel(dimension, dimensionLabelText);
+  }
+  return n;
 }
 
 // outcome slug -> a chip color class (the LABEL text comes from outcomeLabel; this is color only).
@@ -178,7 +200,8 @@ export default function ExperimentDetailPage({ params }: { params: { id: string 
                   <span className="tag dot">{e.state_label}</span>
                 </div>
                 <div className="b" style={{ fontSize: 19, fontFamily: 'var(--font-display)', letterSpacing: '-0.02em' }}>
-                  {e.name || changeLabel(e.dimension, e.dimension_label)}
+                  {/* CB-70: use titleOfDetail so raw mutation strings / blank names never render */}
+                  {titleOfDetail(e.name, e.diff_description, e.dimension, e.dimension_label)}
                 </div>
                 <div className="row" style={{ gap: 8, marginTop: 8 }}>
                   <span className="tag">

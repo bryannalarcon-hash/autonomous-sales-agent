@@ -69,6 +69,49 @@
 - **Acceptance:** replay turn-6 shape: either no trailing question on the terminal line, or the caller's number is captured into the lead before the session closes; no session ends on an unanswered direct question from the agent.
 - **Refs:** CB-61 replay transcript /tmp/qa7/cb61_replay_transcript.txt (turn 6); CB-68 Done entry.
 
+### CB-73 — Integration tests must stop polluting the dev DB's lineage/episodes (the v0-vs-v1 header confusion)
+- **Type / Surface / Size:** bug · `tests` (integration fixtures) · `web` (baseline-mismatch copy) · M
+- **Current (QA9 Sev-2 #4 + orchestrator diagnosis):** the header says "Champion v1" while experiments honestly baseline champion_v0 (CB-59 fallback). The v1 lineage rows are TEST-SEEDED — DB-gated integration tests write version lineage + episodes into the shared dev Postgres on every suite run (hash churns per run; pre-existing, flagged during CB-59). An operator cannot resolve the mismatch.
+- **Desired:** integration tests write lineage/episodes to an isolated target (dedicated test DB/schema or guaranteed teardown) so the dev header reflects reality; AND when an experiment's baseline ≠ the store champion, the drawer says why in one plain sentence ("baseline v0 — the promoted champion isn't materialized; see Versions").
+- **Acceptance:** full suite run leaves version_lineage/episode rows unchanged in the dev DB; mismatch copy renders when applicable.
+- **Refs:** QA9 lab Sev-2 #4; CB-59 Done entry follow-ups.
+
+### CB-74 — KPI page must never default into an empty population
+- **Type / Surface / Size:** bug · `web` (KPI) · S–M
+- **Current (QA9-ops CRITICAL):** fresh load of /operate/kpi auto-selects the live champion (CB-59 round-1 behavior) — but the lineage hash churns (CB-73 pollution), so v1-tagged episodes don't match the newest hash → "No episodes match v1" on every fresh visit. Operators see an empty KPI page with no guidance.
+- **Desired:** auto-select only a POPULATED version (fall back to the most-populated/default view when the live champion has zero episodes, with a one-line note "the live champion has no recorded calls yet — showing <X>"); never an unexplained empty default.
+- **Acceptance:** fresh /operate/kpi load renders data; explicit empty selections show guidance; qa playwright check.
+- **Refs:** QA9-ops bug #1; /tmp/qa9/f07_kpi.png; interacts with CB-73 (root) — this is the display-side guard.
+
+### CB-75 — Operate polish round 2 (label dup, hint→affordance, counts, sort visibility, leaks)
+- **Type / Surface / Size:** bug · `web` (operate) · `api` (count) · M
+- **Current (QA9-ops):** "Champion **Champion** v0" doubled label when the review panel opens (HIGH); the escalation cohort hint is raw pasted text, not a link/affordance (HIGH); "75 real calls" label vs 76 rendered rows (off-by-one); sidebar badge and Unreviewed tab fetched separately (±1 race renders on one screen); `establish_who_first` strategy slug leaks in the Live sample-call belief panel; sort gives no visible direction glyph for sighted users and LADDER/VERSION columns silently eat clicks; DURATION ⇅ doesn't visibly reorder; three filter chips (Booked/Interested/No interest) return empty tables with no "no match" message; "CALL ID" raw 32-hex field in drawer (shorten + copy affordance).
+- **Desired:** each item fixed or explicitly waived; counts on one screen come from one fetch.
+- **WAIVED with evidence:** "review pages 404 on direct URL" — disproven live (200 + proper render for real and bogus ids; agent artifact).
+- **Acceptance:** the QA9-ops bug list re-checked item-by-item by a playwright script; leak sweep extended with the belief-panel surface.
+- **Refs:** QA9-ops bugs #2–#8, #10.
+
+### CB-76 — Listening v2: disjunctive/plural windows, more deadline forms, never-deny, contact ack
+- **Type / Surface / Size:** bug · `core` (`dst`, `nlg`) · M
+- **Current (QA9-chat CRITICAL):** "Wednesdays or Fridays after 4" (plural, disjunctive) never fills callback_window → asked "did I already tell you when works for me?" the agent CONFIDENTLY DENIED: "No, you haven't shared any times yet" (the final confirm later got it right from raw history — the slot was empty, the info wasn't). "state testing is end of the month" deadline form not extracted and never acknowledged. Name+phone accepted with zero acknowledgment (inconsistent with the Karen replay's echo).
+- **Desired:** (a) extractor covers plural/disjunctive day windows ("Wednesdays or Fridays after 4", capture the whole phrase) + deadline forms ("end of the month", "next month", "this semester"); (b) HARD NLG RULE: never assert the caller did NOT previously say something — when asked "did I tell you X", confirm from the visible history or hedge ("let me confirm: …?"), never deny; (c) contact details (name/phone/email) get a one-line acknowledgment when captured.
+- **Acceptance:** deterministic tests for each extraction form + the deny scenario (canned LLM); scripted replay of QA9 conv-2 shows ack at msg 1, no denial at msg 5, deadline acknowledged.
+- **Refs:** QA9-chat bugs #1, #2, #4; builds on CB-61.
+
+### CB-77 — Price persistence: terse re-asks must trigger the answer, range must carry numbers
+- **Type / Surface / Size:** bug · `core` (`gates` recurrence, `nlg`) · S–M
+- **Current (QA9-chat HIGH):** ask 1 got "a few hundred dollars a month" (no floor/ceiling); asks 2–3 ("just give me the number", "monthly cost. just the number.") got qualification/consult pivots — the terse re-asks share too few content words with ask 1 for `_question_recurs`, so CB-48's forcing never fired. Karen's replay (verbose asks) worked.
+- **Desired:** price-recurrence detection keys on price intent (price_inquiry act repetition / price tokens), not just shared content words; a direct price answer always carries the KB-grounded floor–ceiling (e.g. "$40–80/hr" or the monthly range), not "a few hundred".
+- **Acceptance:** deterministic test: three terse re-asks → second ask at latest is answer_via_kb with pricing facts in prompt; eval-judge directness axis on the skeptic persona improves.
+- **Refs:** QA9-chat bugs #3, #6; builds on CB-48/CB-62.
+
+### CB-78 — First-message cold start (~10s to first token) + mid-stream double-send queueing
+- **Type / Surface / Size:** bug · `api`/`web` (demo) · S–M
+- **Current (QA9-chat MEDIUM/INFO):** a session's first message showed 16ms-to-indicator but 10.0s-to-first-text (later turns 9–13ms-to-first-text scale); suspects: first-turn lazy load (KB retrieve / route compile / OpenRouter connection warmup) — diagnose, don't guess. Mid-stream, a second Send was accepted and queued server-side (no client block) — no corruption, but the queue door is open.
+- **Desired:** first-turn latency near later-turn latency (warm whatever is cold at startup), or an honest "connecting…" state; client blocks Send while a stream is active.
+- **Acceptance:** measured first-turn first-token within ~2× of later turns; mid-stream Send is a no-op client-side.
+- **Refs:** QA9-chat bugs #5, #10; streaming measurement table.
+
 ### CB-01 — Active-calls queue with per-call take-over
 - **Type / Surface / Size:** feature · `/operate/live` · `api` · `voice-worker` · L
 - **Prereqs:** — *(no other CB blocks it; internally it has 3 work units that order themselves: the list endpoint → the queue UI → the take-over mechanism. Split into `CB-01.a/.b/.c` when pulled.)*
@@ -130,6 +173,30 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-72 — Lab UX clarity batch (cost estimate, disabled-button hint, toast, tooltips, small-n)
+- **Type / Surface / Size:** change · `web` (lab) · S–M
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `web/app/improve/lab/page.tsx` ($0.025/call estimate constant → "≈ $X.XX (approximate)"; disabled-button helper text; completion toast via the fidelity notice idiom; Ladder/Significance/CI `title=` tooltips; small-n caution chip at n<10; `data-kind="exp-card"` to dedupe the render).
+- **What changed:** the QA9 Sev-3 friction items resolved; the "double render" was a test-selector artifact (`.card` + `.card-pad`), now disambiguated with a data attribute.
+- **Verification:** qa9fix_lab.py (10) + leak sweep (12) green live; full suite 855p/5s.
+- **Follow-ups / known gaps:** $ estimate uses a hardcoded per-call constant (matches measured ~$0.025); drift if model mix changes.
+
+### CB-71 — One truthful display state machine for experiment records (incl. legacy rows)
+- **Type / Surface / Size:** bug · `web` (lab) · S–M
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `web/app/improve/lab/page.tsx` + `[id]/page.tsx` (`isNoResult`/`effectiveState` helpers; guardrail-regression chip on card + drawer; `humanizeGuardrailReason` on every reason surface; no-result records suppress metrics; zombie draft renders as Draft).
+- **What changed:** one state machine for all records (table in the coder report): guardrail regression now visible on the card, legacy `challenger_better is False` translated everywhere, the timeout card no longer shows fabricated metrics, zombie "Running+Draft" renders Draft only.
+- **Verification:** qa9fix_lab.py asserts each legacy-card shape; full suite 855p/5s.
+- **Follow-ups / known gaps:** no-result detection matches two known legacy reason strings explicitly (commented) — a stored-state flag would be cleaner if the schema gains one.
+
+### CB-70 — Blank/raw experiment name falls back to the humanized description
+- **Type / Surface / Size:** bug · `web` (lab list/detail) · S
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `web/app/improve/lab/page.tsx` (`titleOf`) + `[id]/page.tsx` (`titleOfDetail`): `RAW_MUTATION_RE` detects a raw mutation string persisted as the name and falls back to `humanizeDiffDescription` → `changeLabel`; `tests/e2e/qa7_cb65_leaksweep.py` extended with a `-> [` title assertion.
+- **What changed:** the Sev-1 — the `name` field actually held the raw `reorder discovery_sequence -> [...]` string (not blank); now detected and humanized on card/Past/detail.
+- **Verification:** leak sweep 12/12 incl. the known QA9 record; full suite 855p/5s.
+- **Follow-ups / known gaps:** the raw string is still STORED as the name (display-layer fix); a future run-creation fix could store the humanized name (low priority).
 
 ### CB-65 — Viewer-facing leak sweep (slugs, IDs, debug artifacts)
 - **Type / Surface / Size:** bug · `web` (all surfaces) · M
