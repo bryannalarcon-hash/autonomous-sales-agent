@@ -17,14 +17,15 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# 1) torch CPU first (the heavy transitive dep) — pin to the CPU index so no CUDA wheels are pulled.
-RUN pip install --index-url https://download.pytorch.org/whl/cpu torch
+# 1) torch CPU first, PINNED to the version that works locally (unpinned/CPU-index torch resolved
+#    older than transformers expected → "module 'torch' has no attribute 'float8_e8m0fnu'").
+RUN pip install --index-url https://download.pytorch.org/whl/cpu torch==2.12.0
 
-# 2) project deps + the rag extra (sentence-transformers). Copy only what the install needs first
-#    so this layer caches across source-only changes.
+# 2) project (base deps) + the ML stack PINNED to the locally-verified set so the version skew can't
+#    recur. torch is already satisfied (2.12.0), so these don't re-pull it.
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install ".[rag]"
+RUN pip install . "sentence-transformers==5.5.1" "transformers==5.9.0"
 
 # 3) bake the embedder model into the image so the first live turn / KB ingest is offline + instant.
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')"
