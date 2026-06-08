@@ -13,6 +13,8 @@
 // CB-65: ladderTierLabel translates commitment-ladder tier ints to human labels (mirrors the Python
 // LADDER_TIER_LABEL map in src/api/labels.py). kbVersionLabel translates a raw kb_version slug
 // ("kb_v0") to a human-readable form ("Knowledge base v0") for header chips and inline tags.
+// CB-75: GATE_LABELS extended with establish_who_first + no_repeat_discovery (CB-34/CB-35 gate slugs
+// that appear in live-panel rationales). humanizeRationale now used in live/page.tsx too.
 
 // Strip the internal suffixes from a raw version id for display: the experiment dimension/seq suffix
 // ("champion_v0__playbooks_discovery_sequence__7" -> "champion_v0") and any short hash
@@ -123,6 +125,7 @@ const DRIVER_LABELS: Record<string, string> = {
 // Gate-name prefixes (the internal policy-gate identifiers a rationale leads with, e.g.
 // "pushiness_cap: …") → human gate labels. These are NOT thresholds — they name the override gate that
 // fired. Unmapped gate names fall through to Title Case.
+// CB-75: establish_who_first (CB-34 gate) added so its rationale never leaks the raw slug.
 const GATE_LABELS: Record<string, string> = {
   pushiness_cap: 'Pushiness cap',
   advance_to_close: 'Advance to close',
@@ -132,6 +135,8 @@ const GATE_LABELS: Record<string, string> = {
   skip_known: 'Skip known slot',
   address_direct_input: 'Address direct input',
   offer_low_commitment_on_budget: 'Offer free callback',
+  establish_who_first: 'Establish who first',
+  no_repeat_discovery: 'No repeat discovery',
 };
 
 // Build the union of every multi-word snake_case slug we humanize, LONGEST-first so a compound slug

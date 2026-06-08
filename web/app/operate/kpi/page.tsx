@@ -25,6 +25,13 @@
 // first. Hash suffixes are an internal index and are NOT rendered. The COMPARE baseline continues to
 // probe AT MOST 2 of the most-populated non-selected candidates so entering Compare costs a handful
 // of requests, not dozens.
+//
+// CB-74 — auto-select guard: on fresh load, the page auto-advances to the live champion ONLY when
+// the champion has recorded episodes (count > 0 in the episode-derived option list). When the live
+// champion has no episodes yet (count == 0 — hash churn keeps its tag out of the episode table),
+// the page stays on the most-populated option and shows a one-line informational note so the operator
+// is never dumped into an unexplained empty state. A manual selection that is empty keeps the empty
+// state but gains a hint ("Try another version or cohort.") so the operator knows how to recover.
 'use client';
 
 import { useEffect, useState } from 'react';
@@ -157,8 +164,11 @@ export default function KpiPage() {
   // store champion resolves (fetchVersions probe), the selector auto-advances to the live champion
   // if the user hasn't manually changed the selection yet. `userPickedVersion` tracks whether the
   // user has overridden the default so we don't silently clobber their selection.
+  // CB-74: champNote is set when the live champion has 0 episodes and we fall back to a populated
+  // version — the note names the live champion and explains why we're showing something else.
   const [version, setVersion] = useState(SEEDED_VERSION);
   const [userPickedVersion, setUserPickedVersion] = useState(false);
+  const [champNote, setChampNote] = useState<string | null>(null);
   const [cohort, setCohort] = useState('All');
   const [versionOptions, setVersionOptions] = useState<VersionOption[]>([
     { value: SEEDED_VERSION, label: versionLabel(SEEDED_VERSION), count: 0 },
@@ -209,14 +219,25 @@ export default function KpiPage() {
 
         if (final.length > 0) {
           setVersionOptions(final);
-          // CB-59: auto-advance the selection to the live champion when the user hasn't overridden
-          // the default. This ensures the KPI page opens on the live champion's performance, not the
-          // bootstrap default — matching what the Versions page and lab drawer label as "production".
+          // CB-59 / CB-74: auto-advance to the live champion ONLY when it has recorded episodes
+          // (count > 0). If the champion's count is 0 (hash churn keeps its tag absent from the
+          // episode table), fall back to the most-populated option and show a one-line note so the
+          // operator isn't dropped into an unexplained empty KPI page.
           if (champVer && !userPickedVersion) {
-            // Use the most-populated raw id that maps to the champion label (could be the champion
-            // itself if it has episodes, or the injected 0-count entry if not yet in episode table).
             const champOpt = final.find((o) => versionLabel(o.value) === champLabel);
-            if (champOpt) setVersion(champOpt.value);
+            if (champOpt && champOpt.count > 0) {
+              // Champion has episodes — safe to auto-select.
+              setVersion(champOpt.value);
+              setChampNote(null);
+            } else if (champOpt) {
+              // CB-74: champion exists in store but has zero recorded calls. Keep the most-populated
+              // option (first in the episode-derived list, or SEEDED_VERSION) and surface a note.
+              const populated = final.find((o) => o.count > 0) ?? final[0];
+              if (populated) setVersion(populated.value);
+              setChampNote(
+                `The live champion (${champLabel}) has no recorded calls yet — showing ${populated.label}.`,
+              );
+            }
           }
         }
       })
@@ -327,6 +348,26 @@ export default function KpiPage() {
             </select>
           </div>
 
+          {/* CB-74: one-line informational note when the live champion has no episodes and we fell
+              back to a populated version. Muted so it reads as context, not an alarm. */}
+          {champNote ? (
+            <div
+              className="row"
+              style={{
+                gap: 8,
+                alignItems: 'center',
+                marginBottom: 14,
+                padding: '7px 12px',
+                borderRadius: 10,
+                background: 'var(--surface-2, var(--surface))',
+                border: '1px solid var(--border)',
+              }}
+            >
+              <Icon name="alert" size={13} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+              <span className="muted" style={{ fontSize: 12.5 }}>{champNote}</span>
+            </div>
+          ) : null}
+
           {error ? (
             <div className="card">
               <div className="empty">
@@ -350,7 +391,11 @@ export default function KpiPage() {
                   <Icon name="chart" size={28} />
                 </div>
                 <h3>No calls for this selection</h3>
-                <p>No episodes match {versionLabel(version)} {cohort === 'All' ? '' : `· ${populationLabel(cohort)}`}. Try another filter.</p>
+                {/* CB-74: for manual selections that resolve empty, give a recovery hint. */}
+                <p>
+                  No episodes match {versionLabel(version)}{cohort === 'All' ? '' : ` · ${populationLabel(cohort)}`}.{' '}
+                  Try another version or cohort.
+                </p>
               </div>
             </div>
           ) : mode === 'compare' && data.compare ? (

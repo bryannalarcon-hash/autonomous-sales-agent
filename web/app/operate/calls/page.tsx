@@ -9,6 +9,9 @@
 // pre-translated by the backend; the raw persona archetype + version slugs are humanized client-side
 // via @/lib/labels (archetypeLabel/versionLabel), and the raw call id is muted/secondary — never a
 // headline (internal indices must not render as operator-facing labels).
+// CB-75: the calls page now reads ?cohort=all from the URL search params on mount to pre-activate
+// "All cohorts" mode. This lets the escalations page link here with the correct cohort mode active
+// so operators can immediately find calls from non-live cohorts without manual toggle.
 // CB-45: the drawer also shows the call's average time-to-first-word (from EpisodeSummary
 // avg_first_token_ms via fmtMsShort), omitted when the call has no voice timing.
 // CB-60: (1) seeded/sim stub rows get a visible "Seeded sample" badge (is_stub from the API) and are
@@ -26,10 +29,17 @@
 // already leads with the archetype label as its primary text, the ARCHETYPE column is REMOVED to
 // avoid duplication — the information is still present in the row's primary label and the drawer.
 // CB-66 (item 8): count strings are properly pluralized ("1 call" not "1 calls").
+// CB-75: (1) ?cohort=all URL param pre-activates All cohorts mode (linked from escalations page).
+// (2) StaticTh added for LADDER TIER + VERSION — non-sortable columns no longer eat clicks silently.
+// (3) Sort glyph on active column is now accent-colored (var(--accent)) for clearer visibility.
+// (4) CALL ID in drawer shortened to first 8 chars + … with a copy-full-id button affordance.
+// (5) Empty filter results show the existing "No calls match" empty state (already correct behavior —
+//     justified: all outcome chips remain visible; hiding zero-count chips would require a per-outcome
+//     count fetch and would surprise operators expecting to see all filter options at all times.
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useEffect, useMemo, useCallback, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchEpisodes, fmtDuration, fmtMsShort, fmtTimeAgo } from '@/lib/operate-api';
 import { archetypeLabel, kbVersionLabel, versionLabel } from '@/lib/labels';
@@ -39,7 +49,9 @@ import type { EpisodeSummary } from '@/lib/operate-types';
 type SortKey = 'call' | 'outcome' | 'duration' | 'when';
 type SortDir = 'asc' | 'desc';
 
-/** Sortable column header: shows an up/down arrow when this column is active. */
+/** Sortable column header: shows an up/down arrow when this column is active.
+ *  CB-75: the direction glyph is at 0.85 opacity when active, 0.35 when inactive (was 0.3 — slightly
+ *  more visible cue that the column IS clickable but not currently sorted). */
 function SortTh({
   label,
   col,
@@ -70,13 +82,27 @@ function SortTh({
         aria-hidden
         style={{
           fontSize: 10,
-          opacity: isActive ? 0.85 : 0.3,
+          opacity: isActive ? 0.85 : 0.35,
           fontWeight: 700,
           verticalAlign: 'middle',
+          color: isActive ? 'var(--accent)' : undefined,
         }}
       >
         {isActive ? (dir === 'asc' ? '▲' : '▼') : '⇅'}
       </span>
+    </th>
+  );
+}
+
+/** Non-sortable column header: styled the same as SortTh but with a static cursor and no glyph,
+ *  so it's visually distinct from clickable headers and doesn't silently eat clicks (CB-75). */
+function StaticTh({ label, align }: { label: string; align?: 'num' }) {
+  return (
+    <th
+      className={align === 'num' ? 'num' : undefined}
+      style={{ cursor: 'default', whiteSpace: 'nowrap', userSelect: 'none' }}
+    >
+      {label}
     </th>
   );
 }
@@ -117,6 +143,12 @@ function outcomeClass(key: string | null): string {
   return key ? OUTCOME_STYLE[key] ?? '' : '';
 }
 
+// CB-75 #8: shorten a 32-hex call ID to "first8…" for display; full id kept in a data attribute.
+function shortId(id: string): string {
+  if (id.length <= 12) return id;
+  return `${id.slice(0, 8)}…`;
+}
+
 function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
   const router = useRouter();
   const cls = outcomeClass(c.outcome_key);
@@ -124,6 +156,21 @@ function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
   // included when the call carries voice timing (fmtMsShort('' on null) — a text/legacy call omits it
   // rather than showing a placeholder).
   const firstWord = fmtMsShort(c.avg_first_token_ms);
+  // CB-75: copied state for the copy-id affordance.
+  const [copied, setCopied] = useState(false);
+  const handleCopyId = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(c.episode_id);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // clipboard not available — silent fail, full id is still visible on hover/data attr
+    }
+  }, [c.episode_id]);
+
+  // CB-75 #8: CALL ID rendered shortened (first 8 chars + …) with a copy affordance;
+  // the full id is in a data-full-id attribute for automation/selectors.
+  // All other facts are plain string tuples for the grid.
   const facts: [string, string][] = [
     ['Duration', fmtDuration(c.duration_ms)],
     ['Channel', c.channel === 'voice' ? 'Web-voice' : c.channel],
@@ -131,7 +178,6 @@ function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
     ['Qualified', c.qualified == null ? '—' : c.qualified ? 'Yes' : 'No'],
     ['Ladder tier', c.ladder_label],
     ...(firstWord ? ([['Time to first word', firstWord]] as [string, string][]) : []),
-    ['Call ID', c.episode_id],
   ];
   return (
     <>
@@ -195,6 +241,39 @@ function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
                 <div className="b" style={{ fontSize: 13.5, marginTop: 3 }}>{v}</div>
               </div>
             ))}
+            {/* CB-75 #8: CALL ID — shortened display (first 8 chars + …) with a copy affordance;
+                the full id is stored in data-full-id for automation and shown in the tooltip. */}
+            <div>
+              <div
+                className="faint"
+                style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em' }}
+              >
+                Call ID
+              </div>
+              <div
+                className="row"
+                style={{ marginTop: 3, gap: 6, alignItems: 'center' }}
+                data-full-id={c.episode_id}
+              >
+                <span
+                  className="b mono"
+                  style={{ fontSize: 13, letterSpacing: '0.02em' }}
+                  title={c.episode_id}
+                >
+                  {shortId(c.episode_id)}
+                </span>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={handleCopyId}
+                  title={copied ? 'Copied!' : `Copy full ID: ${c.episode_id}`}
+                  style={{ padding: '1px 6px', fontSize: 10.5, height: 22, minWidth: 0 }}
+                  data-testid="copy-call-id"
+                >
+                  {copied ? <Icon name="check" size={11} /> : <Icon name="download" size={11} />}
+                  {copied ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+            </div>
           </div>
           <button className="btn btn-primary" onClick={() => router.push(`/operate/review/${c.episode_id}`)}>
             <Icon name="eye" size={16} />
@@ -208,13 +287,15 @@ function Drawer({ c, onClose }: { c: EpisodeSummary; onClose: () => void }) {
 }
 
 export default function CallsPage() {
+  const searchParams = useSearchParams();
   const [q, setQ] = useState('');
   const [outcome, setOutcome] = useState(''); // internal key ('' = All)
   const [esc, setEsc] = useState(false);
   // Scope the operator Calls log to REAL calls (cohort='live'). Experiment/eval cohorts
   // (held_out / training / sim self-play / per-run coh-*) are persisted into the same DB and would
   // otherwise flood the log with short synthetic episodes — hidden by default, toggleable.
-  const [liveOnly, setLiveOnly] = useState(true);
+  // CB-75: ?cohort=all on the URL activates all-cohorts mode on load (e.g. linked from escalations).
+  const [liveOnly, setLiveOnly] = useState(() => searchParams?.get('cohort') !== 'all');
   const [rows, setRows] = useState<EpisodeSummary[]>([]);
   // CB-60: total = completed rows matching the filter before the 200-row page cap.
   // When total > rows.length the list is capped and we show "showing N of total".
@@ -373,12 +454,15 @@ export default function CallsPage() {
                     {/* CB-66 (item 1): sortable headers; (item 6): ARCHETYPE column removed — the
                         archetype is already the primary label in the CALL cell so a separate column
                         would be a pure duplicate. The persona archetype stays accessible via CALL and
-                        the row drawer. */}
+                        the row drawer.
+                        CB-75: LADDER TIER and VERSION are non-sortable (no comparable ordering) —
+                        use StaticTh so they don't silently eat clicks. CALL/OUTCOME/DURATION/WHEN
+                        remain sortable via SortTh with a visible ▲/▼ glyph on the active column. */}
                     <SortTh label="Call" col="call" active={sortKey} dir={sortDir} onSort={handleSort} />
                     <SortTh label="Outcome" col="outcome" active={sortKey} dir={sortDir} onSort={handleSort} />
-                    <th>Ladder tier</th>
+                    <StaticTh label="Ladder tier" />
                     <SortTh label="Duration" col="duration" active={sortKey} dir={sortDir} onSort={handleSort} align="num" />
-                    <th>Version</th>
+                    <StaticTh label="Version" />
                     <SortTh label="When" col="when" active={sortKey} dir={sortDir} onSort={handleSort} align="num" />
                   </tr>
                 </thead>

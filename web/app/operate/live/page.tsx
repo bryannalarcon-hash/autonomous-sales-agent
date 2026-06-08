@@ -42,13 +42,15 @@
 // CB-45 (live timing): when the voice worker is streaming a turn it also carries snap.live_timing
 // (first-token + stream-elapsed). ActiveAgentTurn renders a small human timing readout in its header
 // ("0.8s to first word · speaking 1.2s") beside the "speaking…" label — Cadence tokens, no raw ms key.
+// CB-75: TranscriptTurn.lv-rat now passes rationale through humanizeRationale (same as the review
+// page) so gate slugs like "establish_who_first: …" never render raw in the live belief panel.
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchActiveCalls, fetchLive, fetchSampleCall, fmtDuration, fmtFirstToken, fmtMsShort, initials } from '@/lib/operate-api';
-import { archetypeLabel, kbVersionLabel, versionLabel } from '@/lib/labels';
+import { archetypeLabel, humanizeRationale, kbVersionLabel, versionLabel } from '@/lib/labels';
 import type { ActiveCallSummary, ActiveCallsResponse, BeliefSnapshot, LiveSnapshot, LiveTiming, Turn } from '@/lib/operate-types';
 import { ApiError, API_BASE, startAutoDemo } from '@/lib/api';
 
@@ -111,7 +113,9 @@ function TranscriptTurn({ turn }: { turn: Turn }) {
           {latency ? <span className="lv-lat">{latency}</span> : null}
         </div>
       ) : null}
-      {isAgent && turn.rationale ? <div className="lv-rat">{`"${turn.rationale}"`}</div> : null}
+      {/* CB-75: rationale passes through humanizeRationale — same as the review page — so gate-name
+          slugs like "establish_who_first: …" and driver slugs never render raw in the live panel. */}
+      {isAgent && turn.rationale ? <div className="lv-rat">{`"${humanizeRationale(turn.rationale)}"`}</div> : null}
     </div>
   );
 }

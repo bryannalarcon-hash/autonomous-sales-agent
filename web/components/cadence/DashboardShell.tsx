@@ -13,6 +13,8 @@
 // (Escalations/Approvals counts) REVALIDATE without a refresh — a ~15s poll + focus/visibility refetch
 // in useNavBadges (CB-17). The KB nav entry's title reads "KB / Playbook" (no "Editor") since that
 // page is read-only. Pure chrome: pages render as {children} inside .main.
+// CB-75: fixed "Champion Champion v0" doubled label — versionLabel("champion_v0") already returns
+// "Champion v0"; the old literal "Champion " prefix caused the duplication when the review panel opened.
 'use client';
 
 import Link from 'next/link';
@@ -91,6 +93,10 @@ const BADGE_POLL_MS = 15000;
 // the tab regains focus / becomes visible. So after an operator rejects an approval or reviews an
 // escalation (on its own page), the badge here catches up within a poll / on the next focus, instead
 // of staying stale until the shell remounts. All timers/listeners are cleaned up on unmount.
+// CB-75: the escalations page fires a 'cadence:escalation-counts' CustomEvent with
+// {detail: {unreviewed: N}} whenever it fetches fresh counts. useNavBadges listens for this event
+// so the sidebar badge and the tab counts on the same screen always derive from ONE fetch result,
+// eliminating the ±1 race that occurred when the shell polled independently at a different moment.
 function useNavBadges(): Record<string, number> {
   const [badges, setBadges] = useState<Record<string, number>>({});
   useEffect(() => {
@@ -108,6 +114,16 @@ function useNavBadges(): Record<string, number> {
       });
     };
 
+    // CB-75: when the escalations page fetches fresh counts it broadcasts them here so both
+    // the badge and the tab counts on the same screen read from one fetch, not two.
+    const onEscalationCounts = (ev: Event) => {
+      if (cancelled) return;
+      const detail = (ev as CustomEvent<{ unreviewed?: number }>).detail;
+      if (typeof detail?.unreviewed === 'number') {
+        setBadges((prev) => ({ ...prev, '/operate/escalations': detail.unreviewed! }));
+      }
+    };
+
     refetch(); // initial load on mount
     const interval = setInterval(refetch, BADGE_POLL_MS);
 
@@ -118,12 +134,14 @@ function useNavBadges(): Record<string, number> {
     };
     window.addEventListener('focus', refetch);
     document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('cadence:escalation-counts', onEscalationCounts);
 
     return () => {
       cancelled = true;
       clearInterval(interval);
       window.removeEventListener('focus', refetch);
       document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('cadence:escalation-counts', onEscalationCounts);
     };
   }, []);
   return badges;
@@ -177,10 +195,13 @@ function GlobalControls() {
         <span>Talk to the agent</span>
         <Icon name="arrowR" className="gctl-chev" />
       </Link>
+      {/* CB-75: versionLabel("champion_v0") already returns "Champion v0" — the literal prefix
+          "Champion " was causing "Champion Champion v0" when the panel opened. Use the humanized
+          label directly; the "Champion" word comes from versionLabel, not from a literal here. */}
       <Link href="/improve/versions" className="gctl" title="Champion version — open Version History">
         <Icon name="shield" size={15} />
         <span>
-          Champion {champion ? <b>{versionLabel(champion.version)}</b> : <b>—</b>}
+          {champion ? <b>{versionLabel(champion.version)}</b> : <b>Champion —</b>}
         </span>
         {champion ? <span className="muted">{kbVersionTag(champion.kbVersion)}</span> : null}
         <Icon name="chevDown" className="gctl-chev" />

@@ -15,9 +15,13 @@
 // CB-66 (item 7): escalation cards and drawers now display the escalation timestamp (created_at).
 // The data was already serialized by the API (escalation_to_dict carries created_at) — it just
 // wasn't rendered. fmtTimeAgo from operate-api formats it as a relative "X min ago" string.
+// CB-75: cohort hint on cards/drawers is now an actionable link → /operate/calls?cohort=all so
+// the operator can navigate directly to the Calls list pre-filtered to all cohorts. The calls page
+// reads the ?cohort=all param on mount to initialize liveOnly=false.
 'use client';
 
 import { useEffect, useState } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { fetchEpisode, fetchEscalations, fmtTimeAgo, updateEscalationLifecycle } from '@/lib/operate-api';
@@ -226,13 +230,23 @@ function Drawer({
               ))}
             </div>
           ) : null}
-          {/* CB-60: if the linked call is from a non-live cohort, tell the operator how to find it
-              in the Calls list. The list defaults to "Real calls" (cohort=live) so a sim/eval call
-              won't appear there without switching to "All cohorts". */}
+          {/* CB-60 / CB-75: if the linked call is from a non-live cohort, give an actionable link to
+              the Calls list pre-activated with all-cohorts mode (?cohort=all). The calls page reads
+              this param on mount so the operator lands directly in the right view. */}
           {e.episode_cohort && e.episode_cohort !== 'live' ? (
-            <div className="row" style={{ gap: 7, alignItems: 'center', fontSize: 12, color: 'var(--text-3)' }}>
-              <Icon name="alert" size={13} />
-              This call is from the <b>{e.episode_cohort}</b> cohort — to find it in the Calls list, switch to &quot;All cohorts&quot;.
+            <div className="row" style={{ gap: 7, alignItems: 'center', fontSize: 12, color: 'var(--text-3)', flexWrap: 'wrap' }}>
+              <Icon name="alert" size={13} style={{ flexShrink: 0 }} />
+              <span>
+                This call is from the <b>{e.episode_cohort}</b> cohort —{' '}
+                <Link
+                  href="/operate/calls?cohort=all"
+                  style={{ color: 'var(--accent)', textDecoration: 'underline', fontWeight: 600 }}
+                  title="Open Calls list in All cohorts mode"
+                >
+                  open Calls list (All cohorts)
+                </Link>
+                {' '}to find it.
+              </span>
             </div>
           ) : null}
           <div className="row" style={{ gap: 10 }}>
@@ -306,6 +320,13 @@ export default function EscalationsPage() {
         if (!cancelled) {
           setData(res);
           setError(null);
+          // CB-75: broadcast the freshly-fetched unreviewed count to DashboardShell's useNavBadges
+          // so the sidebar badge and the tab counts on screen derive from one fetch, not two.
+          if (typeof res.counts?.unreviewed === 'number') {
+            window.dispatchEvent(
+              new CustomEvent('cadence:escalation-counts', { detail: { unreviewed: res.counts.unreviewed } }),
+            );
+          }
         }
       })
       .catch((e) => {
@@ -410,12 +431,18 @@ export default function EscalationsPage() {
                       </div>
                       <div className="b" style={{ fontSize: 14 }}>
                         Call <span className="mono">{e.episode_id}</span>
-                        {/* CB-60: cohort hint — tells the operator which filter to use in the Calls
-                            list to find this call. Non-live cohorts need "All cohorts" toggle. */}
+                        {/* CB-60 / CB-75: cohort hint on the card is now an affordance link to
+                            the Calls list pre-activated in All cohorts mode (?cohort=all). */}
                         {e.episode_cohort && e.episode_cohort !== 'live' ? (
-                          <span className="tag" style={{ marginLeft: 8, fontSize: 10.5, opacity: 0.7 }}>
-                            {e.episode_cohort} cohort — use All cohorts in Calls list
-                          </span>
+                          <Link
+                            href="/operate/calls?cohort=all"
+                            className="tag"
+                            style={{ marginLeft: 8, fontSize: 10.5, opacity: 0.85, color: 'var(--accent)', textDecoration: 'underline' }}
+                            title="Open Calls list in All cohorts mode to find this call"
+                            onClick={(ev) => ev.stopPropagation()}
+                          >
+                            {e.episode_cohort} cohort — view in Calls list
+                          </Link>
                         ) : null}
                       </div>
                       <div className="muted" style={{ fontSize: 12.5, marginTop: 3, maxWidth: 680 }}>{e.moment}</div>
