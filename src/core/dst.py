@@ -857,6 +857,31 @@ def _ground_objection(objection: Optional[str], utterance: str) -> Optional[str]
     return objection if pat.search(_normalize_punct(utterance or "")) else None
 
 
+# CB-67: broad lexical cue set for grounding an LLM-proposed human_request (looser than the strict
+# _HUMAN_REQUEST_RE so genuine paraphrases survive, but it must at least NAME a person to talk to or
+# a speak/talk/transfer intent). "Can you tell me how this works?" has zero cues and must NOT pass —
+# the DST LLM hallucinated human_request on exactly that, and escalation_triggers treats an explicit
+# human request as a TERMINAL escalate, ending a brand-new call on turn 1 (caught by the CB-61 replay).
+_HUMAN_REQUEST_CUES_RE = re.compile(
+    r"\b(?:human|person|people|someone|somebody|representative|rep|agent|advisor|operator|manager|"
+    r"specialist|staff|speak|talk|transfer|call\s+me\s+back|real\s+person)\b",
+    re.IGNORECASE,
+)
+
+
+def _ground_human_request(act: Optional[str], utterance: str) -> Optional[str]:
+    """Keep an LLM-proposed 'human_request' ONLY when the utterance carries a person/speak cue
+    (CB-67 — the human_request analogue of CB-36's objection grounding). human_request is the one
+    label that terminally ends a call via escalation_triggers, so a hallucinated label is the
+    costliest possible misread: an ungrounded one degrades to a plain question/statement turn
+    (recoverable), never a terminal escalate."""
+    if act != "human_request":
+        return act
+    if _HUMAN_REQUEST_CUES_RE.search(_normalize_punct(utterance or "")):
+        return act
+    return "question" if _QUESTION_RE.search(_normalize_punct(utterance or "")) else "statement"
+
+
 # --- The per-turn hybrid update ---------------------------------------------------------------
 
 async def update(
@@ -897,7 +922,9 @@ async def update(
     #    price-inquiry, firm refusal); an explicit last_user_act passed in (an upstream NLU label) wins.
     updated.turn_count = prior.turn_count + 1
     if llm_intent is not None:
-        classified_act = llm_intent["user_act"]
+        # CB-67: ground the LLM's human_request label BEFORE anything reads it — an unsupported
+        # human_request is the costliest hallucination (terminal escalate on a normal question).
+        classified_act = _ground_human_request(llm_intent["user_act"], user_utterance)
         # CB-36 anti-hallucination: GROUND the LLM-proposed objection — keep it only when the utterance
         # carries a cue for that category. On real calls the LLM intent classifier hallucinated objections
         # ('timing' on "Why do you keep asking? I said third", 'diy_free' on "this feels like a scam.

@@ -131,6 +131,15 @@
 > - **Follow-ups / known gaps:** <or none>
 > ```
 
+### CB-67 — Ground the LLM's human_request label (hallucinated terminal escalate on turn 1)
+- **Type / Surface / Size:** bug · `core` (`dst`) · S
+- **Completed:** 2026-06-08 (found and fixed by the orchestrator during the CB-61 paid replay)
+- **Files changed (actual):** `src/core/dst.py` (`_HUMAN_REQUEST_CUES_RE` + `_ground_human_request` — the human_request analogue of CB-36's objection grounding; applied at the LLM-intent fusion seam), `tests/unit/test_cb67_human_request_grounding.py` (NEW, 6).
+- **What changed:** live replay caught gpt-5-nano labeling "Can you tell me how this works?" as `human_request`; the fusion took the LLM act UNGROUNDED and `escalation_triggers` (correctly) treats an explicit human request as terminal → a brand-new call ended on turn 1 with a specialist-callback. Pre-existing probabilistic landmine (not a tonight regression — CB-36 grounded objections but never human_request, the one label that can END a call). Now an LLM human_request needs a lexical person/speak cue; ungrounded ones degrade to question/statement (recoverable). Genuine phrasings ("talk to a real person", "someone I could speak with", "representative") still pass.
+- **Verification:** 6 new tests incl. the exact live utterance; DST + CB-61 adversarial/listening + CB-50 escalate-guard suites green (81); full suite 605p/5s.
+- **Constraints checked:** legitimate escalation paths intact (cue-bearing requests escalate; CB-50 tests green).
+- **Follow-ups / known gaps:** none — same grounding discipline now covers both LLM labels with destructive downstream power.
+
 ### CB-59 — One champion: experiments + KPI target the live champion honestly
 - **Type / Surface / Size:** bug/change · `api` (`improve`, `server`) · `loop` (`promotion`) · `config` · `web` (KPI) · M
 - **Completed:** 2026-06-07 (2 rounds — round 1 had 2 orchestrator-caught defects)
