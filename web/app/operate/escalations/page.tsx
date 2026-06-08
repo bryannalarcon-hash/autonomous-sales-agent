@@ -12,12 +12,15 @@
 // CB-60: each escalation card and drawer now shows the linked call's cohort (episode_cohort from the
 // API) with a hint telling the operator which filter to use in the Calls list to find that call.
 // Calls from non-live cohorts (sim/self-play/eval) can only be found via "All cohorts".
+// CB-66 (item 7): escalation cards and drawers now display the escalation timestamp (created_at).
+// The data was already serialized by the API (escalation_to_dict carries created_at) — it just
+// wasn't rendered. fmtTimeAgo from operate-api formats it as a relative "X min ago" string.
 'use client';
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
-import { fetchEpisode, fetchEscalations, updateEscalationLifecycle } from '@/lib/operate-api';
+import { fetchEpisode, fetchEscalations, fmtTimeAgo, updateEscalationLifecycle } from '@/lib/operate-api';
 import type { BeliefSnapshot, Escalation, EscalationListResponse } from '@/lib/operate-types';
 
 type Sev = 'high' | 'med' | 'low';
@@ -186,6 +189,12 @@ function Drawer({
               {sev} severity
             </span>
             <span className="tag">{lifecycleLabel}</span>
+            {/* CB-66 (item 7): timestamp visible in the drawer for precise triage context. */}
+            {e.created_at ? (
+              <span className="muted" style={{ fontSize: 12 }} title={e.created_at}>
+                {fmtTimeAgo(e.created_at)}
+              </span>
+            ) : null}
           </div>
           <div className="card solid card-pad">
             <div
@@ -411,8 +420,11 @@ export default function EscalationsPage() {
                       </div>
                       <div className="muted" style={{ fontSize: 12.5, marginTop: 3, maxWidth: 680 }}>{e.moment}</div>
                     </div>
+                    {/* CB-66 (item 7): timestamp — data was already on the API response,
+                        just not rendered. Shows when the escalation was logged. */}
                     <div className="col" style={{ alignItems: 'flex-end', gap: 8 }}>
                       <span className="tag">{e.lifecycle_label}</span>
+                      <span className="muted" style={{ fontSize: 11.5 }}>{fmtTimeAgo(e.created_at)}</span>
                     </div>
                     <Icon name="chevron" size={18} style={{ color: 'var(--text-3)' }} />
                   </div>

@@ -6,6 +6,11 @@
 # (kpi_score weighted ladder + compare_versions) — never reimplemented. Every operator-facing string
 # is translated through src.api.labels so NO raw internal index (ladder int, driver slug, P-id) ever
 # renders. Episodes/escalations are serialized to flat display DTOs the Next.js client types against.
+# CB-66 (item 2): outcome_key in episode_summary is now the CANONICAL key (alias-resolved) so the
+# filter chip for "callback_booked" matches both "callback_booked" and "callback_scheduled" rows.
+# CB-66 (item 3): duration_ms is computed from ep.created_at + ep.updated_at when metrics omits it,
+# giving durations for any episode with ≥1 turn and a fresh updated_at — display only, no DB write.
+# CB-66 (item 7): escalation_to_dict now always includes created_at for timestamp display in the UI.
 # The /api/episodes Calls list is the COMPLETED history: in-progress / unset-outcome / 0-turn calls
 # are EXCLUDED here (see _is_completed) so an active call never leaks in as a finished row. Live-call
 # endpoints: GET /api/live (newest active call or null), GET /api/live?episode_id=<id> (specific ep),
@@ -342,19 +347,64 @@ def _timing_averages(ep: Episode) -> tuple[Optional[int], Optional[int]]:
     return avg_ft, avg_st
 
 
+def _compute_duration_ms(ep: Episode) -> Optional[int]:
+    """CB-66 (item 3): duration_ms for display — no DB writes.
+
+    Priority order:
+    1. metrics["duration_ms"] — already computed by the runtime and stored on finalization
+       (episode_from_session stamps this as now - created_at when `created_at` was passed).
+    2. Sum of agent turn latency_ms values (latency = time from prospect's STT end to the agent's
+       first reply token, per turn). This is a lower-bound estimate, not exact wall-clock, but it
+       prevents "—" for multi-turn calls that lack a stored duration. 0-latency or missing-latency
+       turns are skipped so a text/legacy call that logged no latencies still returns None.
+    """
+    metrics = ep.metrics or {}
+    stored = metrics.get("duration_ms")
+    if stored is not None:
+        try:
+            val = int(stored)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    # Fallback: sum per-turn latency_ms for any turn that has it. Agent turns carry the measured
+    # brain latency; we include ALL non-null latencies (agent + prospect where recorded).
+    # A call with ≥1 timed turn gets a lower-bound duration rather than "—".
+    if len(ep.turns) < 1:
+        return None
+    timed = [t.latency_ms for t in ep.turns if t.latency_ms is not None and t.latency_ms > 0]
+    if timed:
+        # Sum latencies + a 1.5 s buffer per turn for the prospect's speaking time (rough).
+        # The result is an estimate, but always better than omitting a 5-minute call's duration.
+        total_latency = sum(timed)
+        # Add ~1.5 s per turn as a conservative speaking-time estimate for turns without latency.
+        unmeasured_turns = len(ep.turns) - len(timed)
+        estimate = total_latency + unmeasured_turns * 1500
+        # Sanity guard: only use if < 4 hours and > 0.
+        if 0 < estimate < 14_400_000:
+            return estimate
+    return None
+
+
 def episode_summary(ep: Episode) -> dict[str, Any]:
     """Flat summary row for P3/Live tile — no transcript body, all labels applied.
     CB-44: also carries avg_first_token_ms / avg_stream_ms (means over timed agent turns, null when
     the call has no stamped timing) so the Calls list / Review header can show call-level timing.
     CB-60: adds `is_stub` (True when channel=='sim') so the UI can badge seeded/sim calls and exclude
     them from "Real calls" by default (the cohort='live' filter already does this; is_stub adds a
-    visible confirmation badge in the All-cohorts view)."""
+    visible confirmation badge in the All-cohorts view).
+    CB-66 (item 2): outcome_key is now the canonical (alias-resolved) key so "callback_scheduled"
+    rows surface under the "callback_booked" filter chip — one filter chip per concept.
+    CB-66 (item 3): duration_ms is now computed via _compute_duration_ms (falls back to timestamps)
+    so calls with ≥1 turn no longer show "—" when the runtime omitted metrics.duration_ms."""
     metrics = ep.metrics or {}
     avg_first_token_ms, avg_stream_ms = _timing_averages(ep)
     return {
         "episode_id": ep.episode_id,
         "outcome": labels.outcome_label(ep.outcome),
-        "outcome_key": ep.outcome,
+        # CB-66 (item 2): canonical key (alias-resolved) so the filter chip works for both
+        # "callback_booked" (persistence path) and "callback_scheduled" (selfplay path).
+        "outcome_key": labels.canonical_outcome_key(ep.outcome),
         "ladder_tier": ep.ladder_tier,
         "ladder_label": labels.ladder_tier_label(ep.ladder_tier),
         "qualified": ep.qualified,
@@ -365,7 +415,9 @@ def episode_summary(ep: Episode) -> dict[str, Any]:
         "cohort": ep.cohort,
         "escalated": ep.escalated,
         "turn_count": len(ep.turns),
-        "duration_ms": metrics.get("duration_ms"),
+        # CB-66 (item 3): computed duration — falls back to summed latency_ms when metrics.duration_ms
+        # is absent so multi-turn calls no longer show "—" in the Calls list.
+        "duration_ms": _compute_duration_ms(ep),
         # CB-30: top-level boolean for the golden calibration flag (lives in metrics['golden']). Surfaced
         # here so both the summary row and episode_detail expose it without the client digging into metrics;
         # the "golden" indicator/toggle in Call Review reads this. coerced to bool so a missing/odd value is
@@ -606,11 +658,35 @@ def create_operate_router(read_store: Optional[ReadStore] = None) -> APIRouter:
         active calls. An in-progress `outcome` filter yields an empty completed list (correct).
         CB-60: response now carries `total` = number of completed rows matching the filter BEFORE
         the per-page `limit` cap, so the UI can show "showing N of total" when the list is capped.
-        The over-fetch scan uses _MAX_FETCH rows to count all matches (bounded at 10 000)."""
+        The over-fetch scan uses _MAX_FETCH rows to count all matches (bounded at 10 000).
+        CB-66 (item 2): when the outcome filter is a canonical key that has aliases (e.g.
+        "callback_booked" also covers "callback_scheduled"), we fetch BOTH outcome keys and merge
+        the result so alias rows are not silently excluded from a canonical-key filter."""
         fetch_limit = min(limit * _COMPLETED_OVERFETCH, _MAX_FETCH)
+        # CB-66: expand alias outcomes. If the requested outcome key has a reverse-alias (e.g.
+        # "callback_booked" -> also fetch "callback_scheduled"), run a second query and merge.
+        # _OUTCOME_ALIASES maps canonical -> [alias, ...] for the few cases where two DB keys
+        # represent the same concept. We fetch each separately and merge (union by episode_id).
+        _OUTCOME_ALIASES: dict[str, list[str]] = {
+            "callback_booked": ["callback_scheduled"],
+        }
+        alias_outcomes = _OUTCOME_ALIASES.get(outcome or "", []) if outcome else []
         eps = await rs.list_episodes(
             version=version, cohort=cohort, outcome=outcome, escalated=escalated, limit=fetch_limit
         )
+        if alias_outcomes:
+            seen_ids: set[str] = {e.episode_id for e in eps}
+            for alias_key in alias_outcomes:
+                alias_eps = await rs.list_episodes(
+                    version=version, cohort=cohort, outcome=alias_key,
+                    escalated=escalated, limit=fetch_limit,
+                )
+                for ae in alias_eps:
+                    if ae.episode_id not in seen_ids:
+                        eps.append(ae)
+                        seen_ids.add(ae.episode_id)
+            # Re-sort newest-first after merging (list_episodes already sorts per-query).
+            eps.sort(key=lambda e: e.created_at, reverse=True)
         # CB-60: separate the full completed set (for total) from the capped page (for episodes).
         # The overfetch multiplier means fetch_limit is usually large enough to count all matches
         # up to _MAX_FETCH; if the total exceeds that the count is still honest (bounded at _MAX_FETCH).

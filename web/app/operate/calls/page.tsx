@@ -15,6 +15,17 @@
 // excluded from "Real calls" by default via the cohort='live' filter (reachable via All cohorts);
 // (2) when the API's `total` exceeds the displayed `count`, a "showing N of total" disclosure appears
 // in the filter bar so operators know the list is capped (prevents mistaking 200 for "All calls").
+// CB-66 (item 1): column headers are now clickable sort controls. Clicking a header sorts the loaded
+// rows client-side by that column; clicking again toggles direction. An arrow indicator shows the
+// active sort direction. Sortable columns: CALL (by episode_id), OUTCOME, DURATION, WHEN.
+// CB-66 (item 2): OUTCOME_OPTIONS now includes all filterable outcomes from the backend enum — no
+// outcome present in real data can be absent from the filter chips. The "callback_booked" chip now
+// matches both "callback_booked" AND the selfplay alias "callback_scheduled" (the backend normalizes
+// outcome_key to the canonical form before serializing, so the chip drives the correct key).
+// CB-66 (item 6): the ARCHETYPE column now shows the prospect archetype tag; since the CALL column
+// already leads with the archetype label as its primary text, the ARCHETYPE column is REMOVED to
+// avoid duplication — the information is still present in the row's primary label and the drawer.
+// CB-66 (item 8): count strings are properly pluralized ("1 call" not "1 calls").
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
@@ -24,17 +35,71 @@ import { fetchEpisodes, fmtDuration, fmtMsShort, fmtTimeAgo } from '@/lib/operat
 import { archetypeLabel, versionLabel } from '@/lib/labels';
 import type { EpisodeSummary } from '@/lib/operate-types';
 
+// CB-66 (item 1): sortable column keys for the Calls table.
+type SortKey = 'call' | 'outcome' | 'duration' | 'when';
+type SortDir = 'asc' | 'desc';
+
+/** Sortable column header: shows an up/down arrow when this column is active. */
+function SortTh({
+  label,
+  col,
+  active,
+  dir,
+  onSort,
+  align,
+}: {
+  label: string;
+  col: SortKey;
+  active: SortKey | null;
+  dir: SortDir;
+  onSort: (k: SortKey) => void;
+  align?: 'num';
+}) {
+  const isActive = active === col;
+  return (
+    <th
+      className={align === 'num' ? 'num' : undefined}
+      onClick={() => onSort(col)}
+      title={`Sort by ${label}`}
+      style={{ cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' }}
+      aria-sort={isActive ? (dir === 'asc' ? 'ascending' : 'descending') : 'none'}
+    >
+      {label}
+      {' '}
+      <span
+        aria-hidden
+        style={{
+          fontSize: 10,
+          opacity: isActive ? 0.85 : 0.3,
+          fontWeight: 700,
+          verticalAlign: 'middle',
+        }}
+      >
+        {isActive ? (dir === 'asc' ? '▲' : '▼') : '⇅'}
+      </span>
+    </th>
+  );
+}
+
 // Outcome filter options: the displayed label + the internal outcome KEY it maps to ('' = no filter).
-// The key MUST equal a real `episode.outcome` value (the API filters `WHERE outcome = $key`); the
-// labels mirror src/api/labels.outcome_label. The previous keys booked/disqualified/no_interest did
-// not exist in the data, so those chips always returned 0 — replaced with the real outcomes.
+// CB-66 (item 2): derives from the COMPLETE enum (matching src/api/labels.FILTERABLE_OUTCOME_KEYS)
+// so no outcome present in real data is ever missing. "Callback booked" covers both the real-call
+// path ("callback_booked") and the selfplay alias ("callback_scheduled") — the backend normalizes
+// outcome_key to "callback_booked" for both so the filter chip always works correctly.
 const OUTCOME_OPTIONS: { label: string; key: string }[] = [
   { label: 'All', key: '' },
   { label: 'Enrolled', key: 'enrolled' },
+  { label: 'Trial booked', key: 'trial_booked' },
   { label: 'Consultation booked', key: 'consult_booked' },
-  { label: 'Escalated', key: 'escalated' },
+  { label: 'Callback booked', key: 'callback_booked' },
+  { label: 'Booked', key: 'booked' },
+  { label: 'Interested', key: 'interested' },
   { label: 'Released', key: 'released' },
+  { label: 'Abandoned', key: 'abandoned' },
+  { label: 'No interest', key: 'no_interest' },
   { label: 'Walked away', key: 'walked' },
+  { label: 'Disqualified', key: 'disqualified' },
+  { label: 'Escalated', key: 'escalated' },
 ];
 
 // Outcome key -> dot-tag color class (status semantics), for the table + drawer.
@@ -156,6 +221,9 @@ export default function CallsPage() {
   const [total, setTotal] = useState<number | null>(null);
   const [sel, setSel] = useState<EpisodeSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // CB-66 (item 1): client-side column sort state. sortKey=null means default (API order = newest-first).
+  const [sortKey, setSortKey] = useState<SortKey | null>(null);
+  const [sortDir, setSortDir] = useState<SortDir>('asc');
 
   useEffect(() => {
     let cancelled = false;
@@ -180,11 +248,37 @@ export default function CallsPage() {
     };
   }, [outcome, esc, liveOnly]);
 
+  // CB-66 (item 1): toggle sort column; clicking the same column flips direction.
+  function handleSort(key: SortKey) {
+    setSortKey((prev) => {
+      if (prev === key) {
+        setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+        return key;
+      }
+      setSortDir('asc');
+      return key;
+    });
+  }
+
   // Free-text search is client-side over the loaded page (call id).
-  const visible = useMemo(
-    () => rows.filter((c) => !q || c.episode_id.toLowerCase().includes(q.toLowerCase())),
-    [rows, q],
-  );
+  // CB-66 (item 1): apply sort on top of the search filter.
+  const visible = useMemo(() => {
+    const filtered = rows.filter((c) => !q || c.episode_id.toLowerCase().includes(q.toLowerCase()));
+    if (!sortKey) return filtered;
+    return [...filtered].sort((a, b) => {
+      let cmp = 0;
+      if (sortKey === 'call') {
+        cmp = a.episode_id.localeCompare(b.episode_id);
+      } else if (sortKey === 'outcome') {
+        cmp = (a.outcome ?? '').localeCompare(b.outcome ?? '');
+      } else if (sortKey === 'duration') {
+        cmp = (a.duration_ms ?? -1) - (b.duration_ms ?? -1);
+      } else if (sortKey === 'when') {
+        cmp = (a.created_at ?? '').localeCompare(b.created_at ?? '');
+      }
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+  }, [rows, q, sortKey, sortDir]);
 
   return (
     <div className="page">
@@ -232,13 +326,17 @@ export default function CallsPage() {
             {/* CB-60: population disclosure. When the page is capped (200 row limit), show
                 "showing N of total" so operators know they're seeing a slice, not all calls.
                 `visible` is the client-side id-search filter on top of the already-loaded page. */}
+            {/* CB-66 (item 8): properly pluralized count strings. */}
             {total !== null && total > rows.length ? (
               <span className="muted" style={{ fontSize: 12.5 }}>
-                {visible.length} calls &nbsp;<span style={{ opacity: 0.5 }}>(showing {rows.length} of {total})</span>
+                {visible.length} {visible.length === 1 ? 'call' : 'calls'}&nbsp;
+                <span style={{ opacity: 0.5 }}>(showing {rows.length} of {total})</span>
               </span>
             ) : (
               <span className="muted" style={{ fontSize: 12.5 }}>
-                {visible.length} {liveOnly ? 'real calls' : 'calls'}
+                {visible.length} {liveOnly
+                  ? (visible.length === 1 ? 'real call' : 'real calls')
+                  : (visible.length === 1 ? 'call' : 'calls')}
               </span>
             )}
             <button className="gctl">
@@ -272,13 +370,16 @@ export default function CallsPage() {
               <table className="tbl">
                 <thead>
                   <tr>
-                    <th>Call</th>
-                    <th>Archetype</th>
-                    <th>Outcome</th>
+                    {/* CB-66 (item 1): sortable headers; (item 6): ARCHETYPE column removed — the
+                        archetype is already the primary label in the CALL cell so a separate column
+                        would be a pure duplicate. The persona archetype stays accessible via CALL and
+                        the row drawer. */}
+                    <SortTh label="Call" col="call" active={sortKey} dir={sortDir} onSort={handleSort} />
+                    <SortTh label="Outcome" col="outcome" active={sortKey} dir={sortDir} onSort={handleSort} />
                     <th>Ladder tier</th>
-                    <th className="num">Duration</th>
+                    <SortTh label="Duration" col="duration" active={sortKey} dir={sortDir} onSort={handleSort} align="num" />
                     <th>Version</th>
-                    <th className="num">When</th>
+                    <SortTh label="When" col="when" active={sortKey} dir={sortDir} onSort={handleSort} align="num" />
                   </tr>
                 </thead>
                 <tbody>
@@ -287,16 +388,14 @@ export default function CallsPage() {
                       <td>
                         {/* The Call cell leads with the humanized archetype as the primary label; the raw
                             call id is an internal index, demoted to a muted mono secondary line (not the
-                            headline). The Archetype column repeats the human label as a filterable tag. */}
+                            headline). CB-66 (item 6): the separate ARCHETYPE column is removed since it
+                            was an exact duplicate of this label — the info is here and in the drawer. */}
                         <div className="b" style={{ fontSize: 13 }}>
                           {c.persona ? archetypeLabel(c.persona) : 'Unknown archetype'}
                         </div>
                         <span className="mono muted" style={{ fontSize: 11 }}>
                           #{c.episode_id}
                         </span>
-                      </td>
-                      <td>
-                        <span className="tag">{c.persona ? archetypeLabel(c.persona) : 'Unknown'}</span>
                       </td>
                       <td>
                         <span className={`tag dot ${outcomeClass(c.outcome_key)}`}>{c.outcome}</span>

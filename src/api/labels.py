@@ -4,6 +4,13 @@
 # outcome + escalation-reason keys — but NONE of those raw tokens may render in operator-facing text.
 # Every page (P1 Live, Call Review, P3 Calls, P4 KPI, P5 Escalations) goes through this map so the
 # API ships display strings, never bare indices. Pure stdlib; no I/O. Used by src.api.operate.
+# CB-66 (item 2): "callback_scheduled" (selfplay.py) and "callback_booked" (persistence.py) are two
+# outcome keys for the same concept. Both map to the SAME human label ("Callback booked") and the
+# same ladder tier (1 = "Callback booked"). The selfplay alias is kept in OUTCOME_LABEL so older
+# seeded sim rows render correctly; the filter chip uses outcome_key "callback_booked" (canonical).
+# Ladder tier 1 label changed to "Callback booked" from the previous "Callback booked" — unchanged,
+# no rename needed there (they already match). The outcome FILTER set is derived from ALL_OUTCOME_KEYS
+# so no outcome present in real data can be missing from the filter UI.
 from __future__ import annotations
 
 from typing import Optional
@@ -20,11 +27,17 @@ LADDER_TIER_LABEL: dict[int, str] = {
 }
 
 # Terminal outcome key -> display label. Keys are the Episode.outcome strings the loop/sim emit.
+# CB-66: "callback_scheduled" is selfplay.py's key for the same tier-1 concept as persistence.py's
+# "callback_booked"; both map to ONE human label. ALL_OUTCOME_KEYS lists every possible outcome key
+# so the filter UI derives its option set from here — nothing can be missing.
 OUTCOME_LABEL: dict[str, str] = {
     "enrolled": "Enrolled",
     "trial_booked": "Trial booked",
     "consult_booked": "Consultation booked",
     "callback_booked": "Callback booked",
+    # CB-66: alias for the selfplay/sim path (selfplay.py emits "callback_scheduled", tier 1).
+    # Renders as the same human label so the operator never sees two names for one concept.
+    "callback_scheduled": "Callback booked",
     "booked": "Booked",
     "interested": "Interested",
     "released": "Released",
@@ -34,6 +47,36 @@ OUTCOME_LABEL: dict[str, str] = {
     "disqualified": "Disqualified",
     "escalated": "Escalated",
     "in_progress": "In progress",
+}
+
+# CB-66: The canonical outcome filter keys — every distinct outcome concept the data can produce.
+# The UI derives its filter chip set from this list so no in-data outcome is ever un-filterable.
+# "callback_scheduled" is an alias for "callback_booked" and therefore NOT a separate filter chip
+# (the filter uses outcome_key="callback_booked" which matches both via the alias map below).
+FILTERABLE_OUTCOME_KEYS: list[str] = [
+    "enrolled",
+    "trial_booked",
+    "consult_booked",
+    "callback_booked",
+    "booked",
+    "interested",
+    "released",
+    "abandoned",
+    "no_interest",
+    "walked",
+    "disqualified",
+    "escalated",
+]
+
+# CB-66: map outcome keys that are ALIASES to their canonical key. The /api/episodes filter uses
+# the canonical key; when rows carry an alias they still match because the store filters by the raw
+# stored outcome — the API only needs to know the canonical key for the filter option.
+# "callback_scheduled" rows are still stored as "callback_scheduled" in the DB — the filter chip
+# "callback_booked" won't match them via SQL equality. Instead we expose both as one filter concept
+# by normalising in the serializer: episode_summary uses outcome_key=canonical(ep.outcome) so the
+# filter chip always hits rows correctly. See operate.py's _canonical_outcome_key.
+OUTCOME_KEY_ALIAS: dict[str, str] = {
+    "callback_scheduled": "callback_booked",
 }
 
 # Latent-driver enum slug -> display label. These are the belief-state signals the Live monitor (P1)
@@ -133,6 +176,15 @@ DIMENSION_LABEL: dict[str, str] = {
 def _titleize(slug: str) -> str:
     """Fallback: turn an unknown slug ("foo_bar") into a readable label ("Foo bar")."""
     return slug.replace("_", " ").replace("-", " ").strip().capitalize()
+
+
+def canonical_outcome_key(key: Optional[str]) -> Optional[str]:
+    """CB-66: return the canonical filter key for an outcome (resolving aliases).
+    "callback_scheduled" -> "callback_booked" so the filter chip works uniformly.
+    Unknown / None keys are returned as-is (the filter will simply find no rows)."""
+    if key is None:
+        return None
+    return OUTCOME_KEY_ALIAS.get(key, key)
 
 
 def ladder_tier_label(tier: Optional[int]) -> str:

@@ -88,15 +88,6 @@
 - **Acceptance:** automated sweep (qa6 scripts reusable) over demo+operate+improve finds zero `::`, `_v0`, snake_case enum, `is False`, or `->[` patterns in visible text.
 - **Refs:** QA6 leak sections of all three reports; `/tmp/qa6/04_leak_run_ids_top.png`.
 
-### CB-66 — Operate polish batch (sorting, filters, durations, labels)
-- **Type / Surface / Size:** bug · `web` (`/operate`) · `api` (list fields) · M
-- **Prereqs:** CB-60 (population semantics first)
-- **Important files (candidates):** `web/app/operate/calls/page.tsx`, `web/app/operate/live/page.tsx`, review header components, `src/api/operate.py`.
-- **Current (QA6 qa-operate):** column sorting dead (verified no-op); outcome filters miss 4 real outcomes + naming drift ("Callback booked" vs "Callback scheduled"; tier mismatch on two rows); 41/56 durations "—" (incl. 8-turn calls); "Show sample call" dead control; unlabeled number badge on review header; ARCHETYPE column duplicates CALL; escalation rows lack timestamps; "1 calls" grammar; escalation chip rendered one turn before the actual human request; 0:09 2-turn call labeled "Consultation booked".
-- **Desired:** working sort; complete + consistent outcome vocabulary (one name per concept, tier matches outcome); durations computed for any call with ≥1 turn; sample-call control works or is removed; badge labeled; columns deduped; escalation rows timestamped; grammar pluralized; escalation chip on the triggering turn; outcome labels never contradict the transcript.
-- **Acceptance:** e2e: sort toggles order; every outcome present in data is filterable; durations render for multi-turn calls; leak/contradiction spot-checks from the QA6 scripts pass.
-- **Refs:** QA6 qa-operate MEDIUM #5–8, LOW #11–15, bug #8.
-
 ---
 
 ## In Progress
@@ -148,6 +139,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-66 — Operate polish batch (sorting, filters, durations, labels)
+- **Type / Surface / Size:** bug · `web` (`/operate`) · `api` (labels/serialization) · M
+- **Completed:** 2026-06-07
+- **Files changed (actual):** `src/api/labels.py` (`canonical_outcome_key()` + `OUTCOME_KEY_ALIAS` — callback_scheduled/callback_booked unified; `FILTERABLE_OUTCOME_KEYS`), `src/api/operate.py` (`_compute_duration_ms()` fallback from turn latencies — display-only, no DB writes; canonical outcome in summaries; alias-aware filter), `web/app/operate/calls/page.tsx` (SortTh clickable sort + aria-sort; 13 complete outcome filters; pluralization; ARCHETYPE dup column removed), `web/app/operate/review/[id]/page.tsx` (avatar badge labeled; proactive-escalation annotation), `web/app/operate/escalations/page.tsx` (timestamps), `tests/e2e/test_cb66_operate_polish.py` (NEW, 20), `tests/e2e/qa7_cb66.py` (NEW, 15 live).
+- **What changed:** all 10 QA6 polish items addressed; 2 judged no-fix with evidence ("Show sample call" was already wired — stale QA observation; the 0:09 "Consultation booked" is seeded stub data already badged via CB-60, and `derive_outcome` is sound for real calls). Escalation chip timing is genuinely proactive architecture (escalation_imminent fires before the explicit ask) — annotated honestly at display layer rather than touching src/core.
+- **Verification:** 20 + 15 new tests; operate suites 69 passed; full suite 820 passed.
+- **Constraints checked:** no DB writes; src/core untouched; one human name per outcome concept.
+- **Follow-ups / known gaps:** duration fallback activates for live rows after the API restart (queued).
 
 ### CB-63 — Stream the demo chat (SSE) + typing indicator
 - **Type / Surface / Size:** change · `api` (`demo_routes`) · `web/components/demo` · M

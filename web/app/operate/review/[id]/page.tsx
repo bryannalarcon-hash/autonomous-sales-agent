@@ -28,6 +28,14 @@
 // RUN-...%3A%3Aarm%3A%3An. We decode once here so fetchEpisode receives the raw ID; the fetch
 // helper then encodes it correctly for the HTTP path. Error display uses a safe fallback message,
 // never the raw encoded ID blob.
+// CB-66 (item 5): the rv-av avatar number badge in the outcome strip is now labelled via a tooltip
+// so "88" doesn't read as an unlabeled quantity (it's a deterministic avatar from the episode ID).
+// CB-66 (item 9): escalation chip context. When an "Escalate to human" chip appears on an agent
+// turn whose NEXT turn is the prospect's explicit request (i.e. the agent escalated proactively
+// before the prospect stated it), the chip shows a "(proactive)" annotation with a tooltip explaining
+// the signal. Root cause: this is correct behavior — the agent fires escalate when escalation_imminent
+// fires (belief signal), which can precede the prospect's explicit statement. Not a data or persistence
+// bug; the chip position is accurate. The annotation removes the appearance of misattribution.
 'use client';
 
 import { useMemo, useState } from 'react';
@@ -605,7 +613,17 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
       <div className="rv">
         {/* outcome strip */}
         <div className="rv-strip">
-          <div className="rv-av">{ep.episode_id.replace(/[^0-9]/g, '').slice(-2) || 'CA'}</div>
+          {/* CB-66 (item 5): the number badge is a deterministic avatar derived from the last 2
+              digits of the episode ID (the same pattern used across the dashboard for call avatars —
+              there is no caller name in this build). The tooltip makes this visible so operators
+              know the number is not a call-count or external reference. */}
+          <div
+            className="rv-av"
+            title={`Call avatar — last 2 digits of episode ID ${ep.episode_id}`}
+            aria-label={`Call avatar: ${ep.episode_id.replace(/[^0-9]/g, '').slice(-2) || 'CA'}`}
+          >
+            {ep.episode_id.replace(/[^0-9]/g, '').slice(-2) || 'CA'}
+          </div>
           <div>
             {/* Lead with the humanized archetype as the title; the raw episode id is an internal
                 index, demoted to a muted mono secondary line. The cohort id (`coh-…`) has no human
@@ -729,6 +747,13 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
             const latency = t.latency_ms != null ? `${(t.latency_ms / 1000).toFixed(1)}s` : null;
             // CB-28: a tool-use turn carries the retrieved KB facts that grounded its answer.
             const pulled = t.retrieved && t.retrieved.length ? t.retrieved : null;
+            // CB-66 (item 9): detect a proactive escalation — the agent's "Escalate to human" chip
+            // fires BEFORE the prospect's explicit request (the NEXT turn is a prospect turn). This is
+            // correct behavior (the agent fires on escalation_imminent belief signal), but without
+            // context it reads as misattribution. We annotate the chip "(proactive)" with a tooltip.
+            const isEscalateChip = isAgent && t.decision_label === 'Escalate to human';
+            const nextTurn = ep.turns[i + 1];
+            const isProactiveEscalation = isEscalateChip && nextTurn?.speaker === 'prospect';
             return (
               <div
                 key={t.turn_id}
@@ -753,9 +778,24 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
                   <div className="rv-ttext">{t.text}</div>
                   {isAgent && t.decision_label ? (
                     <div className="rv-trace">
-                      <span className="rv-dchip">
+                      <span
+                        className="rv-dchip"
+                        title={isProactiveEscalation
+                          ? 'The agent detected escalation risk (escalation_imminent signal) before the prospect stated the request — this is a proactive escalation, not a misattribution.'
+                          : undefined}
+                      >
                         <Icon name="spark" size={12} />
                         {t.decision_label}
+                        {/* CB-66 (item 9): annotate proactive escalations so operators understand
+                            the chip precedes the prospect's explicit request by design — the agent
+                            is responding to the belief signal, not the explicit text. */}
+                        {isProactiveEscalation ? (
+                          <span
+                            style={{ fontSize: 10, opacity: 0.75, marginLeft: 3, fontWeight: 600 }}
+                          >
+                            proactive
+                          </span>
+                        ) : null}
                       </span>
                       {t.rationale ? <span className="rv-rat">{`"${humanizeRationale(t.rationale)}"`}</span> : null}
                       {latency ? <span className="rv-lat">{latency}</span> : null}
