@@ -16,7 +16,10 @@
 # real embedder + a kb.live retrieve hook so /api/chat grounds in the ingested KB; tests pass
 # live_rag=False (or a FakeEmbedder + stub hook) to stay DB-free. LIVE PERSISTENCE (U2/U14/U15/Layer2):
 # a finished call persists its Episode + escalations + per-lead memory at /end; live_upsert_hook upserts
-# an in_progress Episode after each turn so the Live monitor can query calls mid-call. SECURITY/OPS:
+# an in_progress Episode after each turn so the Live monitor can query calls mid-call. CB-88: the
+# default live_upsert_hook (_default_live_upsert) now forwards last_close_tier + phone_hash to
+# persist_call_live so the CB-87 booked-outcome stamp and lead checkpoint actually fire on live calls
+# (the wrapper was missing those kwargs, causing all live calls to persist as 'in_progress'). SECURITY/OPS:
 # require_operator guards write endpoints (env OPERATOR_TOKEN; unset -> ALLOW with a warning for local
 # demo); CORS reads ALLOWED_ORIGINS (never wildcard + credentials together); a lifespan warms the
 # embedder when live_rag and closes the DB pool on shutdown. PII is scrubbed before any transcript is
@@ -159,6 +162,10 @@ def create_app(
     # Default live_upsert_hook: the real persist_call_live (lazy import keeps DB off the test path).
     # Tests inject a no-op or capture hook; prod gets this default which upserts in_progress Episodes
     # so the Live monitor can query calls mid-call. Only wired when no explicit hook is provided.
+    # CB-88 fix: forward last_close_tier + phone_hash so the CB-87 outcome stamp (consult_booked /
+    # callback_booked / trial_booked) and the CB-86/CB-87 lead checkpoint actually fire on real calls.
+    # These kwargs were added to persist_call_live in CB-87 but _default_live_upsert was not updated,
+    # so booked episodes were always persisted as 'in_progress' on the live path.
     if live_upsert_hook is None and live_rag:
         from src.api.persistence import persist_call_live
 
@@ -169,6 +176,8 @@ def create_app(
                 channel=kw["channel"],
                 created_at=kw["created_at"],
                 episode_id=kw["episode_id"],
+                last_close_tier=kw.get("last_close_tier"),
+                phone_hash=kw.get("phone_hash"),
             )
 
         live_upsert_hook = _default_live_upsert

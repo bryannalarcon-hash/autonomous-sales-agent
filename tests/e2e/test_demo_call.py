@@ -1,4 +1,4 @@
-# End-to-end tests for the U13 web-demo call (plan U13; AE9 + R1/R3/R33/R40/R41/R42 + CB-87).
+# End-to-end tests for the U13 web-demo call (plan U13; AE9 + R1/R3/R33/R40/R41/R42 + CB-87 + CB-88).
 # Drives the thin FastAPI surface (src.api.server) with fastapi.testclient.TestClient and an injected
 # MockLLMClient so NOTHING hits the network or a DB. Asserts the consent gate guards /api/chat
 # (409 until satisfied), the refusal path proceeds unrecorded (episode flagged not-recorded), the
@@ -7,6 +7,10 @@
 # and (CB-87, corrects CB-82) that sub-enrollment closes (callback/consultation/trial) do NOT end
 # the conversation (done=False) but DO persist a booked outcome via the live-upsert path + the lead
 # is checkpointed at contact-capture; enrollment/escalate/disqualify still set done=True.
+# CB-88 regression: the production _default_live_upsert in server.py was missing last_close_tier +
+# phone_hash, so every live attempt_close was persisted as 'in_progress' rather than 'consult_booked' /
+# 'callback_booked' / 'trial_booked' — the CB-87 outcome stamp never fired on real calls. Fixed by
+# forwarding those kwargs in _default_live_upsert; three new tests cover the production wiring path.
 from __future__ import annotations
 
 import json
@@ -1095,3 +1099,205 @@ def test_cb87_regression_enrollment_close_still_persists_via_end():
     assert len(captured) == 1
     assert captured[0].outcome == "enrolled"
     assert captured[0].qualified is True
+
+
+# ======================= CB-88: real-flow attempt_close tier survives to live-upsert =============
+#
+# CB-87's tests injected a CUSTOM live_upsert_hook that read last_close_tier from **kw directly.
+# The PRODUCTION wiring is _default_live_upsert in server.py, which is built when live_upsert_hook
+# is None and live_rag=True.  CB-88 found that _default_live_upsert dropped last_close_tier and
+# phone_hash from the kwargs it forwarded to persist_call_live, so the episode was always stamped
+# "in_progress" instead of "consult_booked"/"callback_booked" on a live call.
+#
+# This test drives the REAL production wiring:
+#   - create_app with live_upsert_hook=None so _default_live_upsert is used
+#   - persist_call_live patched at the module level so the DB write is captured (not executed)
+#   - MockLLMClient returns attempt_close@consultation from the policy call
+#   - Assert the captured episode outcome == "consult_booked" (not "in_progress")
+#
+# The test must FAIL before the fix (server.py _default_live_upsert drops last_close_tier) and
+# PASS after it (the kwargs are forwarded).
+
+
+def test_cb88_default_live_upsert_forwards_close_tier_to_persist_call_live():
+    """CB-88 regression: the production _default_live_upsert (live_upsert_hook=None, live_rag=True)
+    must forward last_close_tier to persist_call_live so a booked callback/consultation/trial
+    episode appears in /operate with the correct outcome (not stuck as 'in_progress').
+
+    The CB-87 tests only verified the injected-hook path; this test covers the DEFAULT wiring
+    in server.py that the live call actually uses.  Before the fix, persist_call_live received
+    last_close_tier=None (dropped by _default_live_upsert) → outcome='in_progress'.  After the
+    fix it receives last_close_tier='consultation' → outcome='consult_booked'."""
+    from unittest.mock import AsyncMock, patch
+
+    from src.kb.embeddings import FakeEmbedder
+
+    captured_kwargs: list[dict[str, Any]] = []
+    captured_episodes: list[Any] = []
+
+    # Patch persist_call_live at the module level so _default_live_upsert's lazy import sees it.
+    # The patch captures the kwargs (specifically last_close_tier) and also builds a real Episode
+    # so the caller gets a valid return value.
+    async def _fake_persist_call_live(session: Any, **kw: Any) -> Any:
+        captured_kwargs.append(dict(kw))
+        from src.api.persistence import episode_from_session
+        ep = episode_from_session(
+            session,
+            config=kw["config"],
+            channel=kw["channel"],
+            last_tier=kw.get("last_close_tier"),
+            phone_hash=kw.get("phone_hash"),
+            episode_id=kw.get("episode_id"),
+            created_at=kw.get("created_at"),
+        )
+        captured_episodes.append(ep)
+        return ep
+
+    with patch("src.api.persistence.persist_call_live", new=_fake_persist_call_live):
+        # live_upsert_hook=None + live_rag=True → server.py wires _default_live_upsert (the bug path).
+        # FakeEmbedder + stub retrieve_hook keep this DB-free (no SentenceTransformerEmbedder).
+        app = create_app(
+            llm_client_factory=lambda: _agent_mock(
+                act="attempt_close",
+                tier="consultation",
+                reply="Shall we lock in a free consultation?",
+            ),
+            embedder=FakeEmbedder(),
+            retrieve_hook=lambda q, **k: [],
+            live_rag=True,
+            live_upsert_hook=None,  # force the DEFAULT _default_live_upsert path
+        )
+        client = TestClient(app)
+        sid = _start(client, channel="text")["session_id"]
+        _grant(client, sid)
+
+        r = client.post("/api/chat", json={"session_id": sid, "text": "That sounds great."})
+        assert r.status_code == 200, r.text
+        assert r.json()["decision_act"] == "attempt_close"
+
+    # The production wiring must have forwarded last_close_tier to persist_call_live.
+    assert len(captured_kwargs) >= 1, "persist_call_live must have been called by _default_live_upsert"
+    last_kw = captured_kwargs[-1]
+    assert last_kw.get("last_close_tier") == "consultation", (
+        f"CB-88: _default_live_upsert dropped last_close_tier; persist_call_live received "
+        f"last_close_tier={last_kw.get('last_close_tier')!r} (expected 'consultation'). "
+        "The production live-upsert wiring in server.py must forward last_close_tier + phone_hash."
+    )
+
+    # The live-upserted episode must carry the booked outcome, not 'in_progress'.
+    assert len(captured_episodes) >= 1, "an Episode must have been built"
+    ep = captured_episodes[-1]
+    assert ep.outcome == "consult_booked", (
+        f"CB-88: live-upserted episode has outcome={ep.outcome!r} (expected 'consult_booked'). "
+        "A consultation offer must stamp consult_booked so the booking appears in /operate."
+    )
+    assert ep.qualified is True, "a booked close must mark the episode as qualified"
+
+
+def test_cb88_real_flow_callback_booking_persisted() -> None:
+    """CB-88 real-flow: the production _default_live_upsert must forward last_close_tier='callback'
+    to persist_call_live so the live-upserted episode shows 'callback_booked' (not 'in_progress').
+
+    Uses the DEFAULT wiring (live_upsert_hook=None, live_rag=True) with persist_call_live patched
+    at the module level.  The patched version replicates persist_call_live's actual outcome-stamp
+    logic (the 'if last_close_tier:' branch) so the assertion directly proves the kwargs were
+    forwarded and the correct outcome was derived."""
+    from unittest.mock import patch
+
+    from src.api.persistence import derive_outcome
+    from src.kb.embeddings import FakeEmbedder
+
+    captured_outcomes: list[str] = []
+    captured_close_tiers: list[Any] = []
+
+    async def _fake_persist_call_live(session: Any, **kw: Any) -> Any:
+        # Replicate persist_call_live's outcome-stamp logic exactly — this is what the fix must satisfy.
+        last_close_tier = kw.get("last_close_tier")
+        captured_close_tiers.append(last_close_tier)
+        if last_close_tier:
+            outcome, _, _, _ = derive_outcome("attempt_close", last_close_tier)
+        else:
+            outcome = "in_progress"
+        captured_outcomes.append(outcome)
+        return None
+
+    with patch("src.api.persistence.persist_call_live", new=_fake_persist_call_live):
+        app = create_app(
+            llm_client_factory=lambda: _agent_mock(
+                act="attempt_close",
+                tier="callback",
+                reply="Let me set up a callback for you.",
+            ),
+            embedder=FakeEmbedder(),
+            retrieve_hook=lambda q, **k: [],
+            live_rag=True,
+            live_upsert_hook=None,
+        )
+        client = TestClient(app)
+        sid = _start(client, channel="text")["session_id"]
+        _grant(client, sid)
+
+        r = client.post("/api/chat", json={"session_id": sid, "text": "A callback works for me."})
+        assert r.status_code == 200, r.text
+        assert r.json()["decision_act"] == "attempt_close"
+        assert r.json()["done"] is False, "callback offer must keep convo open (CB-87)"
+
+    assert len(captured_close_tiers) >= 1, "persist_call_live must have been called"
+    assert captured_close_tiers[-1] == "callback", (
+        f"CB-88: _default_live_upsert dropped last_close_tier; persist_call_live received "
+        f"last_close_tier={captured_close_tiers[-1]!r} (expected 'callback'). "
+        "The production live-upsert wiring in server.py must forward last_close_tier."
+    )
+    assert captured_outcomes[-1] == "callback_booked", (
+        f"CB-88: outcome='in_progress' instead of 'callback_booked' (tier not forwarded). "
+        f"Got outcome={captured_outcomes[-1]!r}"
+    )
+
+
+def test_cb88_non_closing_turn_stays_in_progress() -> None:
+    """CB-88 invariant: a non-closing turn (ask/pitch/answer_via_kb) must NOT set done=True and
+    the live-upserted episode outcome stays 'in_progress'."""
+    from unittest.mock import patch
+
+    from src.kb.embeddings import FakeEmbedder
+
+    captured_episodes: list[Any] = []
+
+    async def _fake_persist_call_live(session: Any, **kw: Any) -> Any:
+        from src.api.persistence import episode_from_session
+        ep = episode_from_session(
+            session,
+            config=kw["config"],
+            channel=kw["channel"],
+            last_tier=kw.get("last_close_tier"),
+            episode_id=kw.get("episode_id"),
+            created_at=kw.get("created_at"),
+        )
+        captured_episodes.append(ep)
+        return ep
+
+    with patch("src.api.persistence.persist_call_live", new=_fake_persist_call_live):
+        app = create_app(
+            llm_client_factory=lambda: _agent_mock(
+                act="ask",
+                target_slot="goal",
+                reply="What's the main goal you're hoping to achieve?",
+            ),
+            embedder=FakeEmbedder(),
+            retrieve_hook=lambda q, **k: [],
+            live_rag=True,
+            live_upsert_hook=None,
+        )
+        client = TestClient(app)
+        sid = _start(client, channel="text")["session_id"]
+        _grant(client, sid)
+
+        r = client.post("/api/chat", json={"session_id": sid, "text": "Tell me more."})
+        assert r.status_code == 200, r.text
+        assert r.json()["done"] is False, "a discovery turn must not end the conversation"
+
+    assert len(captured_episodes) >= 1, "persist_call_live must have been called"
+    ep = captured_episodes[-1]
+    assert ep.outcome == "in_progress", (
+        f"CB-88 invariant: non-closing turn must leave outcome='in_progress', got {ep.outcome!r}"
+    )

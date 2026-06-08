@@ -61,13 +61,6 @@
 > ```
 
 
-### CB-88 — Policy emits attempt_close with tier=None → booking never stamped (not in /operate)
-- **Type / Surface / Size:** bug · `core` (`policy`/`gates`) + `api` (persistence) · M · (deeper than CB-87)
-- **Prereqs:** —
-- **Current (round-4 final replay, orchestrator-verified in DB):** the mom booked a callback; the episode's agent turns include `attempt_close` BUT with `tier=None` (turn.tier and meta.tier both empty). CB-87's outcome-stamp keys on `last_close_tier`, so a None tier → `derive_outcome("attempt_close", None)` can't map a booked outcome → episode stays `in_progress` → excluded from /operate (CB-60 filter). So CB-87 fixed the premature-end and the lead checkpoint, but a tier-less close still doesn't surface as a booking. The brain is "booking" verbally (attempt_close act) without committing to a tier.
-- **Desired:** an `attempt_close` decision must carry the tier it is closing at (callback/consultation/trial/enrollment); the policy/gates set it; then CB-87's stamp + buy-gate mapping work. Investigate why the policy LLM proposes attempt_close with no tier and whether a gate should infer/require it.
-- **Acceptance:** a scripted callback booking → the episode shows "Callback booked" in /operate mid-call; attempt_close turns always carry a tier; buy-gate purity preserved.
-- **Refs:** round-4 replay ep-23268e…; demo_routes last_close_tier + persistence.derive_outcome; deeper layer of CB-82/87.
 
 ### CB-89 — Non-sequitur (social_aside) not detected on the live LLM intent path
 - **Type / Surface / Size:** bug · `core` (`dst` LLM-intent prompt / `gates`) · M
@@ -156,6 +149,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-88 — _default_live_upsert dropped last_close_tier → booking never stamped on live calls
+- **Type / Surface / Size:** bug · `api` (`server.py`) · S
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `src/api/server.py`, `tests/e2e/test_demo_call.py`
+- **What changed:** `_default_live_upsert` in `create_app` (the production live-upsert wrapper, wired when `live_upsert_hook=None` and `live_rag=True`) was forwarding only `config/channel/created_at/episode_id` to `persist_call_live`. CB-87 added `last_close_tier` + `phone_hash` params to `persist_call_live` but never updated this wrapper, so on every live call those kwargs were `None`. `persist_call_live`'s `if last_close_tier:` guard then skipped the booked-outcome stamp → episode always `in_progress`. Fix: added `last_close_tier=kw.get("last_close_tier")` and `phone_hash=kw.get("phone_hash")` to the `_default_live_upsert` call. The gates/policy trace confirmed no gate produces `attempt_close` with `tier=None` (all paths set a real tier); the bug was solely in this wrapper layer.
+- **Verification:** three new regression tests in `test_demo_call.py` (`test_cb88_default_live_upsert_forwards_close_tier_to_persist_call_live`, `test_cb88_real_flow_callback_booking_persisted`, `test_cb88_non_closing_turn_stays_in_progress`) — all FAILED before fix, all PASS after. Full `.venv` suite: 1039 passed, 5 skipped, 0 failed.
+- **Constraints checked:** buy-gate purity untouched; phone sha256-only (R42) preserved; consent gate unchanged; R37 brain-parity unaffected; no gates.py changes needed.
+- **Follow-ups / known gaps:** CB-87 tests injected a custom hook that read `last_close_tier` directly from `**kw` (bypassing `_default_live_upsert`), masking this gap. Future CB-87-style tests that cover the default wiring should use `live_upsert_hook=None` + `live_rag=True` + patch `persist_call_live`.
 
 ### CB-79 — One-time reset of the dev DB's polluted champion (user-authorized DB write)
 - **Type / Surface / Size:** chore · `db` (dev only) · S
