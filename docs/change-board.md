@@ -60,6 +60,15 @@
 > - **Refs:** <spec docs / sections / design files>
 > ```
 
+### CB-69 — Text-channel escalate: don't ask a question the session can't hear answered
+- **Type / Surface / Size:** design/bug · `core` (`nlg` escalate guidance) · `api` (`demo_routes` done semantics) · S–M
+- **Prereqs:** — (user decision wanted on the desired semantics)
+- **Important files (candidates):** `src/core/nlg.py` (`_ACT_GUIDANCE["escalate"]` — the realized line collected contact info), `src/api/demo_routes.py` (escalate ⇒ done ⇒ input disabled on the SAME turn).
+- **Current (CB-61 replay):** on a terminal escalate, NLG spoke "all I need is a good phone number and email so our specialist can reach you Thursday…— what's the best number?" and the demo session ENDED on that turn — the caller could never answer. The handoff sounded great and then hung up on its own question.
+- **Desired (pick one):** (a) escalate's realized line must be self-contained on text (no trailing question; offer the callback using already-known contact info or none), or (b) the demo keeps the session open exactly one more turn after an escalate that asked for contact, committing the answer to the lead record before ending. Voice path unaffected either way (the worker keeps the room open).
+- **Acceptance:** replay turn-6 shape: either no trailing question on the terminal line, or the caller's number is captured into the lead before the session closes; no session ends on an unanswered direct question from the agent.
+- **Refs:** CB-61 replay transcript /tmp/qa7/cb61_replay_transcript.txt (turn 6); CB-68 Done entry.
+
 ### CB-01 — Active-calls queue with per-call take-over
 - **Type / Surface / Size:** feature · `/operate/live` · `api` · `voice-worker` · L
 - **Prereqs:** — *(no other CB blocks it; internally it has 3 work units that order themselves: the list endpoint → the queue UI → the take-over mechanism. Split into `CB-01.a/.b/.c` when pulled.)*
@@ -130,6 +139,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-68 — Ground the LLM's concession proposal (phantom discount terminally escalated a healthy close)
+- **Type / Surface / Size:** bug · `core` (`gates`) · S
+- **Completed:** 2026-06-08 (found by the CB-61 replay, fixed by the orchestrator)
+- **Files changed (actual):** `src/core/gates.py` (`_price_context_live` + strip step at `apply_gates` entry), `tests/unit/test_cb68_concession_grounding.py` (NEW, 6), `tests/unit/test_policy.py` (band test re-spec'd: concession now requires live price context — the no-context arm is CB-68's strip).
+- **What changed:** replay turn 6 ("Thursday works — what do you need?") saw the policy LLM hallucinate `concession>band`; `escalation_triggers` honored it ungrounded → terminal escalate mid-close. Now a concession is acted on ONLY inside live price talk (price_inquiry / open price-affordability objection / recorded refusals); phantom fractions are stripped. The R10 over-band→defer design is unchanged inside genuine price context.
+- **Verification:** 6 new tests incl. the live failure shape; full suites 611p/5s + 625p.
+- **Constraints checked:** R10 band rule intact in price context; same grounding discipline as CB-36/CB-67 (all LLM labels with destructive power are now grounded).
+- **Follow-ups / known gaps:** the *separate* lifecycle question (escalate handoff line asked for contact info, then the text session terminated before the answer) is logged as CB-69 in To Do — a design decision, not auto-fixed.
 
 ### CB-67 — Ground the LLM's human_request label (hallucinated terminal escalate on turn 1)
 - **Type / Surface / Size:** bug · `core` (`dst`) · S

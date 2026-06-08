@@ -453,10 +453,14 @@ async def test_policy_pushiness_cap_fires_on_repeated_pressure():
 
 
 async def test_policy_escalates_on_concession_beyond_band():
-    """LLM proposes a deep discount beyond the band; the policy escalates (gates have final say)."""
+    """LLM proposes a deep discount beyond the band DURING live price talk; the policy escalates
+    (gates have final say). CB-68 re-spec: the concession must be GROUNDED in price context — a
+    price_inquiry turn here; without it the fraction is a hallucination and is stripped instead
+    (see test_cb68_concession_grounding for that arm)."""
     cfg = make_config(max_concession_band=0.15)
     b = BeliefState.fresh()
     b.drivers["trust"] = 0.7
+    b.last_user_act = "price_inquiry"  # CB-68: live price context — the band rule applies
     llm = MockLLMClient(
         [_proposal_json(act="handle_objection", rationale="offer 40% off", concession=0.40)]
     )

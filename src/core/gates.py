@@ -1262,6 +1262,23 @@ def escalation_triggers(
     return out
 
 
+def _price_context_live(belief: BeliefState) -> bool:
+    """CB-68: is the conversation actually IN price talk this turn? True when the caller's last act
+    is a price inquiry, a price/affordability objection is open, or a firm affordability refusal has
+    been recorded. Only then is an LLM-proposed `concession` meaningful — outside this context a
+    concession fraction is a hallucination and must be stripped before gates act on it."""
+    if belief.last_user_act == "price_inquiry":
+        return True
+    if (belief.active_objection or "") in ("price", "affordability"):
+        return True
+    try:
+        if int((belief.meta or {}).get("affordability_refusals", 0)) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
 def _escalation_reason(
     decision: Any,
     belief: BeliefState,
@@ -1315,6 +1332,16 @@ def apply_gates(
     offer_low_commitment_on_budget (last, so the free-callback offer has final say). The closing
     escalation re-check leaves a callback close intact (no trigger) but still catches genuine ones.
     """
+    # CB-68: GROUND the LLM-proposed concession before anything reads it (the concession analogue of
+    # CB-67's human_request grounding). A concession only means something inside live price talk —
+    # the caller is asking about price or a price/affordability objection is open. Outside that, the
+    # policy LLM has hallucinated a discount fraction (seen live: concession>band proposed on a
+    # scheduling turn — "Thursday works, what do you need?" — which terminally escalated a healthy
+    # close). Strip it so neither escalation_triggers nor price_gate acts on a phantom discount.
+    if decision.concession is not None and not _price_context_live(belief):
+        decision = decision.copy()
+        decision.concession = None
+
     # Extreme moments dominate: nothing else matters if we must defer. The short-circuit fires only on
     # a GENUINE escalation REASON (over-band concession / human request / compliance / low-confidence
     # streak) — NOT merely because the LLM already proposed `escalate`. CB-50: an LLM escalate with no
