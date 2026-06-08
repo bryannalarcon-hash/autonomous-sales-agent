@@ -1,4 +1,4 @@
-# qa7_cb65_leaksweep.py — CB-65/CB-70/CB-81 regression: viewer-facing leak sweep across all surfaces.
+# qa7_cb65_leaksweep.py — CB-65/CB-70/CB-81/CB-94 regression: viewer-facing leak sweep across all surfaces.
 # Walks every page (demo pre-consent, calls list both cohort modes, call review, escalations, KPI,
 # lab list + one lab detail, versions, approvals) and scans rendered innerText against a pattern list.
 # Each pattern class has an explicit allowlist with documented justification for any permitted hit.
@@ -9,6 +9,10 @@
 # (O1: channel must render as "Web chat" not "text"; O2: stub turn rationale must be humanized).
 # CB-81 (CB-NN strip): adds pattern for internal index tags (CB-NN, D#, W#, S#, P#, R#) leaking
 # from src/core gate-rationale strings into the operator call-review rendered text.
+# CB-94 (a): test_cb94_ladder_tier_column_has_tier_number asserts the LADDER TIER column shows a "T<n>"
+# rung prefix so the column is visually distinct from OUTCOME even when both share the same text.
+# CB-94 (c): test_cb94_no_simulated_training_call asserts "Simulated training call" no longer appears
+# as a per-turn rationale in the call review — stub turns show a "Seeded sample" badge instead.
 # Does NOT click chat/chat links, start calls, or take any state-mutating action.
 # Requirements: Next.js dashboard at localhost:3000, FastAPI API at localhost:8000.
 # Run: python -m pytest tests/e2e/qa7_cb65_leaksweep.py -v --tb=short
@@ -105,12 +109,22 @@ LEAK_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
         re.compile(r"Channel\s+text\b", re.IGNORECASE),
         "Raw channel slug 'text' visible in the Channel fact row (should be 'Web chat')",
     ),
-    # CB-81 O2: "sim-harness decision" is the seeded-stub turn rationale string. After the fix,
-    # humanizeRationale maps it to "Simulated training call". Any raw occurrence is a leak.
+    # CB-81 O2 / CB-94 (c): "sim-harness decision" is the seeded-stub turn rationale string written by
+    # the sim harness. After the CB-81 fix it was mapped to "Simulated training call"; after CB-94 (c)
+    # humanizeRationale returns '' and the per-turn rationale chip is suppressed entirely — neither the
+    # raw string nor the humanized phrase should ever appear in the operator review surface.
     (
         "sim_harness_decision",
         re.compile(r"sim-harness\s+decision", re.IGNORECASE),
-        "Raw 'sim-harness decision' rationale string visible in operator review (must be humanized)",
+        "Raw 'sim-harness decision' rationale string visible in operator review (must be suppressed)",
+    ),
+    # CB-94 (c): "Simulated training call" was CB-81's humanized form of the sim-harness annotation.
+    # CB-94 replaces it with a "Seeded sample" chip + suppressed rationale, so the phrase
+    # "Simulated training call" must no longer appear as a per-turn rationale in the review.
+    (
+        "simulated_training_call",
+        re.compile(r"Simulated\s+training\s+call", re.IGNORECASE),
+        "CB-94 (c): 'Simulated training call' as per-turn rationale must be replaced by 'Seeded sample' badge",
     ),
     # CB-81 (CB-NN strip): internal change-board index tags embedded by src/core in gate-rationale
     # strings must be stripped by humanizeRationale before reaching the operator. Pattern specifically
@@ -394,6 +408,17 @@ def test_call_review_no_cb_index_leak(page: Page):
             f"Screenshot: {shot_path}"
         )
 
+    # (c) CB-94: no "Simulated training call" as a per-turn rationale (was CB-81's humanized form;
+    #     CB-94 replaces it with a "Seeded sample" badge + suppressed rationale chip).
+    if re.search(r"Simulated\s+training\s+call", body, re.IGNORECASE):
+        shot_path = os.path.join(SCREENSHOT_DIR, "cb94_simulated_training_call_in_review.png")
+        page.screenshot(path=shot_path)
+        pytest.fail(
+            f"CB-94 (c): 'Simulated training call' still appears as a per-turn rationale in "
+            f"call review for {ep_id}. Should be replaced with a 'Seeded sample' badge.\n"
+            f"Screenshot: {shot_path}"
+        )
+
 
 def test_calls_channel_no_raw_text_slug(page: Page):
     """CB-81 O1: the calls list and call drawer must not show raw 'text' for the channel field.
@@ -520,6 +545,146 @@ def _assert_body_no_leaks(tag: str, body: str, page: Optional[Page] = None) -> N
         if real_hits:
             findings.append((pname, pdesc, real_hits))
     _assert_no_leaks(tag, findings, page)
+
+
+# ---------------------------------------------------------------------------
+# CB-94 targeted tests
+# ---------------------------------------------------------------------------
+
+
+def test_cb94_ladder_tier_column_has_tier_number(page: Page):
+    """CB-94 (a): the LADDER TIER column in the Calls table must contain a tier-number prefix
+    (e.g. 'T0', 'T1', 'T2') so it is visually distinct from the OUTCOME column — the two
+    columns can share the same text when outcome == tier label (e.g. 'Consultation booked'
+    in both), and the tier number makes the distinction scannable at a glance."""
+    _require_services()
+    page.goto(f"{DASHBOARD_BASE}/operate/calls", wait_until="networkidle", timeout=30_000)
+    page.wait_for_timeout(1500)
+
+    # Switch to All cohorts so we see sim rows too
+    all_btn = page.locator("button:has-text('All cohorts'), button:has-text('All')")
+    if all_btn.count() > 0:
+        all_btn.first.click()
+        page.wait_for_timeout(1200)
+
+    rows = page.query_selector_all(".tbl tbody tr")
+    if not rows:
+        pytest.skip("No rows in the Calls table — skipping tier-number check")
+
+    # Collect OUTCOME and LADDER TIER cell text for the first several rows.
+    # Table column order: CALL (0), OUTCOME (1), LADDER TIER (2), DURATION (3), VERSION (4), WHEN (5).
+    tier_texts_seen = []
+    for row in rows[:15]:
+        cells = row.query_selector_all("td")
+        if len(cells) < 3:
+            continue
+        tier_text = (cells[2].inner_text() or "").strip()
+        tier_texts_seen.append(tier_text)
+
+    if not tier_texts_seen:
+        pytest.skip("Could not read tier column cells — table structure may have changed")
+
+    # Every tier cell must contain a T<n> prefix (T0, T1, T2, T3, T4).
+    # Note: CSS margin-right doesn't insert a text space in innerText, so the cell text may read
+    # "T1Callback booked" (no space) — we check for T<digit> at the start of the cell text.
+    tier_re = re.compile(r"^T[0-4]")
+    bad_cells = [t for t in tier_texts_seen if not tier_re.search(t)]
+    assert not bad_cells, (
+        f"CB-94 (a): LADDER TIER cells missing 'T<n>' prefix — cannot distinguish from OUTCOME. "
+        f"Bad cells: {bad_cells!r}"
+    )
+
+
+def test_cb94_no_simulated_training_call_in_review(page: Page):
+    """CB-94 (c): call review must NOT show 'Simulated training call' as a per-turn rationale.
+    Stub turns now show a 'Seeded sample' chip and suppress the rationale string entirely."""
+    _require_services()
+    # Get a stub (sim) episode to review — most likely to have sim-harness turn rationales.
+    ep_id = None
+    for cohort in ("sim", None):
+        try:
+            q = f"{API_BASE}/api/episodes?limit=50" + (f"&cohort={cohort}" if cohort else "")
+            with urllib.request.urlopen(q, timeout=8) as r:
+                data = json.loads(r.read())
+            eps = data.get("episodes", [])
+            ep_id = eps[0]["episode_id"] if eps else None
+            if ep_id:
+                break
+        except Exception:
+            pass
+    if not ep_id:
+        pytest.skip("No episodes available to review")
+
+    page.goto(f"{DASHBOARD_BASE}/operate/review/{ep_id}", wait_until="networkidle", timeout=30_000)
+    page.wait_for_timeout(2500)
+    body = page.inner_text("body")
+
+    # Assert "Simulated training call" is gone from the rendered rationale text.
+    if re.search(r"Simulated\s+training\s+call", body, re.IGNORECASE):
+        shot_path = os.path.join(SCREENSHOT_DIR, "cb94_simulated_training_call.png")
+        page.screenshot(path=shot_path)
+        pytest.fail(
+            f"CB-94 (c): 'Simulated training call' still rendered as a per-turn rationale on "
+            f"review page for {ep_id}. Must be replaced with a 'Seeded sample' chip.\n"
+            f"Screenshot: {shot_path}"
+        )
+
+    # Assert the raw "sim-harness decision" string is also absent.
+    if re.search(r"sim-harness\s+decision", body, re.IGNORECASE):
+        shot_path = os.path.join(SCREENSHOT_DIR, "cb94_sim_harness_raw.png")
+        page.screenshot(path=shot_path)
+        pytest.fail(
+            f"CB-94 (c): raw 'sim-harness decision' visible on review page for {ep_id}.\n"
+            f"Screenshot: {shot_path}"
+        )
+
+
+def test_cb94_stub_review_has_seeded_sample_badge(page: Page):
+    """CB-94 (c): a stub call's review page must show at least one 'Seeded sample' chip — either
+    the per-turn badge on a stub-turn's trace or the call-level badge in the outcome strip (CB-60).
+    This asserts the replacement chip is actually rendering."""
+    _require_services()
+    # Prefer a sim episode (most likely to be a stub).
+    ep_id = None
+    for cohort in ("sim", None):
+        try:
+            q = f"{API_BASE}/api/episodes?limit=50" + (f"&cohort={cohort}" if cohort else "")
+            with urllib.request.urlopen(q, timeout=8) as r:
+                data = json.loads(r.read())
+            eps = data.get("episodes", [])
+            # Pick an episode that the API marks as is_stub if possible.
+            stub_eps = [e for e in eps if e.get("is_stub")]
+            ep_id = (stub_eps[0] if stub_eps else eps[0] if eps else None)
+            if ep_id:
+                ep_id = ep_id["episode_id"]
+                break
+        except Exception:
+            pass
+    if not ep_id:
+        pytest.skip("No episodes available to review")
+
+    page.goto(f"{DASHBOARD_BASE}/operate/review/{ep_id}", wait_until="networkidle", timeout=30_000)
+    page.wait_for_timeout(2500)
+    body = page.inner_text("body")
+
+    # The page should contain "Seeded sample" somewhere (either the call-level badge or a turn badge).
+    if "Seeded sample" not in body:
+        # This is only a failure when the episode is actually a stub.
+        # Check the API to confirm is_stub before failing.
+        try:
+            with urllib.request.urlopen(f"{API_BASE}/api/episodes/{urllib.parse.quote(ep_id)}", timeout=8) as r:
+                ep_data = json.loads(r.read())
+            if not ep_data.get("is_stub"):
+                pytest.skip(f"Episode {ep_id[:12]} is not a stub — 'Seeded sample' badge not required")
+        except Exception:
+            pytest.skip("Could not verify is_stub via API — skipping badge presence check")
+        shot_path = os.path.join(SCREENSHOT_DIR, "cb94_no_seeded_badge.png")
+        page.screenshot(path=shot_path)
+        pytest.fail(
+            f"CB-94 (c): stub call review for {ep_id} shows no 'Seeded sample' badge. "
+            "Expected at least one badge (call-level from CB-60 or per-turn from CB-94).\n"
+            f"Screenshot: {shot_path}"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -3,10 +3,11 @@
 // clicking a turn selects it. CB-04: the gate rationale (`.rv-rat`) leads with an internal gate-name
 // and embeds raw driver enum slugs (e.g. "pushiness_cap: bail_risk over cap…"), so it renders through
 // lib/labels.humanizeRationale ("Pushiness cap: walk-away risk over cap…") — DISPLAY ONLY; the raw
-// rationale stays on the turn record / in logs. CB-81: humanizeRationale also strips internal index
-// tags that src/core may embed (e.g. "(CB-48 directness)") and translates "sim-harness decision"
-// to "Simulated training call" for seeded-stub turns — the per-turn rationale is already routed
-// through humanizeRationale so both fixes apply automatically at the existing render seam. Right: the BELIEF-TRAJECTORY replay — a scrubber over the turns with
+// rationale stays on the turn record / in logs. CB-81/CB-94 (c): humanizeRationale returns '' for
+// "sim-harness decision" stub-turn rationales so the per-turn rationale chip is suppressed entirely;
+// isSimHarnessRationale() detects these turns so a small "Seeded sample" badge renders instead —
+// the call is already badged at the list level (CB-60) and the outcome strip shows the is_stub flag.
+// Right: the BELIEF-TRAJECTORY replay — a scrubber over the turns with
 // tick marks at key decision turns, and a belief snapshot (Trust + Walk-away risk gauges, stage +
 // the selected turn's decision, slot mini-table) that reflects the NEAREST belief snapshot at/below
 // the selected turn. CB-05: per-driver velocity deltas (↑/↓/~) rendered inline next to each gauge
@@ -47,7 +48,7 @@ import { useRouter } from 'next/navigation';
 import { Icon } from '@/components/cadence/Icon';
 import { Ring } from '@/components/cadence/Spark';
 import { fetchEpisode, fmtDuration, fmtFirstToken, fmtMsShort, fmtSpoke, setEpisodeGolden } from '@/lib/operate-api';
-import { archetypeLabel, humanizeRationale, kbVersionLabel, versionLabel } from '@/lib/labels';
+import { archetypeLabel, humanizeRationale, isSimHarnessRationale, kbVersionLabel, versionLabel } from '@/lib/labels';
 import type { BeliefSnapshot, EpisodeDetail, ProspectTurnState, TurnTiming } from '@/lib/operate-types';
 
 // CB-45: per-agent-turn voice-timing chips for the decision trace. Renders up to two small muted
@@ -685,6 +686,13 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
                 <Icon name="badge" size={12} /> Golden
               </span>
             ) : null}
+            {/* CB-60 / CB-94 (c): seeded-stub badge in the outcome strip mirrors the calls-list
+                badge so an operator opening a stub directly via URL sees the provenance. */}
+            {ep.is_stub ? (
+              <span className="tag" style={{ opacity: 0.7 }} title="This is a seeded training call, not a live conversation">
+                Seeded sample
+              </span>
+            ) : null}
             {flagged ? (
               <span className="tag warn dot" title="Flagged for follow-up (local to this view)">
                 Flagged
@@ -758,6 +766,11 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
             const isEscalateChip = isAgent && t.decision_label === 'Escalate to human';
             const nextTurn = ep.turns[i + 1];
             const isProactiveEscalation = isEscalateChip && nextTurn?.speaker === 'prospect';
+            // CB-94 (c): detect sim-harness stub turns — suppress the rationale chip and show a
+            // small "Seeded sample" badge instead. humanizeRationale already returns '' for these,
+            // but we need the raw check here to know whether to show the badge vs omit entirely.
+            const isStubTurn = isSimHarnessRationale(t.rationale);
+            const humanRationale = isStubTurn ? '' : humanizeRationale(t.rationale);
             return (
               <div
                 key={t.turn_id}
@@ -801,7 +814,20 @@ export default function ReviewPage({ params }: { params: { id: string } }) {
                           </span>
                         ) : null}
                       </span>
-                      {t.rationale ? <span className="rv-rat">{`"${humanizeRationale(t.rationale)}"`}</span> : null}
+                      {/* CB-94 (c): stub-turn rationale is suppressed — show a "Seeded sample" badge
+                          instead of the "Simulated training call" string. For real turns, show the
+                          humanized rationale as before (humanRationale is '' for stub turns). */}
+                      {isStubTurn ? (
+                        <span
+                          className="tag"
+                          style={{ fontSize: 10, opacity: 0.65, padding: '1px 6px' }}
+                          title="This turn is from a seeded training call"
+                        >
+                          Seeded sample
+                        </span>
+                      ) : humanRationale ? (
+                        <span className="rv-rat">{`"${humanRationale}"`}</span>
+                      ) : null}
                       {latency ? <span className="rv-lat">{latency}</span> : null}
                       {/* CB-45: voice-timing chips for this agent turn (omitted when the turn has no
                           timing — text/legacy). first-token = how long until the agent started

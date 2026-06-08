@@ -17,10 +17,13 @@
 // CB-75: GATE_LABELS extended with establish_who_first + no_repeat_discovery (CB-34/CB-35 gate slugs
 // that appear in live-panel rationales). humanizeRationale now used in live/page.tsx too.
 // CB-81: channelLabel maps raw channel slugs (text, voice, phone) to operator-facing labels
-// ("Web chat", "Web voice", "Phone"). humanizeRationale extended to (a) map "sim-harness decision"
-// → "Simulated training call" so seeded-stub turn rationale never leaks the raw harness string, and
-// (b) strip internal index tags — "(CB-48 directness)", inline CB/D/W/S/P/R-NN tokens — that
-// src/core may embed in gate rationale strings; these are internal references, not operator text.
+// ("Web chat", "Web voice", "Phone"). humanizeRationale extended to (a) suppress "sim-harness
+// decision" turns by returning '' so the caller can omit the rationale chip entirely — the call is
+// already badged "Seeded sample" at the list and review levels (CB-60/CB-94), making the per-turn
+// provenance label redundant; (b) strip internal index tags — "(CB-48 directness)", inline
+// CB/D/W/S/P/R-NN tokens — that src/core may embed in gate rationale strings.
+// CB-94 (c): isSimHarnessRationale(raw) exported so callers can detect stub turns and render a
+// "Seeded sample" chip instead of a rationale quote.
 
 // Strip the internal suffixes from a raw version id for display: the experiment dimension/seq suffix
 // ("champion_v0__playbooks_discovery_sequence__7" -> "champion_v0") and any short hash
@@ -207,13 +210,23 @@ export function humanizeDiffDescription(desc: string | null | undefined): string
 // so NO raw slug or gate-name reaches the operator. Idempotent.
 // CB-65: step 3 added to strip Python-style kwargs like "tier='trial' (trust=0.70, purchase_intent=0.62)"
 // that gates.py embeds in the advance_to_close rationale string — display-only scrub; raw string kept.
+/** CB-94 (c): returns true when the raw rationale is the sim-harness annotation written for
+ *  seeded-stub turns. Callers use this to suppress the rationale chip and render a "Seeded sample"
+ *  badge instead — the call is already badged at the list and review levels so the per-turn
+ *  provenance string is redundant and exposes sim infrastructure in the operator-facing trace. */
+export function isSimHarnessRationale(rationale: string | null | undefined): boolean {
+  if (!rationale) return false;
+  return /^sim-harness\s+decision\s*$/i.test(rationale.trim());
+}
+
 export function humanizeRationale(rationale: string | null | undefined): string {
   if (!rationale) return '';
   let out = rationale;
-  // CB-81: translate known harness/system strings before any other processing so they never leak.
-  // "sim-harness decision" is the turn rationale written by the sim harness for seeded-stub turns —
-  // it is a system annotation, not a gate rationale, and must render as a plain phrase.
-  if (/^sim-harness\s+decision\s*$/i.test(out.trim())) return 'Simulated training call';
+  // CB-81/CB-94 (c): suppress the sim-harness annotation entirely — return '' so the caller omits
+  // the rationale chip. The call is already badged "Seeded sample" at the list and review levels;
+  // showing "Simulated training call" as a per-turn rationale quote exposes sim provenance in the
+  // operator-facing trace unnecessarily. isSimHarnessRationale() lets callers render a badge instead.
+  if (isSimHarnessRationale(out)) return '';
   // 1. Leading gate-name prefix "<gate>: …" → human gate label.
   const m = out.match(/^([a-z][a-z0-9_]*?):\s*/);
   if (m && GATE_LABELS[m[1]]) {

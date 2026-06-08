@@ -9,6 +9,10 @@
 // pre-translated by the backend; the raw persona archetype + version slugs are humanized client-side
 // via @/lib/labels (archetypeLabel/versionLabel), and the raw call id is muted/secondary — never a
 // headline (internal indices must not render as operator-facing labels).
+// CB-94 (a): LADDER TIER column now shows the numeric tier rung (e.g. "T2") alongside the tier
+// name to make it semantically distinct from the OUTCOME column. The two columns can share the same
+// text (e.g. "Consultation booked") when the outcome IS that tier — showing the tier number avoids
+// the false appearance of duplication and makes the rung position scannable at a glance.
 // CB-75: the calls page now reads ?cohort=all from the URL search params on mount to pre-activate
 // "All cohorts" mode. This lets the escalations page link here with the correct cohort mode active
 // so operators can immediately find calls from non-live cohorts without manual toggle.
@@ -497,7 +501,19 @@ export default function CallsPage() {
                         ) : null}
                       </td>
                       <td>
-                        <span className="muted" style={{ fontSize: 12.5 }}>{c.ladder_label}</span>
+                        {/* CB-94 (a): show tier number alongside the tier name so this column is
+                            visually distinct from OUTCOME even when both share the same text
+                            (e.g. tier-2 label AND outcome are both "Consultation booked"). */}
+                        <span className="muted" style={{ fontSize: 12.5 }}>
+                          <span
+                            className="mono"
+                            style={{ fontSize: 10, opacity: 0.6, marginRight: 4, fontWeight: 700 }}
+                            title={`Commitment rung ${c.ladder_tier} of 4`}
+                          >
+                            T{c.ladder_tier}
+                          </span>
+                          {c.ladder_label}
+                        </span>
                       </td>
                       <td className="num mono" style={{ fontSize: 12.5 }}>{fmtDuration(c.duration_ms)}</td>
                       <td>
