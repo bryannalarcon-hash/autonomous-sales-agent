@@ -226,6 +226,29 @@ class OpenRouterClient(_JsonHelperMixin):
         # RETRIES after the first attempt, so total attempts = 1 + max_retries.
         self.max_retries = max(0, int(max_retries))
         self.retry_backoff_base = max(0.0, float(retry_backoff_base))
+        # CB-78: shared httpx client, one per (instance, event loop). A fresh AsyncClient per call
+        # paid a TLS handshake on EVERY LLM call (3+ per turn: DST/policy/NLG). httpx clients are
+        # loop-affine and the test suite spins one loop per test, so the cache holds THE loop object
+        # (identity-checked — id() reuse after GC made an int key unsafe) alongside its client.
+        self._cached_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._cached_client: Optional[httpx.AsyncClient] = None
+
+    def _client(self) -> httpx.AsyncClient:
+        """Return this loop's shared AsyncClient, creating it on first use (CB-78).
+
+        Connection pooling across calls removes the per-call TLS handshake to OpenRouter. The client
+        is NOT closed per request; it lives as long as its loop. A different/closed loop or a closed
+        client (getattr — tests monkeypatch httpx.AsyncClient with fakes lacking is_closed) means
+        the cached client is unusable: drop it and build a fresh one."""
+        loop = asyncio.get_running_loop()
+        if (
+            self._cached_client is None
+            or self._cached_loop is not loop
+            or getattr(self._cached_client, "is_closed", False)
+        ):
+            self._cached_loop = loop
+            self._cached_client = httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout)
+        return self._cached_client
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -272,16 +295,15 @@ class OpenRouterClient(_JsonHelperMixin):
         last_exc: Exception
         for attempt in range(self.max_retries + 1):
             try:
-                async with httpx.AsyncClient(
-                    base_url=self.base_url, timeout=self.timeout
-                ) as client:
-                    resp = await client.post(
-                        f"{self.base_url}/chat/completions",
-                        json=body,
-                        headers=self._headers(),
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
+                # CB-78: shared per-loop client (connection reuse — no TLS handshake per call).
+                client = self._client()
+                resp = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    json=body,
+                    headers=self._headers(),
+                )
+                resp.raise_for_status()
+                data = resp.json()
                 # CB-52: record this call's real cost (best-effort; record_usage never raises).
                 cost.record_usage(body["model"], data.get("usage"))
                 return data["choices"][0]["message"]["content"]
@@ -337,27 +359,26 @@ class OpenRouterClient(_JsonHelperMixin):
         for attempt in range(self.max_retries + 1):
             yielded_any = False
             try:
-                async with httpx.AsyncClient(
-                    base_url=self.base_url, timeout=self.timeout
-                ) as client:
-                    async with client.stream(
-                        "POST",
-                        f"{self.base_url}/chat/completions",
-                        json=body,
-                        headers=self._headers(),
-                    ) as resp:
-                        resp.raise_for_status()
-                        async for raw_line in resp.aiter_lines():
-                            token = _sse_content_delta(raw_line)
-                            if token:
-                                yielded_any = True
-                                yield token
-                                continue
-                            # CB-52: the non-content final chunk carries usage (cost) — record it,
-                            # never yield it (token parity: concat(yielded) == complete() reply).
-                            usage = _sse_usage(raw_line)
-                            if usage is not None:
-                                cost.record_usage(body["model"], usage)
+                # CB-78: shared per-loop client (connection reuse — no TLS handshake per call).
+                client = self._client()
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    json=body,
+                    headers=self._headers(),
+                ) as resp:
+                    resp.raise_for_status()
+                    async for raw_line in resp.aiter_lines():
+                        token = _sse_content_delta(raw_line)
+                        if token:
+                            yielded_any = True
+                            yield token
+                            continue
+                        # CB-52: the non-content final chunk carries usage (cost) — record it,
+                        # never yield it (token parity: concat(yielded) == complete() reply).
+                        usage = _sse_usage(raw_line)
+                        if usage is not None:
+                            cost.record_usage(body["model"], usage)
                 return
             except httpx.HTTPStatusError as exc:
                 # If a status surfaced we have not started yielding (raise_for_status runs before the

@@ -112,6 +112,15 @@
 - **Acceptance:** measured first-turn first-token within ~2× of later turns; mid-stream Send is a no-op client-side.
 - **Refs:** QA9-chat bugs #5, #10; streaming measurement table.
 
+### CB-78 — First-message cold start (~10s first token) + mid-stream double-send
+- **Type / Surface / Size:** bug · `core` (`llm`) · `api` (`server` lifespan) · `web` (demo) · S–M
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `src/core/llm.py` (per-(instance,loop) shared httpx `AsyncClient` — was a fresh client + TLS handshake on EVERY call, 3+/turn), `src/api/server.py` (lifespan pre-opens the DB pool alongside the embedder warm-up), `tests/unit/test_cb78_llm_client_reuse.py` (NEW, 5). Web mid-stream Send guard: `canSend` already gates on `sending` (verified — the QA "queue" was the indicator-timing artifact; documented).
+- **What changed:** first-turn latency was paying TLS handshakes + lazy DB-pool creation on top of the LLM round-trips (measured first agent turn 11.3s vs ~7s steady). Connection reuse + pool pre-open remove the startup tax; loop-affinity handled (cache keyed by the running loop, rebuilt on loop/closed change — tests spin one loop each).
+- **Verification:** 5 reuse tests (same-loop reuse, new-loop rebuild, closed-client replace, fake-client tolerance); llm suite + full suites 615p/5s + system green.
+- **Constraints checked:** retry/backoff/cost-capture paths unchanged (same client, just reused); R37 stream parity intact.
+- **Follow-ups / known gaps:** real first-token latency improvement to be confirmed in QA round 3 (the handshake/pool tax is removed; embedder first-load is already warmed). Mid-stream Send is already a no-op client-side (canSend gating); no code change needed there.
+
 ### CB-01 — Active-calls queue with per-call take-over
 - **Type / Surface / Size:** feature · `/operate/live` · `api` · `voice-worker` · L
 - **Prereqs:** — *(no other CB blocks it; internally it has 3 work units that order themselves: the list endpoint → the queue UI → the take-over mechanism. Split into `CB-01.a/.b/.c` when pulled.)*

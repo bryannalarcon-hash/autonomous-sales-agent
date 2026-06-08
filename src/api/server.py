@@ -209,6 +209,15 @@ def create_app(
                 emb.embed(["warmup"])
             except Exception:  # pragma: no cover - warm-up is best-effort
                 _log.warning("embedder warm-up failed (continuing; first turn will load lazily)")
+            # CB-78: pre-open the shared DB pool too — the first live turn was paying pool creation
+            # on top of the LLM calls (~+4s first-turn latency measured). Gated on live_rag so
+            # DB-free test apps never touch Postgres at startup. Best-effort like the embedder.
+            try:
+                from src.memory import store as _mem_store
+
+                await _mem_store.connect()
+            except Exception:  # pragma: no cover - warm-up is best-effort
+                _log.warning("DB pool pre-open failed (continuing; first request connects lazily)")
         try:
             yield
         finally:
