@@ -61,6 +61,30 @@
 > ```
 
 
+### CB-88 — Policy emits attempt_close with tier=None → booking never stamped (not in /operate)
+- **Type / Surface / Size:** bug · `core` (`policy`/`gates`) + `api` (persistence) · M · (deeper than CB-87)
+- **Prereqs:** —
+- **Current (round-4 final replay, orchestrator-verified in DB):** the mom booked a callback; the episode's agent turns include `attempt_close` BUT with `tier=None` (turn.tier and meta.tier both empty). CB-87's outcome-stamp keys on `last_close_tier`, so a None tier → `derive_outcome("attempt_close", None)` can't map a booked outcome → episode stays `in_progress` → excluded from /operate (CB-60 filter). So CB-87 fixed the premature-end and the lead checkpoint, but a tier-less close still doesn't surface as a booking. The brain is "booking" verbally (attempt_close act) without committing to a tier.
+- **Desired:** an `attempt_close` decision must carry the tier it is closing at (callback/consultation/trial/enrollment); the policy/gates set it; then CB-87's stamp + buy-gate mapping work. Investigate why the policy LLM proposes attempt_close with no tier and whether a gate should infer/require it.
+- **Acceptance:** a scripted callback booking → the episode shows "Callback booked" in /operate mid-call; attempt_close turns always carry a tier; buy-gate purity preserved.
+- **Refs:** round-4 replay ep-23268e…; demo_routes last_close_tier + persistence.derive_outcome; deeper layer of CB-82/87.
+
+### CB-89 — Non-sequitur (social_aside) not detected on the live LLM intent path
+- **Type / Surface / Size:** bug · `core` (`dst` LLM-intent prompt / `gates`) · M
+- **Prereqs:** —
+- **Current (round-4 replay):** CB-85 added `social_aside` to the regex `_classify_intent` FALLBACK, but live demo uses the LLM intent classifier (which returns question/price_inquiry/human_request/objection/statement — no social_aside). So "you guys see the storm coming tonight?" live → ignored + a scheduling push ("Great — I'll get you on the calendar"), the exact behavior CB-85 meant to fix. The gate guard never engages because last_user_act is never "social_aside" on the live path.
+- **Desired:** either add "social_aside" to the LLM intent vocabulary (and its prompt), OR run the regex social_aside check over the user text regardless of the LLM result so the gate guard + NLG ack engage live.
+- **Acceptance:** a live/replay storm turn gets a brief ack + redirect, never a scheduling push; advance_to_close still gated.
+- **Refs:** round-4 replay /tmp/qa7/round4_dad.txt turn 3; CB-85 only wired the regex fallback.
+
+### CB-90 — Guarantee demand pivoted-past; caller's own availability misread as a lookup
+- **Type / Surface / Size:** bug · `core` (`gates`/`nlg`) · M
+- **Prereqs:** —
+- **Current (round-4 replay):** (a) "Guarantee me a B or it's free" → the agent pivoted to scheduling ("Perfect — I have your info, we'll reach out") instead of handling the guarantee objection (CB-83 fixed the name-misparse, but the objection is now swallowed, not answered) + a minor "I have your info" when no contact was given; (b) the mom's STATED availability "Wednesdays or Fridays after 4 work best" → "I don't have the specific Wednesday or Friday after-4 availability in front of me…" — the agent misread the caller stating HER availability as a request to look up TUTOR availability, reading as not-listening.
+- **Desired:** a guarantee/efficacy demand routes to objection handling (honest "we can't promise a grade, but…"), not a scheduling pivot; a caller stating availability is captured + acknowledged (CB-76 callback_window), never deflected as an unavailable lookup.
+- **Acceptance:** scripted guarantee turn → objection-handled reply; scripted availability statement → ack ("Got it — Wednesdays or Fridays after 4"), no "I don't have that in front of me".
+- **Refs:** round-4 replay dad turn 4 + mom turn 2.
+
 ### CB-69 — Text-channel escalate: don't ask a question the session can't hear answered
 - **Type / Surface / Size:** design/bug · `core` (`nlg` escalate guidance) · `api` (`demo_routes` done semantics) · S–M
 - **Prereqs:** — (user decision wanted on the desired semantics)
