@@ -1299,9 +1299,14 @@ async def update(
         # it's really worth it" → efficacy_doubt). For every objection type OTHER than a guarantee
         # demand we now TRUST the LLM (it judges by meaning; the regex words are context-free). So the
         # upgrade fires ONLY when the NARROW _GUARANTEE_DEMAND_RE matches AND the LLM returned a weak
-        # intent (statement/None, no objection). Genuine guarantee demand → efficacy_doubt; everything
-        # else keeps the LLM's call. (The pattern-ORDERING fix stays on the regex fallback path.)
-        _OBJECTION_WEAK_ACTS = frozenset({"statement", None})
+        # intent (statement/question/None, no objection). Genuine guarantee demand → efficacy_doubt;
+        # everything else keeps the LLM's call. (The pattern-ORDERING fix stays on the regex fallback.)
+        # CB-90a-fix: "question" is a WEAK act here too — live, the LLM labels a guarantee demand
+        # phrased as "...Yes or no?" / "Can you guarantee a B?" as `question`, which left the guarantee
+        # unhandled (answer_via_kb instead of handle_objection). Upgrading a `question` is safe ONLY
+        # because _GUARANTEE_DEMAND_RE is tight (requires a grade/result token) — a normal question
+        # never matches it, so this cannot steal genuine questions (proven by the adversarial suite).
+        _OBJECTION_WEAK_ACTS = frozenset({"statement", "question", None})
         if (
             classified_act in _OBJECTION_WEAK_ACTS
             and objection is None

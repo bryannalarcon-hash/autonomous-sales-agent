@@ -475,3 +475,35 @@ class TestAdvanceToCloseNotOverBlocked:
         assert out.act != "attempt_close", (
             f"advance_to_close must be blocked after social_aside. Got {out.act!r}"
         )
+
+
+# CB-90a-fix (live): the LLM labels a guarantee demand phrased as "...Yes or no?" / "Can you
+# guarantee a B?" as `question`, not statement — the upgrade must cover `question` too (safe
+# because _GUARANTEE_DEMAND_RE requires a grade/result token). Caught by the round-4 live replay.
+import asyncio as _asyncio
+import json as _json
+from src.core import dst as _dst
+from src.core.belief_state import BeliefState as _BS
+from src.core.llm import MockLLMClient as _Mock
+
+
+def _intent(utt, llm_act):
+    body = {"trust": 0.0, "urgency": 0.0, "bail_risk": 0.0, "need_intensity": 0.0,
+            "purchase_intent": 0.0, "price_sensitivity": 0.0, "user_act": llm_act,
+            "objection": None, "open_question": None, "affordability_refusal": False}
+
+    async def _run():
+        nb = await _dst.update(_BS.fresh(), "pitch", utt, _Mock([_json.dumps(body)]))
+        return nb.last_user_act, nb.active_objection
+    return _asyncio.run(_run())
+
+
+def test_cb90a_guarantee_as_question_upgrades_to_efficacy():
+    assert _intent("Guarantee me a B or it's free. Yes or no.", "question") == ("objection", "efficacy_doubt")
+    assert _intent("Can you guarantee a B?", "question") == ("objection", "efficacy_doubt")
+
+
+def test_cb90a_guarantee_question_fp_guard_holds():
+    # tight pattern: no grade/result token -> stays a question even though "guarantee" appears
+    assert _intent("Can you guarantee a tutor will be free Thursday?", "question") == ("question", None)
+    assert _intent("What do I get for the money?", "question") == ("question", None)
