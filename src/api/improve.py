@@ -28,6 +28,16 @@
 # runner (tests stack a deterministic deck). REUSES the loop (generator mutators, run_experiment,
 # evaluate_promotion, experiment_record_from) and src.api.labels so NO raw internal index (dimension
 # slug, state slug, version internals) ever renders in operator-facing text.
+# CB-59: ONE SOURCE OF TRUTH for "current champion". resolve_champion_config() is the single function
+# that decides which AgentConfig experiments baseline against. It reads the store's is_champion record
+# first (the promoted champion), then loads its MATERIALIZED config via load_config(config_ref or
+# version) — src.loop.promotion.promote() persists every new champion's config yaml at promotion time.
+# HONEST FALLBACK: a legacy champion with no materializable content degrades to the bootstrap yaml
+# UNDER ITS TRUE LABEL (champion_v0) — content is never relabeled, so records say what they actually
+# baselined. A missing/corrupt store also degrades to the bootstrap (never crashes the run route). All
+# endpoints that need the champion config call _resolve_champion() (async), which routes through the
+# injected sync provider in tests or resolve_champion_config(store) in prod (server.py only injects
+# the provider when an explicit `config` override is given — the test seam).
 from __future__ import annotations
 
 import asyncio
@@ -54,9 +64,69 @@ from src.loop.generator import (
     mutate_threshold,
     reorder_discovery,
 )
-from src.memory.schema import Episode
 from src.loop.promotion import QUAL_TOLERANCE, PromotionDecision, evaluate_promotion
-from src.memory.schema import ExperimentRecord, VersionLineage
+from src.memory.schema import Episode, ExperimentRecord, VersionLineage
+
+
+# ---------------------------------------------------------------------------
+# CB-59 — Championship resolution (ONE source of truth)
+# ---------------------------------------------------------------------------
+
+_YAML_BOOTSTRAP = "champion_v0"  # the always-present bootstrap config file
+
+
+async def resolve_champion_config(store: "ImproveStore") -> AgentConfig:
+    """Return the AgentConfig the current champion represents — the SINGLE source of truth.
+
+    Authority order (CB-59):
+    1. Read the store's is_champion lineage record (the promoted version, e.g. v1-d762f480).
+    2. Attempt load_config(node.config_ref) if config_ref is set, then load_config(node.version) —
+       champions promoted via src.loop.promotion.promote() now MATERIALIZE their config body to
+       src/config/versions/<version>.yaml at promotion time (the CB-59 root fix), so this is the
+       normal path going forward.
+    3. HONEST FALLBACK: if the champion's config content is NOT materializable (a legacy champion
+       promoted before the root fix — config_ref is None and no versions/<version>.yaml exists, so
+       its true content is genuinely unreconstructable), return the bootstrap yaml UNDER ITS TRUE
+       LABEL (champion_v0) and log the degradation. We NEVER relabel content we didn't load:
+       stamping v0 content as "v1" would be a substance lie — experiment records must say what they
+       actually baselined.
+    4. If the store has no champion record (empty/fresh install) or the store call fails, fall back
+       to the bootstrap yaml — the explicit yaml-bootstrap case; never crashes the run route.
+
+    Never raises on store/candidate failures: everything degrades gracefully to the bootstrap
+    config, and the version string on the returned config always truthfully names the content it
+    carries (it is what experiment records, KPI labels, and the lab drawer propagate).
+    """
+    try:
+        champ = await store.get_champion()
+    except Exception:
+        logger.warning("resolve_champion_config: store.get_champion() failed; using bootstrap yaml")
+        champ = None
+
+    if champ is None:
+        # No champion in store — fresh install or empty DB. Return the bootstrap yaml explicitly.
+        return load_config(_YAML_BOOTSTRAP)
+
+    # Try to load the full config body for the promoted version: config_ref first (the explicit
+    # pointer promote() now writes at promotion time), then the version name itself.
+    for candidate in filter(None, [champ.config_ref, champ.version]):
+        try:
+            return load_config(candidate)  # the champion's REAL content, version label included
+        except Exception:
+            continue  # this candidate has no/invalid yaml; try the next
+
+    # HONEST FALLBACK (CB-59 round 2): the promoted champion's content is unavailable (a legacy
+    # champion whose config was never persisted). Return the bootstrap config UNDER ITS TRUE LABEL —
+    # experiments will baseline champion_v0 and their records will say so. Relabeling v0 content
+    # with the champion's version would fabricate a baseline that never ran.
+    logger.warning(
+        "resolve_champion_config: champion %r has no materializable config "
+        "(config_ref=%r, no versions/%s.yaml) — baselining the bootstrap %r under its TRUE label; "
+        "experiment records will truthfully show %r as the baseline",
+        champ.version, champ.config_ref, champ.version, _YAML_BOOTSTRAP, _YAML_BOOTSTRAP,
+    )
+    return load_config(_YAML_BOOTSTRAP)
+
 
 # ---------------------------------------------------------------------------
 # Injectable data layer
@@ -778,8 +848,10 @@ def create_improve_router(
     run_max_concurrency: int = _DEFAULT_RUN_CONCURRENCY,
 ) -> APIRouter:
     """Build the /api Improve router. `improve_store` is injectable (default Postgres store, tests
-    pass a seeded fake). `champion_config_provider` returns the champion AgentConfig a KB/playbook
-    SAVE forks into a draft (default: load_config('champion_v0')).
+    pass a seeded fake). `champion_config_provider` (CB-59) is an OPTIONAL sync override that returns
+    the champion AgentConfig directly — used by tests to inject a fixed config without a store. When
+    absent (prod), _resolve_champion() reads the store's is_champion record via resolve_champion_config()
+    so every endpoint sees the LIVE promoted champion, not the static yaml bootstrap.
 
     `llm_client_factory` builds the LLMClient both arms of POST /api/experiments/run use (prod: a REAL
     OpenRouterClient — a run SPENDS CREDIT; tests: a free MockLLMClient). `experiment_runner` is the
@@ -800,7 +872,17 @@ def create_improve_router(
     to force a fast timeout deterministically). server.create_app uses the auto default. All endpoints
     are async."""
     store: ImproveStore = improve_store if improve_store is not None else _StoreBackedImproveStore()
-    get_config = champion_config_provider or (lambda: load_config("champion_v0"))
+
+    async def _resolve_champion() -> AgentConfig:
+        """CB-59: async champion resolver — the ONE place every endpoint calls for the current config.
+
+        Routes through the injected sync provider (tests: deterministic, DB-free) when present;
+        otherwise delegates to resolve_champion_config(store) so prod always gets the PROMOTED
+        champion from the version store, not the static bootstrap yaml. Never raises — degrades to
+        the bootstrap on any store/yaml failure (see resolve_champion_config docstring)."""
+        if champion_config_provider is not None:
+            return champion_config_provider()
+        return await resolve_champion_config(store)
     # One semaphore for the whole router instance bounds concurrent paid runs. Created here (3.10+
     # binds it to the loop lazily on first use), shared across requests served by this router.
     run_semaphore = asyncio.Semaphore(max(1, int(run_max_concurrency)))
@@ -1023,7 +1105,7 @@ def create_improve_router(
         # Floor N to the minimum trustworthy sample (>=_MIN_RUN_N) and cap it — never run a degenerate
         # tiny sample that the grading floor would reject anyway, and never let a UI typo bill a huge N.
         n = max(_MIN_RUN_N, min(int(req.n), _MAX_RUN_N))
-        champion = get_config()
+        champion = await _resolve_champion()
         try:
             if req.changes:
                 # CB-27: a multi-metric experiment (explicit opt-in) — relaxes the single-dimension
@@ -1108,7 +1190,7 @@ def create_improve_router(
         so the operator confirms it before launching the (async, paid) run — not a blank lab landing.
 
         The live champion config / version is UNCHANGED (no record_version) — a scaffold is a draft."""
-        champion = get_config()
+        champion = await _resolve_champion()
         dimension = req.dimension or "playbooks.discovery_sequence"
         value = req.value
         if value is None and dimension == "playbooks.discovery_sequence":
@@ -1277,7 +1359,7 @@ def create_improve_router(
         experiments) or the table is empty, `sections` is [] and the page shows an empty-state rather
         than failing.
         """
-        cfg = get_config()
+        cfg = await _resolve_champion()
         chunks: list[dict[str, Any]] = []
         list_chunks = getattr(store, "list_kb_chunks", None)
         if list_chunks is not None:
@@ -1294,7 +1376,7 @@ def create_improve_router(
     async def get_playbook_ep() -> dict[str, Any]:
         """The current champion config's playbook (P8 editor view). Read-only — editing happens via
         POST, which forks a draft challenger rather than mutating this live config (R20)."""
-        cfg = get_config()
+        cfg = await _resolve_champion()
         return {
             "version": cfg.version,
             "kb_version": cfg.kb_version,
@@ -1307,7 +1389,7 @@ def create_improve_router(
     async def save_kb_ep(req: SaveDraftRequest) -> dict[str, Any]:
         """SAVE a KB edit -> a DRAFT CHALLENGER (a new `running` experiment). The live champion config
         / version is UNCHANGED (no record_version), per R20 — it's a draft until promoted."""
-        cfg = get_config()
+        cfg = await _resolve_champion()
         draft = _draft_challenger_record(
             cfg, surface="kb", name=req.name, body=req.body, seed=0
         )
@@ -1318,7 +1400,7 @@ def create_improve_router(
     async def save_playbook_ep(req: SaveDraftRequest) -> dict[str, Any]:
         """SAVE a playbook edit (e.g. discovery_sequence) -> a DRAFT CHALLENGER. The live champion is
         UNCHANGED (no record_version), per R20."""
-        cfg = get_config()
+        cfg = await _resolve_champion()
         draft = _draft_challenger_record(
             cfg, surface="playbook", name=req.name, body=req.body, seed=0
         )

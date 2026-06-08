@@ -2,6 +2,9 @@
 # An AgentConfig is the unit the improvement loop versions and promotes: prompts + playbooks +
 # policy thresholds, identified by a stable `version` and a pinned `kb_version`. Every episode and
 # live session is stamped with these so performance is attributable to the exact config that ran.
+# CB-59: save_config() is the write-side counterpart of load_config() — promotion
+# (src.loop.promotion.promote) materializes every NEW champion's config to versions/<version>.yaml
+# so resolve_champion_config can re-load its REAL content later (lineage config_ref points here).
 # Uses stdlib dataclasses (no third-party dep) so the foundational config layer stays robust.
 from __future__ import annotations
 
@@ -55,3 +58,32 @@ def load_config(version: str = "champion_v0") -> AgentConfig:
         playbooks=data.get("playbooks", {}),
         thresholds=data.get("thresholds", {}),
     )
+
+
+def save_config(config: AgentConfig) -> Path:
+    """Serialize an AgentConfig to config/versions/<config.version>.yaml (CB-59 root fix).
+
+    The write-side counterpart of load_config: promotion materializes every NEW champion's config
+    here so its content is re-loadable later (load_config(config.version) round-trips). The yaml
+    carries the SAME field set load_config validates (version/kb_version/persona + prompts/
+    playbooks/thresholds), so a saved config always re-loads. Returns the written path. Raises on
+    I/O failure — the caller (promote) decides whether that is fatal (it is not: promotion still
+    records the lineage; config_ref just stays None for that champion)."""
+    target = VERSIONS_DIR / f"{config.version}.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "version": config.version,
+        "kb_version": config.kb_version,
+        "persona": {
+            "name": config.persona.name,
+            "role": config.persona.role,
+            "style": config.persona.style,
+        },
+        "prompts": dict(config.prompts),
+        "playbooks": dict(config.playbooks),
+        "thresholds": dict(config.thresholds),
+    }
+    target.write_text(
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+    return target

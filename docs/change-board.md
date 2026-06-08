@@ -70,15 +70,6 @@
 - **Refs:** `src/api/operate.py::live_snapshot` + `live_ep`; LiveKit Agents room/participant model + SIP dispatch (`scripts/setup_sip_dispatch.py`, rule `SDR_hKYQYAwz96uA`); the disabled take-over control (`web/app/operate/live/page.tsx`); R37 in `src/core/respond.py`.
 - **Take-over spec (user, 2026-06-02) — refines CB-01.c:** on "Take over", the AI must (1) be INTERRUPTED mid-conversation and (2) speak a DEFAULT TTS hand-off line (e.g. "Let me bring in a specialist to help — one moment. They may type some of their responses, so there might be a brief pause between answers."). Then the OPERATOR talks into their own device (browser mic / WebRTC into the call's LiveKit room) and is heard by the caller through the phone — operator audio is published as a room participant, NOT a dial-in (presume the operator is NOT calling from their own phone number, so no SIP bridge / caller-ID concerns). The agent stops auto-generating; the operator may ALSO TYPE responses that are TTS'd to the caller ("the agent might be typing their responses"). So take-over = interrupt + disclosure TTS + operator mic→room audio + optional operator-typed→TTS, with the AI yielded. Consent/recording state must carry over; respect R37 (don't fork the brain — the brain just stops).
 
-### CB-59 — One champion: experiments + KPI must target the LIVE champion (v1), not champion_v0.yaml
-- **Type / Surface / Size:** bug/change · `api` (`improve`, `operate`) · `web` (KPI) · M
-- **Prereqs:** —
-- **Important files (candidates):** `src/api/improve.py` (`get_config()` returns the static `champion_v0.yaml`), version store (improve-store champion v1-bd0ef7ce), `web/app/operate/kpi/page.tsx` + its version selector source.
-- **Current:** the Lab baselines v0 and labels it "current production" while the header/Versions page say v1 is live (drawer even shows in-sample mean 0.80 as v0's ladder vs the store's 0.51). KPI's version selector offers v0/vA/vB only — the live champion's performance is invisible, and the only Enrolled/Trial showcase calls (v1) are excluded from every KPI view.
-- **Desired:** a single source of truth for "current champion"; experiments A/B against it by default; KPI selector lists real version labels including the live one; "current production" label always matches the Versions page.
-- **Acceptance:** Lab drawer champion label == Versions page champion == header; KPI can show v1; an experiment run's champion arm uses the promoted config; test pins get_config()/store agreement.
-- **Refs:** QA6 qa-lab MEDIUM #6 + cross-check note, qa-operate bug #9; `/tmp/qa6/24_versions.png`.
-
 ### CB-65 — Viewer-facing leak sweep (slugs, IDs, debug artifacts)
 - **Type / Surface / Size:** bug · `web` (all surfaces) · `api` (label seams) · M
 - **Prereqs:** —
@@ -139,6 +130,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-59 — One champion: experiments + KPI target the live champion honestly
+- **Type / Surface / Size:** bug/change · `api` (`improve`, `server`) · `loop` (`promotion`) · `config` · `web` (KPI) · M
+- **Completed:** 2026-06-07 (2 rounds — round 1 had 2 orchestrator-caught defects)
+- **Files changed (actual):** `src/api/improve.py` (`resolve_champion_config(store)` — THE one championship authority: store champion's materialized content when loadable; HONEST fallback to bootstrap under its TRUE label, never relabeling content), `src/api/server.py` (provider injected only for explicit test configs — round 1 was inert in prod), `src/config/settings.py` (`save_config()`), `src/loop/promotion.py` (promotion MATERIALIZES the new champion's yaml + sets `config_ref` — root fix; best-effort, never blocks promotion), `web/app/operate/kpi/page.tsx` + `web/lib/operate-api.ts` (selector lists store versions incl. the live champion), `tests/e2e/test_cb59_champion.py` (17), `tests/integration/test_loop.py` (tmp-dir fixture so DB-gated promote tests stop writing yamls into the repo).
+- **What changed:** round-1 defects: (1) server.py always injected static v0 → fix dead in prod; (2) fallback stamped v0 CONTENT with the store champion's label — a substance lie (verified: `config_ref` is a pointer, set None at promotion; live v1 unmaterializable). Round 2: honest semantics — with the legacy v1 champion, new records truthfully say `champion_v0` until a champion is promoted through the fixed path (which now persists content).
+- **Verification:** 17 item tests (incl. prod-wiring regression + substance assertion on a mutated threshold value); full suite 806p/5s; stray test yamls cleaned + prevented.
+- **Constraints checked:** run route never crashes on store failure; historical records render their stored versions unchanged.
+- **Follow-ups / known gaps:** approval-queue promotions (`approve_ep`) still can't materialize (record lacks the config body — how v1 got stranded); lineage seed rows churn hashes per suite run (pre-existing). Both noted for a future item if the lab's human-approval path gets exercised.
 
 ### CB-66 — Operate polish batch (sorting, filters, durations, labels)
 - **Type / Surface / Size:** bug · `web` (`/operate`) · `api` (labels/serialization) · M

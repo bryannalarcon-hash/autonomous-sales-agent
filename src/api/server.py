@@ -5,7 +5,9 @@
 #     compliance core (src.voice.consent) exposed to the browser.
 #   - the Operate read router (src.api.operate): /api/episodes, /api/kpis, /api/escalations, /api/live.
 #   - the Improve router (src.api.improve): experiments/approvals/kb/playbook/versions — GATED behind
-#     require_operator (a write surface) at the include site, never inside the router.
+#     require_operator (a write surface) at the include site, never inside the router. CB-59: in prod
+#     (no explicit `config` arg) the improve router gets champion_config_provider=None and resolves
+#     the champion from the VERSION STORE; an explicit `config` is the deterministic test seam.
 #   - the Replay router (src.api.replay_routes): POST /api/replay/build + GET /api/replay/results —
 #     builds fidelity experiments from all completed real calls; background task, bounded concurrency.
 # Everything network/DB-bound is INJECTABLE (llm_client_factory, embedder, retrieve/hydrate/escalation/
@@ -254,10 +256,14 @@ def create_app(
     # Improve-mode endpoints (U16 dashboard) — a WRITE surface, so the whole router is GATED behind
     # require_operator at the INCLUDE site (not inside the router). The run-an-A/B endpoint reuses the
     # app's LLM factory + the injectable experiment_runner so tests stay free + deterministic.
+    # CB-59: champion_config_provider is injected ONLY when the caller passed an explicit `config`
+    # override (the test seam — deterministic, DB-free). In prod (config=None) it stays None, so the
+    # improve router resolves the champion from the VERSION STORE via resolve_champion_config() —
+    # experiments baseline the PROMOTED champion, not the static champion_v0.yaml bootstrap.
     app.include_router(
         create_improve_router(
             improve_store=improve_store,
-            champion_config_provider=(lambda: cfg),
+            champion_config_provider=(lambda: cfg) if config is not None else None,
             llm_client_factory=_make_llm,
             experiment_runner=experiment_runner,
         ),

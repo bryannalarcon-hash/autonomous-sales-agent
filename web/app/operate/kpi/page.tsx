@@ -16,20 +16,21 @@
 // is at 0% (enrollment is genuinely rare for the seeded champion), leads with the meaningful NON-zero
 // signal — the commitment-reached rate (ladder tier >= 2) — so it's informative, not a wall of 0%.
 //
-// The version selector is populated ONLY with versions that ACTUALLY have episodes: a page of
-// episodes is fetched and their `version` tags are grouped by operator label (deriveVersionOptions),
-// so every option resolves to real calls — NOT the /api/versions lineage ids ("v1-0dbf7bff"), which
-// tag zero episodes and would render "No calls for this selection". It DEFAULTS to champion_v0 (the
-// only always-populated cohort). Hash suffixes on raw ids are an internal index and are NOT rendered.
-// The COMPARE baseline reuses that same small, episode-volume-ordered option set and probes AT MOST 2
-// of the most-populated non-selected candidates (not every vA-*/vB-* — which was a ~134-request
-// storm), so entering Compare costs a handful of requests and still yields a baseline with real n.
+// CB-59 — version selector: the live champion from the version store is ALWAYS present in the
+// selector, even before its episodes appear in the episode probe. Two probes run in parallel: (1) the
+// existing episode-probe (deriveVersionOptions) so every option resolves to real calls, and (2) a
+// fetchVersions() call that returns the promoted champion_version from the store (the same source the
+// Versions page uses). The champion is merged into the option list under its honest label
+// (versionLabel(champion_version)) and its is_champion flag is marked so the selector can show it
+// first. Hash suffixes are an internal index and are NOT rendered. The COMPARE baseline continues to
+// probe AT MOST 2 of the most-populated non-selected candidates so entering Compare costs a handful
+// of requests, not dozens.
 'use client';
 
 import { useEffect, useState } from 'react';
 import { Icon } from '@/components/cadence/Icon';
 import { Spark } from '@/components/cadence/Spark';
-import { fetchKpis, fetchEpisodes } from '@/lib/operate-api';
+import { fetchKpis, fetchEpisodes, fetchVersions } from '@/lib/operate-api';
 import type { KpiResponse } from '@/lib/operate-types';
 import { archetypeLabel, populationLabel, versionLabel } from '@/lib/labels';
 
@@ -152,9 +153,12 @@ function BarRow({
 
 export default function KpiPage() {
   const [mode, setMode] = useState<'overview' | 'compare'>('overview');
-  // Default to the seeded cohort so real numbers render on first load (was a hardcoded "v12" that
-  // matched no episodes). The selector is repopulated from /api/versions once it loads.
+  // Default to the seeded bootstrap cohort so real numbers render on first load. CB-59: once the
+  // store champion resolves (fetchVersions probe), the selector auto-advances to the live champion
+  // if the user hasn't manually changed the selection yet. `userPickedVersion` tracks whether the
+  // user has overridden the default so we don't silently clobber their selection.
   const [version, setVersion] = useState(SEEDED_VERSION);
+  const [userPickedVersion, setUserPickedVersion] = useState(false);
   const [cohort, setCohort] = useState('All');
   const [versionOptions, setVersionOptions] = useState<VersionOption[]>([
     { value: SEEDED_VERSION, label: versionLabel(SEEDED_VERSION), count: 0 },
@@ -162,28 +166,64 @@ export default function KpiPage() {
   const [data, setData] = useState<KpiResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Populate the version selector ONLY with versions that ACTUALLY have episodes. We fetch one page
-  // of episodes and group their `version` tags by operator label (deriveVersionOptions), so every
-  // option resolves to real calls — no dead-end "v1-0dbf7bff" lineage ids that tag zero episodes and
-  // render "No calls for this selection". The seeded cohort (champion_v0) is guaranteed present and
-  // stays the default; if the probe somehow returns nothing, the seeded default is kept as a fallback.
+  // Populate the version selector with versions that ACTUALLY have episodes (episode probe) PLUS the
+  // live champion from the version store (CB-59 — fetchVersions). Both probes run in parallel; the
+  // champion is merged into the final option list so it is always selectable even if it has no
+  // episodes yet. The seeded cohort (champion_v0) is guaranteed present as a fallback on a fresh load.
   useEffect(() => {
     let cancelled = false;
-    fetchEpisodes({ limit: '2000' })
-      .then((res) => {
+
+    // Probe 1: derive options from actual episode version tags (each maps to real calls).
+    const episodeProbe = fetchEpisodes({ limit: '2000' }).then((res) =>
+      deriveVersionOptions(res.episodes.map((e) => e.version)),
+    );
+
+    // Probe 2: get the promoted champion_version from the store (CB-59 — the single source of truth).
+    const versionsProbe = fetchVersions()
+      .then((res) => res.champion_version)
+      .catch(() => null as string | null);
+
+    Promise.all([episodeProbe.catch(() => [] as ReturnType<typeof deriveVersionOptions>), versionsProbe])
+      .then(([episodeOpts, champVer]) => {
         if (cancelled) return;
-        const opts = deriveVersionOptions(res.episodes.map((e) => e.version));
-        // Guarantee the seeded, always-populated default is present (and first) even if it didn't
-        // surface in this page — it is the only selection guaranteed to have episodes on a fresh load.
+
+        // Merge: start from episode-derived options (guaranteed to have real calls), then inject the
+        // live champion at the front if it isn't already represented (by label, not raw id — the store
+        // champion may have a different hash suffix than any episode-tagged version).
+        const champLabel = champVer ? versionLabel(champVer) : null;
+        const hasChamp = champLabel
+          ? episodeOpts.some((o) => versionLabel(o.value) === champLabel)
+          : false;
+
+        let opts = episodeOpts;
+        if (champVer && champLabel && !hasChamp) {
+          // Insert the champion first with count 0 (honest — no episodes yet under this exact tag).
+          opts = [{ value: champVer, label: champLabel, count: 0 }, ...opts];
+        }
+
+        // Guarantee the seeded bootstrap default is present so a fresh install still has a selection.
         const hasSeeded = opts.some((o) => o.value === SEEDED_VERSION);
         const final = hasSeeded
           ? opts
           : [{ value: SEEDED_VERSION, label: versionLabel(SEEDED_VERSION), count: 0 }, ...opts];
-        if (final.length > 0) setVersionOptions(final);
+
+        if (final.length > 0) {
+          setVersionOptions(final);
+          // CB-59: auto-advance the selection to the live champion when the user hasn't overridden
+          // the default. This ensures the KPI page opens on the live champion's performance, not the
+          // bootstrap default — matching what the Versions page and lab drawer label as "production".
+          if (champVer && !userPickedVersion) {
+            // Use the most-populated raw id that maps to the champion label (could be the champion
+            // itself if it has episodes, or the injected 0-count entry if not yet in episode table).
+            const champOpt = final.find((o) => versionLabel(o.value) === champLabel);
+            if (champOpt) setVersion(champOpt.value);
+          }
+        }
       })
       .catch(() => {
-        // Episode probe failing is non-fatal — keep the seeded default so the page still shows data.
+        // Both probes failing is non-fatal — the seeded default stays so the page still shows data.
       });
+
     return () => {
       cancelled = true;
     };
@@ -271,7 +311,7 @@ export default function KpiPage() {
               </button>
             </div>
             <div className="grow" />
-            <select className="field" value={version} onChange={(e) => setVersion(e.target.value)}>
+            <select className="field" value={version} onChange={(e) => { setVersion(e.target.value); setUserPickedVersion(true); }}>
               {versionOptions.map((v) => (
                 <option key={v.value} value={v.value}>
                   {v.label}

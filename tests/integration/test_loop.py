@@ -759,6 +759,21 @@ async def _schema():
     await store.close_pool()
 
 
+@pytest.fixture()
+def _tmp_versions(tmp_path, monkeypatch):
+    """CB-59: promote() now MATERIALIZES the new champion's config to settings.VERSIONS_DIR (the
+    root fix that makes promoted champions re-loadable). Redirect that dir to a tmp copy for the
+    promote-running tests below so a test run never writes challenger yamls into the repo's
+    src/config/versions/. champion_v0.yaml is copied in so load_config('champion_v0') still works."""
+    import shutil
+
+    from src.config import settings as settings_mod
+
+    shutil.copy(settings_mod.VERSIONS_DIR / "champion_v0.yaml", tmp_path / "champion_v0.yaml")
+    monkeypatch.setattr(settings_mod, "VERSIONS_DIR", tmp_path)
+    return tmp_path
+
+
 async def _seed_champion(champ) -> None:
     """Record the loaded champion as the current champion so the lineage has a real parent node."""
     await store.record_version(
@@ -767,7 +782,7 @@ async def _seed_champion(champ) -> None:
 
 
 @_db_required
-async def test_obviously_better_sequencing_challenger_promotes_and_becomes_champion(_schema):
+async def test_obviously_better_sequencing_challenger_promotes_and_becomes_champion(_schema, _tmp_versions):
     """U10 VERIFICATION: a seeded 'obviously better' discovery-sequencing challenger runs through
     run_experiment, clears the gate (status 'promoted'), and after promote() the store's champion is
     the challenger version. Deterministic dominating runner (no self-play, no network)."""
@@ -798,7 +813,7 @@ async def test_obviously_better_sequencing_challenger_promotes_and_becomes_champ
 
 
 @_db_required
-async def test_run_improvement_round_orchestrates_generate_to_promotion(_schema):
+async def test_run_improvement_round_orchestrates_generate_to_promotion(_schema, _tmp_versions):
     """run_improvement_round wires generator -> run_experiment -> evaluate_promotion -> promote():
     with a dominating runner a clean challenger promotes and the lineage node is recorded; an extreme
     one would block. Proves the orchestrator returns a coherent RoundResult."""

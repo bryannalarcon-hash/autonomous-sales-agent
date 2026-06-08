@@ -12,12 +12,17 @@
 # seams. NO LiveKit / numpy / scipy / pandas; SEEDED random only.
 # CB-58: all operator-facing reason strings are written in plain English — no Python flag names
 # (challenger_better is False, is_extreme, etc.) ever appear in a reason the UI renders.
+# CB-59: promote() MATERIALIZES the new champion's config to src/config/versions/<version>.yaml
+# (settings.save_config) and stamps config_ref on the lineage node, so resolve_champion_config can
+# re-load the promoted champion's REAL content later. Best-effort: a yaml-write failure still
+# promotes (config_ref=None) — the API's honest fallback covers unmaterialized champions.
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence
 
-from src.config.settings import AgentConfig
+from src.config.settings import AgentConfig, save_config
 from src.core.llm import LLMClient
 from src.loop import sim2real
 from src.loop.experiment import (
@@ -31,6 +36,15 @@ from src.loop.grading import guardrails_regressed
 from src.loop.sim2real import MatchedScenario, Sim2RealReport
 from src.memory import store
 from src.memory.schema import Episode, ExperimentRecord, VersionLineage
+
+logger = logging.getLogger(__name__)
+
+
+class VersionRecorder(Protocol):
+    """The minimal write seam promote() needs to record the new champion lineage (CB-59). The real
+    src.memory.store satisfies it; tests inject an in-memory fake so promotion runs DB-free."""
+
+    async def record_version(self, lineage: VersionLineage) -> str: ...
 
 
 class ExperimentSaver(Protocol):
@@ -164,21 +178,44 @@ async def promote(
     experiment: ExperimentResult,
     *,
     seed: int = 0,
+    version_store: Optional[VersionRecorder] = None,
 ) -> VersionLineage:
     """Record the challenger as the NEW champion in the version lineage (plan R12).
 
+    CB-59 (root fix): BEFORE recording the lineage, MATERIALIZE the new champion's config content to
+    src/config/versions/<challenger_version>.yaml via save_config — the challenger.config already
+    carries challenger_version as its `version` field (re-stamped by _build_challenger), so no
+    relabeling happens here. config_ref on the lineage node points to that yaml, making the champion
+    re-loadable by resolve_champion_config (experiments then baseline its REAL content, not the
+    bootstrap). The yaml write is best-effort: a write failure logs a warning and records the
+    lineage with config_ref=None (promotion itself must never fail on a disk hiccup — the honest
+    fallback in resolve_champion_config covers an unmaterialized champion).
+
     Builds a VersionLineage(version=challenger.challenger_version, parent_version=its parent,
     kb_version from the challenger config, kpi snapshot from the comparison, is_champion=True) and
-    persists it via store.record_version — which demotes any prior champion first (single-champion
-    invariant). Returns the recorded lineage node. `seed` is accepted for API symmetry / future
-    reproducible config-ref derivation.
+    persists it via record_version — which demotes any prior champion first (single-champion
+    invariant). `version_store` is injectable (CB-59) so tests promote against an in-memory fake;
+    None -> the real src.memory.store. Returns the recorded lineage node. `seed` is accepted for
+    API symmetry / future reproducible config-ref derivation.
     """
     _ = seed
+    # CB-59: materialize the new champion's config so it is re-loadable later. Best-effort.
+    config_ref: Optional[str] = None
+    try:
+        save_config(challenger.config)
+        config_ref = challenger.challenger_version
+    except Exception:
+        logger.warning(
+            "promote: could not materialize config yaml for new champion %r — lineage will carry "
+            "config_ref=None (resolve_champion_config will fall back to the bootstrap)",
+            challenger.challenger_version,
+            exc_info=True,
+        )
     cmp = experiment.comparison
     lineage = VersionLineage(
         version=challenger.challenger_version,
         parent_version=challenger.parent_version,
-        config_ref=None,
+        config_ref=config_ref,
         kb_version=challenger.config.kb_version,
         kpi={
             "dimension": experiment.dimension,
@@ -191,7 +228,8 @@ async def promote(
         },
         is_champion=True,
     )
-    await store.record_version(lineage)
+    recorder: VersionRecorder = version_store if version_store is not None else store
+    await recorder.record_version(lineage)
     return lineage
 
 

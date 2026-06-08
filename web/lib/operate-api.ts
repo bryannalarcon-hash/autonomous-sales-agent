@@ -12,6 +12,10 @@
 // CB-45 display helpers: fmtMsShort (raw ms -> "0.8s"/"120ms"), fmtFirstToken ("0.8s to first word")
 // and fmtSpoke ("spoke for 1.4s") format the nullable CB-44 timing numbers into human phrases — they
 // never render a raw ms key and return "" on null so callers can omit the chip entirely.
+// CB-59: fetchVersions (GET /api/versions) returns the champion_version from the version store so the
+// KPI page can guarantee the live champion is always in the version selector, even before its episodes
+// appear in the episode table. The label source for the champion is the same versionLabel() used by
+// the Versions page, keeping the lab drawer label == Versions page label == KPI selector label.
 import { ApiError, API_BASE } from './api';
 import type {
   ActiveCallsResponse,
@@ -110,6 +114,28 @@ export function fetchKpis(params?: {
   compare_version?: string;
 }): Promise<KpiResponse> {
   return getJson<KpiResponse>('/api/kpis', params);
+}
+
+/** CB-59: fetch the version lineage + live champion from the store (GET /api/versions).
+ *  The KPI page uses champion_version to guarantee the live champion always appears in the
+ *  version selector, even before its episodes surface in the episode probe. The label source
+ *  (versionLabel on champion_version) is the same function the Versions page uses, so both
+ *  surfaces always agree on what "current production" is. */
+export interface VersionsResponse {
+  versions: Array<{
+    version: string;
+    parent_version: string | null;
+    kb_version: string;
+    is_champion: boolean;
+    kpi: Record<string, unknown>;
+    dimension_label: string | null;
+    created_at: string | null;
+  }>;
+  count: number;
+  champion_version: string | null;
+}
+export function fetchVersions(): Promise<VersionsResponse> {
+  return getJson<VersionsResponse>('/api/versions');
 }
 
 export function fetchEscalations(params?: {
