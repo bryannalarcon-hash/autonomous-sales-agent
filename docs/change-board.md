@@ -63,6 +63,22 @@
 
 
 
+### CB-94 — Operate display minors (QA11): outcome/tier dup, stage label, stub-call rationale
+- **Type / Surface / Size:** bug · `web` (calls/review) · S · cosmetic (SEV-3)
+- **Prereqs:** —
+- **Current (QA11-ops, orchestrator-triaged):** (a) the Calls table OUTCOME column and LADDER TIER column render the SAME text (e.g. "Consultation booked" in both) — looks like a render bug; decide if tier should show the rung name distinctly or be merged. (b) a stage label "Closing" renders on a turn where the agent is clearly still in discovery (turn 2) — stage-classifier display oddity. (c) seeded-stub turns render "Simulated training call" as the per-turn rationale (CB-81's humanized label) — honest but still flags sim provenance in the reasoning field; consider a "Seeded sample" turn badge instead, or exclude stubs from the default review.
+- **Desired:** outcome vs tier visually distinct or merged; stage label matches the turn's actual phase; stub rationale handled cleanly.
+- **Acceptance:** the three render oddities resolved or explicitly waived with rationale; no new leaks.
+- **Refs:** QA11-ops SEV-3 (#ep-id shortened in CB-93; these are the remaining display items).
+
+### CB-95 — Chat conversational polish (QA11): terse-price 3rd-ask, contact-name echo, CTA loop
+- **Type / Surface / Size:** change · `core` (`gates`/`nlg`) · S–M · (SEV-2/3 conversational)
+- **Prereqs:** —
+- **Current (QA11-chat):** (a) after giving the price range twice, a 3rd TERSE re-ask ("Price. Just the number.") sometimes pivots to school-stats instead of restating the range — CB-77 terse-recurrence is inconsistent on the 3rd identical ask. (b) on giving contact, the agent says "Got it, I've noted that down" without echoing the name ("Thanks, Dana") — a warmth gap (CB-83 ensures no MISparse; this is the positive ack). (c) by turn 3-4 the close is always the same "free consultation" CTA — a terse user perceives a loop. All non-critical: the range IS given (1st/2nd ask), no fabrication, no denial.
+- **Desired:** a 3rd terse price ask restates the number; contact capture echoes the name once; the CTA varies / advances rather than repeating verbatim.
+- **Acceptance:** scripted 3× terse price → number every time; contact turn echoes name; eval-judge directness/repetition non-regressed.
+- **Refs:** QA11-chat SEV-2 (price_3), SEV-3 (contact name, CTA loop); builds on CB-77/64.
+
 ### CB-69 — Text-channel escalate: don't ask a question the session can't hear answered
 - **Type / Surface / Size:** design/bug · `core` (`nlg` escalate guidance) · `api` (`demo_routes` done semantics) · S–M
 - **Prereqs:** — (user decision wanted on the desired semantics)
@@ -162,6 +178,15 @@
 - **Verification:** three new regression tests in `test_demo_call.py` (`test_cb88_default_live_upsert_forwards_close_tier_to_persist_call_live`, `test_cb88_real_flow_callback_booking_persisted`, `test_cb88_non_closing_turn_stays_in_progress`) — all FAILED before fix, all PASS after. Full `.venv` suite: 1039 passed, 5 skipped, 0 failed.
 - **Constraints checked:** buy-gate purity untouched; phone sha256-only (R42) preserved; consent gate unchanged; R37 brain-parity unaffected; no gates.py changes needed.
 - **Follow-ups / known gaps:** CB-87 tests injected a custom hook that read `last_close_tier` directly from `**kw` (bypassing `_default_live_upsert`), masking this gap. Future CB-87-style tests that cover the default wiring should use `live_upsert_hook=None` + `live_rag=True` + patch `persist_call_live`.
+
+### CB-93 — Shorten raw 32-hex UUIDs in operator labels (escalations, calls, review)
+- **Type / Surface / Size:** bug · `web` (operate) · S
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `web/app/operate/escalations/page.tsx` (card + drawer esc-id/ep-id shortened), `web/app/operate/calls/page.tsx` (table row + card episode_id → `shortId`), `web/app/operate/review/[id]/page.tsx` (header + empty-state episode_id shortened), `tests/e2e/qa7_cb65_leaksweep.py` (NEW `raw_uuid_index` pattern — permanent guard).
+- **What changed:** QA11 found raw `esc-<32hex>`/`ep-esc-<hex>` as primary labels in the escalation queue (no-internal-indices violation) + full `ep-<hex>` in the calls table row and review header. All shortened to a short ref (8–12 chars + …) with the full id in a `title` tooltip + the existing Copy affordance. The leak sweep now catches any esc-/ep-/sp- 32-hex UUID in visible text.
+- **Verification:** leak sweep 14/14 (was failing on calls all-cohorts + review until both render sites fixed); tsc clean. The SEV-1 "escalation not navigable" was WAIVED — the card has `onClick={setSel}` → a drawer with a "View call" `router.push` button; the agent saw no URL change (drawers don't change the URL) — same artifact class as prior false 404s.
+- **Constraints checked:** sweep reads only visible innerText (title/data attrs exempt); full ids preserved for copy/automation.
+- **Follow-ups / known gaps:** none.
 
 ### CB-92 — Audit: confirm_request also needed a live-path override (CB-61 confirm-echo)
 - **Type / Surface / Size:** bug · `core` (`dst`) · S · (preventative — closes the regex-intent audit)
