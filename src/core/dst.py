@@ -71,6 +71,33 @@
 #   if we need to reschedule?" stays a real product question, not small talk. Checked in
 #   _classify_intent AFTER all priority intents (human_request/confirm_request/memory_check) and
 #   BEFORE the generic "question" branch.
+# CB-89 — Live-path social_aside override: the LLM intent vocabulary (question/price_inquiry/
+#   human_request/objection/statement) never includes 'social_aside', so the regex fallback
+#   _classify_intent fires social_aside only when the LLM call fails. Fix: after the LLM result is
+#   accepted, run the same deterministic _SOCIAL_ASIDE_CUES_RE + _PRODUCT_KEYWORDS_RE check over the
+#   raw utterance — if it hits AND the LLM didn't return a STRONGER intent (objection/human_request/
+#   price_inquiry), override classified_act to 'social_aside'. This keeps the gate guard + NLG ack
+#   working on the live path without depending on the LLM vocabulary. 'question'/'statement' from the
+#   LLM are weaker than an explicit objection/escalation, so the social-aside override is safe there.
+#   Genuine product/scheduling questions (incl. "weather policy if we need to reschedule") keep their
+#   LLM classification because _PRODUCT_KEYWORDS_RE exempts them.
+# CB-90 (a) — Guarantee/efficacy objection: _GUARANTEE_DEMAND_RE (pattern[0] of _OBJECTION_PATTERNS)
+#   fires BEFORE diy_free so "Guarantee me a B or it's free" routes to efficacy_doubt, not diy_free
+#   (misrouted because 'free' fired first). Round-2 TIGHTENING: the pattern requires a real grade/
+#   result/outcome token after 'guarantee' (article-prefixed letter grade "a B", or grade/pass/score/
+#   results/money-back/it-works), so "guarantee a tutor/time/slot" does NOT match; the bare standalone
+#   'guarantee' was removed from the lower efficacy_doubt row so meta-uses ("guarantee we're on the
+#   same page") no longer over-fire. The LIVE-PATH upgrade in update() is SCOPED to _GUARANTEE_DEMAND_RE
+#   ONLY (not the full _OBJECTION_PATTERNS) — the LLM's 'statement' judgement is trusted for every
+#   other objection type (no second-guessing "feel free"→diy_free / "worth it"→efficacy). The NLG
+#   _NO_CONTACT_CLAIM_NOTE guard in nlg.py prevents claiming "I have your info" when KNOWN_SO_FAR holds
+#   no contact (CB-83 tie-in: only assert captured contact when contact_just_captured / a phone-hash).
+# CB-90 (b) — Caller availability acknowledgment: when the callback_window slot is NEWLY filled
+#   this turn (absent in prior belief, present in updated), the meta flag
+#   'callback_window_just_captured' is set TRUE; nlg.py's _CALLBACK_WINDOW_ACK_NOTE then instructs
+#   a warm one-clause acknowledgment ("Got it — Wednesdays or Fridays after 4") and explicitly forbids
+#   deflecting the caller's availability statement as a tutor-availability lookup ("I don't have
+#   that in front of me"). The flag is ONE-SHOT: it fires on the turn after capture and resets.
 from __future__ import annotations
 
 import os
@@ -310,6 +337,16 @@ _CALLBACK_HEDGE_RE = re.compile(
     r"i\s+guess|probably|sort\s+of|kind\s+of|roughly|around|or\s+so|ish)\b",
     re.I,
 )
+# CB-90 (b) round-2: NEGATION / UNAVAILABILITY cue. A day disjunction stating when the caller is
+# NOT free ("I'm NOT available Wednesdays or Fridays", "I can't do Wednesdays or Fridays",
+# "Wednesdays or Fridays are tough") must NOT be captured as a callback window — acking those days
+# as the caller's preferred slot would misrepresent stated UNAVAILABILITY as availability. Checked
+# in a bounded window immediately around the day pair in the disjunction branch.
+_AVAILABILITY_NEGATION_RE = re.compile(
+    r"\b(?:not|never|cannot|can'?t|won'?t|don'?t|do\s+not|isn'?t|aren'?t|unable|unavailable|"
+    r"tough|bad|busy|hard|difficult|avoid|except|no\s+good|terrible|rough)\b",
+    re.I,
+)
 
 # CB-61: Confirm-request detection — the prospect explicitly asking the AGENT to confirm a fact
 # (typically the callback time) they already stated. "please confirm they'll call Thursday after 3pm",
@@ -492,6 +529,16 @@ def _extract_callback_window(text: str) -> Optional[tuple[Any, float]]:
     # two-day disjunction is itself the scheduling signal, so it needs no extra cue word.
     disj = _CALLBACK_DISJUNCTION_RE.search(text_norm)
     if disj:
+        # CB-90 (b) round-2: NEGATION / UNAVAILABILITY guard — "I'm NOT available Wednesdays or
+        # Fridays" / "I can't do Wednesdays or Fridays" / "Wednesdays or Fridays are tough" state
+        # when the caller is UNAVAILABLE, not a preferred window. Acking those days as availability
+        # would misrepresent the caller. Look in a bounded window immediately BEFORE (~30 chars,
+        # catches "not available <days>") and AFTER (~20 chars, catches "<days> are tough") the day
+        # pair for a negation/unavailability cue; if present, do NOT capture.
+        _before = text_norm[: disj.start()][-30:]
+        _after = text_norm[disj.end() :][:20]
+        if _AVAILABILITY_NEGATION_RE.search(_before) or _AVAILABILITY_NEGATION_RE.search(_after):
+            return None
         # Deadline/context guard: "she has tutoring Thursdays or Fridays" is an existing schedule,
         # not an availability offer. Block on deadline context the same as the single-day branch.
         if not _DEADLINE_CONTEXT_RE.search(text_norm):
@@ -585,11 +632,50 @@ def _extract_slots(belief: BeliefState, utterance: str, last_agent_act: Optional
 # parity-clean (text + voice get the same signals). The objection taxonomy mirrors the config
 # rebuttals + the kb_chunk `objections#*` corpus the agent grounds on.
 
+# CB-90 (a) round-2 — a GUARANTEE-of-OUTCOME demand: the caller wants a PROMISED grade/result/refund
+# ("guarantee me a B", "guarantee a pass", "guarantee results", "guarantee a better grade",
+# "guarantee me a B or it's free"). This is the SINGLE source of truth for "is this a guarantee/
+# efficacy DEMAND?" — pattern[0] of _OBJECTION_PATTERNS (the regex-classify path) AND the scoped
+# live-path objection upgrade in update() both use it, so the two paths agree.
+# TIGHT (round-2 fix for the verifier's false positives):
+#   - a single LETTER grade is ONLY accepted when preceded by the article "a/an" ("a B", "an A") so
+#     the standalone article "a" can never be mis-read AS the grade — this is what made the round-1
+#     pattern fire on "guarantee a tutor"/"guarantee a slot" (the optional "(a\s+)?" group was
+#     skipped and "[abcdf]" then matched the article "a"). The grade letter must also not be followed
+#     by another letter ((?![a-z])) so "a Algebra"/"a session" don't match.
+#   - otherwise an explicit RESULT word (grade/pass/score/results/improvement/money-back/it-works…)
+#     is required after 'guarantee' — "guarantee a tutor"/"guarantee a time" carry NO result word, so
+#     they do NOT match (scheduling/staffing, not an outcome demand).
+#   - the "...or it's free" consequence shape is also an outcome-guarantee demand.
+# Genuine: "Guarantee me a B or it's free" → efficacy_doubt. Rejected: "guarantee a tutor will be
+# free Thursday" (→ falls through to diy_free on the bare 'free', harmless on the regex fallback),
+# "I just want to guarantee we're on the same page" (→ no match).
+_GUARANTEE_RESULT_WORDS = (
+    r"grades?|letter\s+grade|pass(?:ing)?|scores?|results?|improvement|better\s+grade|"
+    r"(?:my\s+)?money\s+back|it'?ll\s+work|it\s+will\s+work|it\s+works|(?:he|she|they)'?ll\s+pass"
+)
+_GUARANTEE_DEMAND_RE = re.compile(
+    r"\bguarantee\s+(?:me\s+|us\s+)?(?:"
+    r"an?\s+[abcdf][-+]?(?![a-z])"                          # article + grade letter: "a B", "an A", "a B+"
+    r"|(?:an?\s+)?(?:" + _GUARANTEE_RESULT_WORDS + r")\b"   # an explicit result word
+    r")"
+    r"|\bguarantee\b.{0,30}?\bor\s+it'?s?\s+free\b",        # "...or it's free" consequence shape
+    re.I,
+)
+
 # Objection cues -> the canonical objection key (priority order: first match wins). Word-boundaried.
+# CB-90 (a): the GUARANTEE-demand pattern is FIRST so "Guarantee me a B or it's free" routes to
+# efficacy_doubt (an outcome demand), NOT diy_free (which would fire on bare 'free' before this).
+# CB-90 (a) round-2: the bare standalone 'guarantee' was REMOVED from the lower efficacy_doubt row
+# (was pattern[3]) — it over-fired on meta-communication uses ("I just want to guarantee we're on
+# the same page") and the live-path upgrade amplified that onto every weak-LLM-intent turn. Genuine
+# guarantee DEMANDS are now caught by _GUARANTEE_DEMAND_RE (pattern[0]); the LLM-proposed
+# efficacy_doubt grounding (_OBJECTION_GROUNDING) still keeps 'guarantee' for the LLM path.
 _OBJECTION_PATTERNS: list[tuple[Any, str]] = [
+    (_GUARANTEE_DEMAND_RE, "efficacy_doubt"),
     (re.compile(r"\b(khan|youtube|free|do it myself|on my own|google it|self[- ]?study)\b", re.I), "diy_free"),
     (re.compile(r"\b(my (husband|wife|spouse|partner)|other parent|check with|talk to my|discuss (it )?with|run it by)\b", re.I), "decision_maker"),
-    (re.compile(r"\b(will it (really )?(work|help)|does it (really )?(work|help)|worth it|actually help|guarantee|skeptic)\b", re.I), "efficacy_doubt"),
+    (re.compile(r"\b(will it (really )?(work|help)|does it (really )?(work|help)|worth it|actually help|skeptic)\b", re.I), "efficacy_doubt"),
     (re.compile(r"\b(right time|too early|too late|not sure (if )?now|maybe later|wait (a|until)|down the road)\b", re.I), "timing"),
     (re.compile(r"\b(expensive|too much|can'?t afford|pricey|out of (our|my) budget|cost(s|ly)? too)\b", re.I), "price"),
 ]
@@ -1178,6 +1264,51 @@ async def update(
             classified_act = "statement"  # a phantom objection is not an objection turn
         open_question = llm_intent["open_question"]
         refused = llm_intent["affordability_refusal"]
+
+        # CB-89: LIVE-PATH social_aside override — the LLM intent vocabulary never includes
+        # 'social_aside', so the gate guard + NLG ack only fired on the regex fallback path (when the
+        # LLM call failed). Fix: after accepting the LLM result, run the deterministic social-aside
+        # check over the raw utterance regardless. If the text matches _SOCIAL_ASIDE_CUES_RE AND
+        # NOT _PRODUCT_KEYWORDS_RE (same AND-guard as _classify_intent), AND the LLM returned only a
+        # WEAK intent ('question'/'statement'/None — not a stronger objection/human_request/
+        # price_inquiry that must be preserved), override to 'social_aside'. This keeps
+        # advance_to_close blocked + NLG _SOCIAL_ASIDE_NOTE injected on the live path. Conservative:
+        # a genuine product/scheduling question ("weather policy if we need to reschedule?") is NOT
+        # overridden because _PRODUCT_KEYWORDS_RE exempts it; a real objection/human_request/
+        # price_inquiry is not overridden because the stronger-intent guard protects it.
+        _SOCIAL_ASIDE_WEAK_ACTS = frozenset({"question", "statement", None})
+        _norm_utt = _normalize_punct(user_utterance or "")
+        _is_question_utt = bool(_QUESTION_RE.search(_norm_utt))
+        if (
+            classified_act in _SOCIAL_ASIDE_WEAK_ACTS
+            and _is_question_utt
+            and _SOCIAL_ASIDE_CUES_RE.search(_norm_utt)
+            and not _PRODUCT_KEYWORDS_RE.search(_norm_utt)
+        ):
+            classified_act = "social_aside"
+            # Carry the question text as open_question so NLG can acknowledge it
+            if open_question is None:
+                open_question = _norm_utt[:300]
+
+        # CB-90 (a) round-2: LIVE-PATH guarantee/efficacy upgrade — SCOPED to a guarantee-of-outcome
+        # DEMAND ONLY. The ONLY documented live-path failure is a guarantee demand ("Guarantee me a
+        # B or it's free") the LLM mislabels as 'statement' so the objection is silently dropped.
+        # The round-1 version ran the FULL _OBJECTION_PATTERNS scan here, which AMPLIFIED the regex's
+        # context-free over-matches onto the live path — second-guessing the LLM's CORRECT 'statement'
+        # judgement on cooperative phrases ("feel free to send me information" → diy_free; "I think
+        # it's really worth it" → efficacy_doubt). For every objection type OTHER than a guarantee
+        # demand we now TRUST the LLM (it judges by meaning; the regex words are context-free). So the
+        # upgrade fires ONLY when the NARROW _GUARANTEE_DEMAND_RE matches AND the LLM returned a weak
+        # intent (statement/None, no objection). Genuine guarantee demand → efficacy_doubt; everything
+        # else keeps the LLM's call. (The pattern-ORDERING fix stays on the regex fallback path.)
+        _OBJECTION_WEAK_ACTS = frozenset({"statement", None})
+        if (
+            classified_act in _OBJECTION_WEAK_ACTS
+            and objection is None
+            and _GUARANTEE_DEMAND_RE.search(_norm_utt)
+        ):
+            classified_act = "objection"
+            objection = "efficacy_doubt"
     else:
         classified_act, objection, open_question = _classify_intent(user_utterance)
         refused = bool(_AFFORDABILITY_REFUSAL_RE.search(_normalize_punct(user_utterance or "")))
@@ -1279,6 +1410,29 @@ async def update(
     else:
         # Clear the one-shot flag so the ack fires ONLY on the turn after the capture turn.
         updated.meta["contact_just_captured"] = False
+
+    # CB-90 (b): callback_window acknowledgment — when the callback_window slot is NEWLY filled
+    # this turn (absent or unlocked in the prior belief, now present at confidence >= lock), set
+    # the 'callback_window_just_captured' flag TRUE so NLG's _CALLBACK_WINDOW_ACK_NOTE instruction
+    # fires, producing a warm one-clause ack ("Got it — Wednesdays or Fridays after 4") and
+    # explicitly forbidding the "I don't have that availability in front of me" deflection. ONE-SHOT:
+    # cleared on the next turn so the ack never repeats. The prior belief comparison uses the slot
+    # confidence: if the prior confidence was below lock and the updated confidence is at/above lock,
+    # OR if the slot was absent (None) and is now present, the window was just volunteered this turn.
+    prior_cw_conf = float(prior.slots.get("callback_window", {}).get("confidence", 0.0)) if prior.slots.get("callback_window") else 0.0
+    updated_cw_conf = float(updated.slots.get("callback_window", {}).get("confidence", 0.0)) if updated.slots.get("callback_window") else 0.0
+    cb_newly_captured = (
+        updated_cw_conf >= _LOCK_CONFIDENCE
+        and prior_cw_conf < _LOCK_CONFIDENCE
+    )
+    if cb_newly_captured:
+        updated.meta["callback_window_just_captured"] = True
+        # Store the human-readable value for the NLG ack (the stored normalized string).
+        cw_val = (updated.slots.get("callback_window") or {}).get("value", "")
+        updated.meta["callback_window_value"] = str(cw_val) if cw_val else ""
+    else:
+        # Clear the one-shot flag on any turn that didn't just capture the window.
+        updated.meta["callback_window_just_captured"] = False
 
     # Advance the EFSM stage from the (now-updated) belief so the policy knows WHERE the call is
     # (greeting -> discovery -> pitch -> close / objection) instead of being stuck at 'greeting'.

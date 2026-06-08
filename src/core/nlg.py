@@ -63,6 +63,15 @@
 # CB-85 (b) PRICE HONESTY NOTE: _BUDGET_CONCERN_NOTE is further strengthened with an explicit ban on
 # "I don't have access to / I don't have the pricing" language when facts contain a price range —
 # the agent must NEVER claim it lacks pricing it can ground from the facts block.
+# CB-90 (a) NO-CONTACT-CLAIM NOTE: when belief.meta['contact_just_captured'] is False AND
+# KNOWN_SO_FAR holds no phone/email contact, _NO_CONTACT_CLAIM_NOTE is injected so the agent NEVER
+# claims "I have your info" or "I've got your contact" — a fabricated contact claim is a trust breach.
+# Only inject on close acts (attempt_close) where the false claim is most likely to appear.
+# CB-90 (b) CALLBACK WINDOW ACK NOTE: when belief.meta['callback_window_just_captured'] is True,
+# _CALLBACK_WINDOW_ACK_NOTE is injected — the agent MUST acknowledge the caller's stated availability
+# ("Got it — Wednesdays or Fridays after 4") and NEVER deflect it as a tutor-availability lookup
+# ("I don't have that availability in front of me"). The DST sets this flag one-shot on the turn the
+# window slot is newly filled; it clears on the next turn so the ack is never repeated.
 from __future__ import annotations
 
 import re
@@ -312,6 +321,33 @@ _CONTACT_ACK_NOTE = (
     "Do NOT skip or defer this acknowledgment regardless of the decided act."
 )
 
+# CB-90 (a) NO-CONTACT-CLAIM NOTE: injected on attempt_close when no contact has been captured (the
+# DST's contact_just_captured flag is False AND KNOWN_SO_FAR holds no contact slots). Prevents the
+# agent from claiming "I have your info" / "I've got your contact" as if contact was given when none
+# was. CB-83 tie-in: contact claims must be grounded in an actual captured phone/email/name.
+_NO_CONTACT_CLAIM_NOTE = (
+    "CONTACT CLAIM RULE (do not break): no contact information (phone, email, or name) has been "
+    "captured yet in this call. Do NOT say 'I have your info', 'I've got your contact details', "
+    "'we'll reach out', or any phrase implying you hold the caller's contact information. "
+    "If contact is needed for the next step, ask for it — do not fabricate that you already have it."
+)
+
+# CB-90 (b) CALLBACK WINDOW ACK NOTE: injected when the DST flags that the caller's availability
+# was JUST volunteered this turn (callback_window_just_captured = True). The agent MUST acknowledge
+# the CALLER'S OWN stated availability, not deflect it as a query about TUTOR availability. The live
+# defect: "Wednesdays or Fridays after 4 work best" → "I don't have the specific Wednesday or
+# Friday after-4 availability in front of me" — the agent misread the caller STATING their window
+# as the caller ASKING about tutor slots. This note is injected once on the capture turn and clears.
+_CALLBACK_WINDOW_ACK_NOTE = (
+    "CALLER AVAILABILITY ACK (do not break): the caller JUST told you THEIR OWN availability "
+    "(the time that works for THEM — not a question about tutor schedules). "
+    "Step 1 — acknowledge it warmly and explicitly: echo the stated time back "
+    "(e.g. 'Got it — Wednesdays or Fridays after 4, I have that noted.'). "
+    "Step 2 — confirm you will use this info to schedule. "
+    "NEVER say 'I don't have that availability in front of me' or any variant — the caller "
+    "stated THEIR schedule, not asked about ours. Do not treat this as a tutor-availability lookup."
+)
+
 # CB-64 (repetition residual): stop-words stripped before comparing a new reply against own_last_lines
 # to detect near-verbatim repetition. Mirrors _RECUR_STOPWORDS in gates.py (CB-48 recurrence logic).
 _REPETITION_STOPWORDS = frozenset({
@@ -492,6 +528,42 @@ def _build_messages(
     else:
         contact_ack_block = ""
 
+    # CB-90 (a): NO-CONTACT-CLAIM NOTE — injected on attempt_close ONLY when no contact has been
+    # captured this call. Prevents the agent from fabricating "I have your info" on a close act when
+    # no contact was given. Gate: attempt_close act AND contact_just_captured is False AND the known
+    # slots carry no phone/email contact. Conservative: only fires on close acts so ordinary discovery
+    # turns are unaffected; the contact_just_captured flag clears each turn so a genuine contact turn
+    # always fires the CONTACT_ACK_NOTE instead.
+    _has_contact_in_known = any(
+        k in ("phone", "email", "phone_hash") and v
+        for k, v in known.items()
+    )
+    no_contact_block = (
+        _NO_CONTACT_CLAIM_NOTE
+        if (
+            decision.act == "attempt_close"
+            and not contact_captured
+            and not _has_contact_in_known
+        )
+        else ""
+    )
+
+    # CB-90 (b): CALLBACK WINDOW ACK NOTE — injected when the DST flags that the callback_window
+    # slot was newly filled this turn (caller just stated their availability). Enforces the
+    # acknowledge-then-confirm shape and explicitly forbids the tutor-availability-lookup deflection.
+    cb_window_just_captured = bool((belief.meta or {}).get("callback_window_just_captured"))
+    cb_window_value = str((belief.meta or {}).get("callback_window_value", ""))
+    if cb_window_just_captured:
+        cb_window_block = _CALLBACK_WINDOW_ACK_NOTE
+        if cb_window_value:
+            # Embed the exact stated time so the model can echo it verbatim.
+            cb_window_block = (
+                cb_window_block
+                + f"\nCALLER_STATED_AVAILABILITY: {cb_window_value!r} — echo this back explicitly."
+            )
+    else:
+        cb_window_block = ""
+
     parts = [
         # CB-64: repetition retry instruction (only on the second attempt — empty string otherwise).
         repetition_block,
@@ -510,6 +582,10 @@ def _build_messages(
         never_deny_block,
         # CB-76 (d): contact acknowledgment instruction (only when contact was just captured).
         contact_ack_block,
+        # CB-90 (a): no-contact-claim guard (only on attempt_close with no captured contact).
+        no_contact_block,
+        # CB-90 (b): callback window ack (only when caller's availability was just stated this turn).
+        cb_window_block,
         # CB-48: the agent's own prior lines + a no-restate instruction (only when there are lines, so
         # the opening turn's prompt is unchanged).
         own_block,

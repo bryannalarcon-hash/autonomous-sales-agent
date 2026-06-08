@@ -62,21 +62,6 @@
 
 
 
-### CB-89 — Non-sequitur (social_aside) not detected on the live LLM intent path
-- **Type / Surface / Size:** bug · `core` (`dst` LLM-intent prompt / `gates`) · M
-- **Prereqs:** —
-- **Current (round-4 replay):** CB-85 added `social_aside` to the regex `_classify_intent` FALLBACK, but live demo uses the LLM intent classifier (which returns question/price_inquiry/human_request/objection/statement — no social_aside). So "you guys see the storm coming tonight?" live → ignored + a scheduling push ("Great — I'll get you on the calendar"), the exact behavior CB-85 meant to fix. The gate guard never engages because last_user_act is never "social_aside" on the live path.
-- **Desired:** either add "social_aside" to the LLM intent vocabulary (and its prompt), OR run the regex social_aside check over the user text regardless of the LLM result so the gate guard + NLG ack engage live.
-- **Acceptance:** a live/replay storm turn gets a brief ack + redirect, never a scheduling push; advance_to_close still gated.
-- **Refs:** round-4 replay /tmp/qa7/round4_dad.txt turn 3; CB-85 only wired the regex fallback.
-
-### CB-90 — Guarantee demand pivoted-past; caller's own availability misread as a lookup
-- **Type / Surface / Size:** bug · `core` (`gates`/`nlg`) · M
-- **Prereqs:** —
-- **Current (round-4 replay):** (a) "Guarantee me a B or it's free" → the agent pivoted to scheduling ("Perfect — I have your info, we'll reach out") instead of handling the guarantee objection (CB-83 fixed the name-misparse, but the objection is now swallowed, not answered) + a minor "I have your info" when no contact was given; (b) the mom's STATED availability "Wednesdays or Fridays after 4 work best" → "I don't have the specific Wednesday or Friday after-4 availability in front of me…" — the agent misread the caller stating HER availability as a request to look up TUTOR availability, reading as not-listening.
-- **Desired:** a guarantee/efficacy demand routes to objection handling (honest "we can't promise a grade, but…"), not a scheduling pivot; a caller stating availability is captured + acknowledged (CB-76 callback_window), never deflected as an unavailable lookup.
-- **Acceptance:** scripted guarantee turn → objection-handled reply; scripted availability statement → ack ("Got it — Wednesdays or Fridays after 4"), no "I don't have that in front of me".
-- **Refs:** round-4 replay dad turn 4 + mom turn 2.
 
 ### CB-69 — Text-channel escalate: don't ask a question the session can't hear answered
 - **Type / Surface / Size:** design/bug · `core` (`nlg` escalate guidance) · `api` (`demo_routes` done semantics) · S–M
@@ -149,6 +134,25 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-90 — Guarantee demand pivoted-past; caller's own availability misread as a lookup
+- **Type / Surface / Size:** bug · `core` (`dst`/`nlg`) · M
+- **Completed:** 2026-06-08
+- **Completed:** 2026-06-08 (2 rounds + adversarial verifier)
+- **Files changed (actual):** `src/core/dst.py` (`_GUARANTEE_DEMAND_RE` — requires a grade/result/outcome token, single source of truth for both classify + the live-path upgrade; bare `guarantee` removed from the generic efficacy row; the live-path objection-upgrade SCOPED to guarantee-demand only — NOT the full `_OBJECTION_PATTERNS`; `_AVAILABILITY_NEGATION_RE` guard on the callback-window disjunction; `callback_window_just_captured`/`_value` flags), `src/core/nlg.py` (`_NO_CONTACT_CLAIM_NOTE` + `_CALLBACK_WINDOW_ACK_NOTE`), `tests/unit/test_cb89_90.py` (39) + `tests/unit/test_cb8990_adversarial.py` (26 — verifier's spec).
+- **What changed:** (a) a guarantee-of-OUTCOME demand ("Guarantee me a B or it's free") routes to `efficacy_doubt`/handle_objection; the `_NO_CONTACT_CLAIM_NOTE` blocks claiming "I have your info" with no captured contact. (b) a stated availability ("Wednesdays or Fridays after 4 work best") sets a one-shot flag → NLG acknowledges the caller's time and never deflects it as a tutor-lookup. Round-1 had 4 BLOCKING false positives the verifier caught: the live-path upgrade ran the FULL objection regex and amplified known over-matches ("feel free…"→diy_free, "it's worth it"→efficacy, "guarantee a tutor"→efficacy). Round-2 fix: trust the LLM's correct "statement" judgment and scope the upgrade to the narrow guarantee pattern only; tighten the guarantee regex to require a grade/result token; negation-guard the availability extractor.
+- **Verification (orchestrator-spot-checked the LIVE path):** "feel free to send me info"/"I think it's really worth it"/"guarantee a tutor will be free Thursday" → no objection; "Guarantee me a B or it's free" → efficacy_doubt; negated availability → no capture. Adversarial 26; item 39; invariant set 392; full suites 681p (.venv) + 1118p (system); zero regressions.
+- **Constraints checked:** R37; buy-gate purity; CB-85 invariant; the upgrade never second-guesses the LLM except on the narrow guarantee demand. (Fallback `_classify_intent` retains pre-existing regex FPs — degraded-mode only, out of scope.)
+- **Follow-ups / known gaps:** paid replay to confirm the honest "we can't promise a grade, but…" realization + the availability ack shape.
+
+### CB-89 — Non-sequitur (social_aside) not detected on the live LLM intent path
+- **Type / Surface / Size:** bug · `core` (`dst`) · M
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `src/core/dst.py` (live-path social_aside override in `update()` — after LLM intent is resolved, if the text matches `_SOCIAL_ASIDE_CUES_RE` AND NOT `_PRODUCT_KEYWORDS_RE` AND the LLM returned only a weak intent (`question`/`statement`/None), override `classified_act` to `social_aside`), `tests/unit/test_cb89_90.py` (CB-89 tests in `TestCB89LivePathSocialAside`).
+- **What changed:** the LLM intent vocabulary has no `social_aside` token, so CB-85's gate guard + NLG ack only fired on the regex fallback path (LLM call failures). After each live LLM result, a deterministic check now runs regardless: a social cue with no product keyword and a weak LLM intent is overridden to `social_aside` — same AND-guard as `_classify_intent`. Genuine product/scheduling questions (reschedule/policy/cost etc.) are exempt via `_PRODUCT_KEYWORDS_RE`; genuine objections and human_requests are not overridden.
+- **Verification:** 9 live-path tests in `TestCB89LivePathSocialAside` all pass; `TestCB85Invariants` unchanged; full suite 1092p/55s; zero regressions.
+- **Constraints checked:** R37; advance_to_close blocked on social_aside still holds (via live-path override); CB-85 invariant preserved; reschedule-policy → NOT social_aside confirmed end-to-end.
+- **Follow-ups / known gaps:** paid replay with real LLM to confirm storm utterance → brief ack + redirect (no scheduling push).
 
 ### CB-88 — _default_live_upsert dropped last_close_tier → booking never stamped on live calls
 - **Type / Surface / Size:** bug · `api` (`server.py`) · S
