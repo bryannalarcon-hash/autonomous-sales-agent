@@ -79,15 +79,6 @@
 - **Acceptance:** Lab drawer champion label == Versions page champion == header; KPI can show v1; an experiment run's champion arm uses the promoted config; test pins get_config()/store agreement.
 - **Refs:** QA6 qa-lab MEDIUM #6 + cross-check note, qa-operate bug #9; `/tmp/qa6/24_versions.png`.
 
-### CB-62 — Price-question policy: offer the KB-grounded ballpark instead of pure deflection
-- **Type / Surface / Size:** change · `core` (`gates.price_gate`, NLG) · `kb` · S–M
-- **Prereqs:** —
-- **Important files (candidates):** `src/core/gates.py` (`price_gate`, `address_direct_input`), `src/kb/content/pricing*.json` (ARPM ~$335–374/mo VERIFIED range exists), `src/core/nlg.py`.
-- **Current (QA6):** direct price ask with stated tight budget → "Perfect — let me get you connected…" (tone-deaf ack + no number); only after pushback an honest "I don't have a rate to share". The KB carries a grounded range that was never offered. (Credit: nothing was invented.)
-- **Desired:** policy decision — on a direct price ask, give the grounded ballpark/range with the "depends on needs" qualifier, THEN offer the exact-quote callback; acknowledge budget concern before pivoting (never "Perfect —" after "tight budget").
-- **Acceptance:** eval seed with a double price-ask: first response contains a KB-grounded range (grounding guard green) + empathetic ack; deflection-without-number does not recur.
-- **Refs:** QA6 qa-chat MEDIUM #5, FAIL on directness axis.
-
 ### CB-63 — Stream the demo chat (SSE) + typing indicator
 - **Type / Surface / Size:** change · `api` (`demo_routes`) · `web/app/demo` · M
 - **Prereqs:** CB-54 (session fix first — same files)
@@ -96,15 +87,6 @@
 - **Desired:** `/api/chat` streams tokens (SSE) and the UI renders progressively; at minimum an immediate typing indicator. Keep turn persistence + timing stamps (CB-44 fields) intact.
 - **Acceptance:** observable progressive render in the demo (first visible text ≲2s after send on a warm path); turn timing fields still populated; e2e asserts >2 incremental paints per reply.
 - **Refs:** QA6 qa-chat FAIL axis 1 (latencies measured), MEDIUM #6.
-
-### CB-64 — Repetition residual in live chat: verbatim pitch + triple callback-pitch
-- **Type / Surface / Size:** bug · `core` (`nlg`) · S–M
-- **Prereqs:** —
-- **Important files (candidates):** `src/core/nlg.py` (`_NO_RESTATE_INSTRUCTION`, YOUR_LAST_LINES window n=4), `src/core/respond.py` (`_own_last_lines`).
-- **Current (QA6 conv 1):** core pitch delivered near-verbatim in replies 1 and 3 (inside the own-lines window — the instruction was present and ignored); "connect you with my team… exact pricing" pitched 3× and "fifteen minutes" 2×. Milder than the pre-CB-51 stat-cycling but still a FAIL to a blind reviewer.
-- **Desired:** a pitch/offer is made once; later references are abbreviated ("like I mentioned, the team call —") or advance the close instead of re-pitching.
-- **Acceptance:** replay QA6 conv 1 script: no two agent replies share a near-verbatim (>8-content-word) span; eval-judge repetition flags stay at current-or-better on the 3 personas.
-- **Refs:** QA6 qa-chat FAIL axis 2 / MEDIUM #7; builds on CB-51/53.
 
 ### CB-65 — Viewer-facing leak sweep (slugs, IDs, debug artifacts)
 - **Type / Surface / Size:** bug · `web` (all surfaces) · `api` (label seams) · M
@@ -175,6 +157,24 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-64 — Repetition residual in live chat: verbatim pitch + triple callback-pitch
+- **Type / Surface / Size:** bug · `core` (`nlg`, `respond`) · S–M
+- **Completed:** 2026-06-07
+- **Files changed (actual):** `src/core/nlg.py` (`_near_verbatim_repetition` — deterministic >8-shared-content-word check vs own last lines; `_REPETITION_RETRY_RULE`; `realize(repetition_retry=)`), `src/core/respond.py` (`_derepetition_blocking_reply` after the grounding guard — regenerate once then accept; stream path flag-only, mirroring CB-53 discipline), `tests/unit/test_cb64_repetition_guard.py` (NEW, 13).
+- **What changed:** post-NLG deterministic near-verbatim guard (chosen over meta topic-tracking — objective count, no LLM judgment). Orchestrator probes: the QA6 reply-1/3 pitch pair AND the triple callback-pitch shape both flag; a legitimate confirm-echo and short acks do NOT (calibration explicitly checked against the CB-53 over-fire lesson).
+- **Verification:** 13 new tests; invariant files 128 passed; full suites 562p/5s (.venv) + 576p (system).
+- **Constraints checked:** R37 (stream flag-only, can't un-speak); one-retry cap (no regenerate loop); reuses CB-53's retry machinery, not duplicated.
+- **Follow-ups / known gaps:** whether the real model obeys the harder retry instruction → paid replay; eval-judge repetition axis re-check rides the QA round.
+
+### CB-62 — Price-question policy: offer the KB-grounded ballpark instead of pure deflection
+- **Type / Surface / Size:** change · `core` (`nlg` only — gates already routed correctly) · S
+- **Completed:** 2026-06-07
+- **Files changed (actual):** `src/core/nlg.py` (`_BUDGET_CONCERN_NOTE` injected when a price inquiry meets `answer_via_kb`/`handle_objection`: empathetic ack first — explicit ban on "Perfect!" after a budget concern — then the KB-grounded ballpark from the FACTS block, then the exact-quote callback bridge; `is_price_inquiry` from DST label OR question text), `tests/unit/test_cb62_price_policy.py` (NEW, 14).
+- **What changed:** investigation showed `address_direct_input` + `price_gate` already route a direct price ask to `answer_via_kb` — the defect was NLG having no instruction to use the retrieved range or acknowledge budget anxiety. No hardcoded prices anywhere (CB-53 grounding guard remains the enforcement: numbers must come from retrieved KB facts).
+- **Verification:** 14 new tests (instruction present in prompt under the right conditions; decision path unchanged); full suites green as above.
+- **Constraints checked:** compliance — no invented prices possible via this path (prompt carries no figures; grounding guard still polices output).
+- **Follow-ups / known gaps:** real-model phrasing quality (ack + ballpark actually spoken) → paid replay + blind QA.
 
 ### CB-60 — Cohort/count coherence across Operate (one disease, many symptoms)
 - **Type / Surface / Size:** bug · `api` (`operate`) · `web` (calls/escalations) · L

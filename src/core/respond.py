@@ -45,6 +45,13 @@
 # token, so it does NOT regenerate; it relies on the same hardened first-line grounding rule in the
 # prompt and only FLAGS an ungrounded streamed reply on decision.meta["grounding"] for observability.
 # R37 parity preserved: both paths run the SAME brain; only the blocking path gets the regenerate backstop.
+# CB-64 (repetition residual) — ASYMMETRIC, mirroring SAFEGUARD 2: the BLOCKING respond() path runs
+# nlg._near_verbatim_repetition() on the NLG reply AFTER realize(); if >8 shared content words with
+# any own_last_line are found it REGENERATES once via realize(repetition_retry=True) which prepends
+# _REPETITION_RETRY_RULE. If the regenerated reply still repeats, it is accepted (one retry is the
+# limit — the first pass had _NO_RESTATE_INSTRUCTION; a second retry could loop). The STREAMING path
+# CANNOT un-speak a token, so it flags decision.meta["repetition"] for observability only (mirrors
+# the grounding stream_flag_only discipline). R37 parity preserved.
 from __future__ import annotations
 
 import logging
@@ -57,7 +64,7 @@ from src.config.settings import AgentConfig
 from src.core import dst, gates
 from src.core.belief_state import BeliefState
 from src.core.llm import LLMClient
-from src.core.nlg import realize, realize_stream
+from src.core.nlg import _near_verbatim_repetition, realize, realize_stream
 from src.core.policy import Decision, decide
 from src.kb import retriever
 
@@ -224,6 +231,52 @@ async def _ground_blocking_reply(
         "unsupported": list(regen_report.unsupported_numbers) + list(regen_report.unsupported_terms),
     }
     return _UNGROUNDED_FALLBACK
+
+
+async def _derepetition_blocking_reply(
+    reply: str,
+    decision: Decision,
+    belief: BeliefState,
+    config: AgentConfig,
+    llm_client: LLMClient,
+    retrieved_facts: Optional[Sequence[Any]],
+    own_last_lines: Sequence[str],
+) -> str:
+    """CB-64 — enforce non-repetition on the live BLOCKING reply. Mirrors _ground_blocking_reply.
+
+    Runs AFTER _ground_blocking_reply so the grounding guard has already fired if needed. Checks
+    _near_verbatim_repetition(reply, own_last_lines): if >_REPETITION_WORD_THRESHOLD shared content
+    words are found between the reply and any own agent line, the reply is a near-verbatim re-pitch.
+    REGENERATE once via realize(repetition_retry=True) which prepends _REPETITION_RETRY_RULE. If the
+    regenerated reply STILL repeats (the retry was ignored), accept it anyway — one retry is the limit
+    (the first pass already had _NO_RESTATE_INSTRUCTION; a second retry risks a loop). Never raises —
+    any guard failure returns the original reply so the call path cannot crash. Results stamped on
+    decision.meta["repetition"] for observability (action: passthrough / regenerated / retry_accepted).
+    """
+    if not _near_verbatim_repetition(reply, own_last_lines):
+        decision.meta["repetition"] = {"checked": True, "action": "passthrough"}
+        return reply
+
+    # Near-verbatim repetition detected: regenerate once with the hardened instruction.
+    try:
+        regenerated = await realize(
+            decision, belief, config, llm_client,
+            retrieved_facts=retrieved_facts,
+            own_last_lines=own_last_lines,
+            repetition_retry=True,
+        )
+    except Exception:
+        # Regeneration call failed — keep the original (less bad than crashing the turn).
+        decision.meta["repetition"] = {"checked": True, "action": "passthrough", "error": "regenerate_failed"}
+        return reply
+
+    if not _near_verbatim_repetition(regenerated, own_last_lines):
+        decision.meta["repetition"] = {"checked": True, "action": "regenerated"}
+        return regenerated
+
+    # Still repeating after the retry — accept the regenerated reply anyway (one retry is the cap).
+    decision.meta["repetition"] = {"checked": True, "action": "retry_accepted"}
+    return regenerated
 
 
 def _record_asked_slot(belief: BeliefState, decision: Any) -> None:
@@ -467,6 +520,13 @@ async def respond(
     reply_text = await _ground_blocking_reply(
         reply_text, decision, new_belief, config, llm_client, retrieved_facts, own_lines,
     )
+    # CB-64 (repetition residual): on the BLOCKING path, check for near-verbatim repetition against the
+    # agent's own last lines — regenerate once with _REPETITION_RETRY_RULE if >8 content words overlap.
+    # Runs AFTER grounding so both safeguards can fire sequentially without interfering. The streaming
+    # path cannot rewrite, so it flags only (see respond_stream below).
+    reply_text = await _derepetition_blocking_reply(
+        reply_text, decision, new_belief, config, llm_client, retrieved_facts, own_lines,
+    )
     t3 = time.perf_counter()
 
     _stamp_timings(decision, new_belief, llm_client, t0=t0, t1=t1, t2=t2, t3=t3)
@@ -543,4 +603,15 @@ async def respond_stream(
             }
         except Exception:
             pass  # observability only — never affect the streamed turn
+    # CB-64 (streaming asymmetry — mirrors SAFEGUARD 2): a streamed token CANNOT be un-spoken, so we
+    # do NOT regenerate — we only FLAG a near-verbatim repetition on decision.meta["repetition"] for
+    # observability (so a downstream monitor/grader can surface it). The blocking respond() path gets
+    # the regenerate backstop; R37 parity holds — both paths run the SAME brain.
+    try:
+        if _near_verbatim_repetition(holder.reply, own_lines):
+            decision.meta["repetition"] = {"checked": True, "action": "stream_flag_only"}
+        else:
+            decision.meta["repetition"] = {"checked": True, "action": "passthrough"}
+    except Exception:
+        pass  # observability only — never affect the streamed turn
     _stamp_timings(decision, new_belief, llm_client, t0=t0, t1=t1, t2=t2, t3=t3)

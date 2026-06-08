@@ -35,8 +35,21 @@
 # other CB-61 slot), _build_messages surfaces the slot value in KNOWN_SO_FAR so the LLM has the exact
 # time to echo. The confirm_known guidance was also made time-echo-aware: when TARGET_SLOT is
 # callback_window, the guidance explicitly says to echo the booked time back verbatim.
+# CB-62 (price-question policy): when the prospect asks a DIRECT price question, _build_messages
+# injects a BUDGET_CONCERN_NOTE instruction: acknowledge any stated budget concern before pivoting
+# (never "Perfect —" after "tight budget"), then use the KB-grounded ballpark from retrieved_facts
+# (never hardcoded), then offer the exact-quote callback. The constraint stays pure — the number comes
+# from the facts block, not from this instruction. realize/realize_stream stay in lock-step.
+# CB-64 (repetition residual): _near_verbatim_repetition() detects a >8-content-word overlap between
+# the new reply and own_last_lines — the shape of the QA6 reply-1-vs-3 verbatim pitch that the
+# _NO_RESTATE_INSTRUCTION alone failed to prevent. On a hit the blocking path regenerates ONCE with
+# _REPETITION_RETRY_RULE (a harder variant), mirroring the CB-53 grounding-retry pattern exactly;
+# the streaming path flags decision.meta["repetition"] for observability only (can't un-speak a
+# token). Deterministic: the >8-word threshold is a hard count, not an LLM judgment. Shares
+# _CONTENT_WORD_RE so the definition of "content word" is the same as gates.py's CB-48 logic.
 from __future__ import annotations
 
+import re
 from typing import Any, AsyncIterator, Optional, Sequence
 
 from src.config.settings import AgentConfig
@@ -211,6 +224,93 @@ _NO_RESTATE_INSTRUCTION = (
     "plainly once and pivot to the most useful next step — never loop."
 )
 
+# CB-62 (price-question policy): the ack instruction injected into the NLG prompt whenever the
+# prospect has asked a DIRECT price question (last_user_act == "price_inquiry"). It instructs the
+# model to (1) acknowledge any stated budget concern before pivoting — never a chipper "Perfect —"
+# after "tight budget" — and (2) offer the KB-grounded ballpark from the facts block (the number
+# MUST come from the retrieved facts, never invented here) with the "depends on needs/plan" qualifier,
+# then (3) bridge to the exact-quote callback. The instruction carries no price figure itself — that
+# grounding constraint from CB-53 is inviolable. Both realize() and realize_stream() share it because
+# they both build from _build_messages().
+_BUDGET_CONCERN_NOTE = (
+    "PRICE QUESTION POLICY (do not break): the prospect asked directly about cost. "
+    "Step 1 — acknowledge any stated budget concern with genuine empathy FIRST (e.g. if they said "
+    "'tight budget', say so explicitly: 'That makes sense — budget is a real consideration here'); "
+    "NEVER reply with a chipper opener like 'Perfect!' or 'Great!' after someone mentions financial "
+    "constraints. "
+    "Step 2 — give the honest KB-grounded ballpark range from the facts provided below (the range "
+    "figure MUST come from those facts, not invented); frame it as 'most families land around X "
+    "depending on the plan and goals — not a fixed price'. "
+    "Step 3 — offer the free consultation as the place to get an exact personalized quote. "
+    "If the facts do not include a price range, say plainly that price varies and the exact quote "
+    "comes from the free consultation — do NOT invent a number."
+)
+
+# CB-64 (repetition residual): stop-words stripped before comparing a new reply against own_last_lines
+# to detect near-verbatim repetition. Mirrors _RECUR_STOPWORDS in gates.py (CB-48 recurrence logic).
+_REPETITION_STOPWORDS = frozenset({
+    "the", "a", "an", "to", "of", "in", "on", "for", "and", "or", "is", "are", "do", "does", "did",
+    "can", "could", "you", "your", "i", "we", "he", "she", "it", "they", "me", "my", "him", "her",
+    "this", "that", "what", "how", "when", "why", "who", "which", "will", "would", "so", "just",
+    "not", "or", "really", "actually", "tell", "give", "with", "at", "be", "have", "has", "out",
+    "ll", "re", "ve", "s", "t", "let", "get",
+})
+
+# The minimum shared-content-word count that constitutes near-verbatim repetition (CB-64). Chosen
+# at >8 words so: (a) the QA6 defect pairs (reply-1 vs reply-3, "connect you with my team…exact
+# pricing…fifteen minutes" re-pitched verbatim) are reliably caught (they share 10+ content words);
+# (b) short legitimately-similar acks like "That makes sense" / "I understand" (≤3 content words
+# shared) are NOT flagged — the threshold is well above their overlap.
+_REPETITION_WORD_THRESHOLD = 8
+
+# Regex for tokenizing content words from a reply string (lowercase alphanum+apostrophe).
+_CONTENT_WORD_RE = re.compile(r"[a-z0-9']+")
+
+
+def _content_words_nlg(text: str) -> set[str]:
+    """Lower-cased content words of `text`, stripped of stop-words (CB-64 near-verbatim detection)."""
+    words = _CONTENT_WORD_RE.findall(text.lower())
+    return {w for w in words if w not in _REPETITION_STOPWORDS and len(w) > 1}
+
+
+def _near_verbatim_repetition(reply: str, own_last_lines: Optional[Sequence[Any]]) -> bool:
+    """True when `reply` shares >_REPETITION_WORD_THRESHOLD content words with ANY of own_last_lines.
+
+    CB-64: the QA6 defect was a near-verbatim re-pitch delivered on turn 3 even though turns 1 and 3
+    were both inside the YOUR_LAST_LINES n=4 window and the _NO_RESTATE_INSTRUCTION was present —
+    the instruction alone was ignored. This deterministic post-NLG check catches what the prompt
+    instruction missed: >8 shared content words between the new reply and any prior agent line is an
+    objective near-verbatim hit, triggering a blocking-path regenerate (or a stream-path flag).
+    Short acks (≤3 shared words) are never flagged; the threshold is calibrated to catch pitch-level
+    repetition only. Returns False when own_last_lines is empty/absent (turn 1 has nothing to compare)
+    or the reply itself is short (fewer than _REPETITION_WORD_THRESHOLD+1 content words)."""
+    if not own_last_lines:
+        return False
+    reply_words = _content_words_nlg(reply)
+    if len(reply_words) <= _REPETITION_WORD_THRESHOLD:
+        return False  # too short to flag — a short reply cannot be a verbatim re-pitch
+    for prior in own_last_lines:
+        prior_words = _content_words_nlg(str(prior))
+        shared = reply_words & prior_words
+        if len(shared) > _REPETITION_WORD_THRESHOLD:
+            return True
+    return False
+
+
+# CB-64: the hardened no-repetition re-instruction used on the blocking-path regenerate when
+# _near_verbatim_repetition() fires. Stronger and more direct than _NO_RESTATE_INSTRUCTION so the
+# second attempt genuinely advances instead of re-pitching. Mirrors _GROUNDING_RETRY_RULE's pattern
+# (explain what went wrong + give the corrected directive) so both safeguards share a consistent
+# shape. Never used on the streaming path (can't un-speak a token — that path flags instead).
+_REPETITION_RETRY_RULE = (
+    "Your previous reply repeated an offer or point you already made. REWRITE it: do NOT re-pitch "
+    "the same callback offer, team connection, or fifteen-minute framing you already said. Instead, "
+    "either (a) add a NEW, concrete piece of information (a different benefit, a specific detail the "
+    "prospect hasn't heard) or (b) advance the conversation with a direct next-step question. "
+    "Abbreviate the earlier offer if you must reference it ('like I mentioned, the team call —') "
+    "rather than repeating it in full. One sentence that moves forward is better than a re-pitch."
+)
+
 
 def _own_lines_block(own_last_lines: Optional[Sequence[Any]]) -> str:
     """Render the agent's OWN last 1-2 spoken lines into a YOUR_LAST_LINES block, or "" if none (CB-48).
@@ -236,6 +336,7 @@ def _build_messages(
     *,
     own_last_lines: Optional[Sequence[Any]] = None,
     grounding_retry: bool = False,
+    repetition_retry: bool = False,
 ) -> list[Message]:
     """Assemble persona + act-specific + grounding messages for the realization call.
 
@@ -247,7 +348,15 @@ def _build_messages(
     SAFEGUARD 2: the grounding block is included for a CLAIM act (answer_via_kb/handle_objection/pitch)
     OR whenever facts are present; `grounding_retry` (the blocking-path regenerate after grounded()
     flagged the first reply) hardens it. A bare ask/confirm/escalate with no facts gets no grounding
-    block (its prompt is unchanged)."""
+    block (its prompt is unchanged).
+
+    CB-62: when the prospect asked a direct price question (last_user_act == "price_inquiry"), the
+    _BUDGET_CONCERN_NOTE instruction is injected so the model acknowledges any stated budget concern
+    before pivoting and uses the KB-grounded ballpark from the facts block (no hardcoded price).
+
+    CB-64: `repetition_retry=True` (the blocking-path regenerate after _near_verbatim_repetition()
+    fired) prepends _REPETITION_RETRY_RULE so the second attempt genuinely advances instead of
+    re-pitching. Never used on the streaming path."""
     guidance = _ACT_GUIDANCE.get(decision.act, "Respond helpfully and warmly.")
     if decision.act == "attempt_close" and decision.tier in _TIER_GUIDANCE:
         guidance = f"{guidance} {_TIER_GUIDANCE[decision.tier]}"
@@ -261,7 +370,34 @@ def _build_messages(
     # wanted to know") and handle_objection addresses the specific objection.
     open_q = getattr(belief, "open_question", None)
     own_block = _own_lines_block(own_last_lines)
+
+    # CB-62: inject the budget-concern ack + KB-ballpark instruction whenever the prospect has asked
+    # a direct price question. The price figure itself MUST come from retrieved_facts (grounding
+    # constraint preserved); this instruction only sets the framing and tone. Applies to answer_via_kb
+    # on a price_inquiry (the routing address_direct_input produces); also fires on handle_objection
+    # (a price objection deserves the same honest ack). Does NOT fire on a bare pitch or close — those
+    # are agent-initiated, not a direct price question.
+    is_price_inquiry = (
+        getattr(belief, "last_user_act", None) == "price_inquiry"
+        or "price" in str(getattr(belief, "open_question", "") or "").lower()
+        or "cost" in str(getattr(belief, "open_question", "") or "").lower()
+        or "how much" in str(getattr(belief, "open_question", "") or "").lower()
+    )
+    price_acts = frozenset({"answer_via_kb", "handle_objection"})
+    budget_concern_block = (
+        _BUDGET_CONCERN_NOTE
+        if (is_price_inquiry and decision.act in price_acts)
+        else ""
+    )
+
+    # CB-64 repetition retry: prepend the hard no-repetition re-instruction FIRST so the regenerate
+    # attempt sees it before any other guidance. Placed ahead of the grounding block so both safeguards
+    # can fire on the same turn without conflicting (grounding checks facts; repetition checks phrasing).
+    repetition_block = _REPETITION_RETRY_RULE if repetition_retry else ""
+
     parts = [
+        # CB-64: repetition retry instruction (only on the second attempt — empty string otherwise).
+        repetition_block,
         f"NEXT_ACT: {decision.act}",
         f"TARGET_SLOT: {decision.target_slot}" if decision.target_slot else "",
         f"COMMITMENT_TIER: {decision.tier}" if decision.tier else "",
@@ -269,6 +405,8 @@ def _build_messages(
         f"PROSPECT_ASKED: {open_q!r}" if open_q else "",
         f"KNOWN_SO_FAR: {known}" if known else "",
         f"ACTIVE_OBJECTION: {belief.active_objection}" if belief.active_objection else "",
+        # CB-62: budget-concern ack instruction (only on a direct price question — empty otherwise).
+        budget_concern_block,
         # CB-48: the agent's own prior lines + a no-restate instruction (only when there are lines, so
         # the opening turn's prompt is unchanged).
         own_block,
@@ -294,6 +432,7 @@ async def realize(
     retrieved_facts: Optional[Sequence[Any]] = None,
     own_last_lines: Optional[Sequence[Any]] = None,
     grounding_retry: bool = False,
+    repetition_retry: bool = False,
 ) -> str:
     """Realize a gated Decision into one persona-consistent, voice-shaped reply string.
 
@@ -302,14 +441,17 @@ async def realize(
     to those facts. own_last_lines (CB-48) carries the agent's own last 1-2 spoken turns so the prompt
     can forbid restating them. SAFEGUARD 2: `grounding_retry=True` is the blocking-path REGENERATE
     after retriever.grounded() flagged the first reply as ungrounded — it hardens the grounding rule so
-    the second attempt states only supported claims (or says it lacks the figure). The reply is
-    whitespace-trimmed; a blank LLM reply — OR any call failure (a real OpenRouter 429/5xx/timeout that
-    outlived the client's bounded retry, FINDING 2) — degrades to a safe filler so the caller always
-    gets a non-empty turn instead of a crash.
+    the second attempt states only supported claims (or says it lacks the figure). CB-64:
+    `repetition_retry=True` is the blocking-path REGENERATE after _near_verbatim_repetition() fired
+    — it prepends _REPETITION_RETRY_RULE so the second attempt genuinely advances instead of re-pitching.
+    The reply is whitespace-trimmed; a blank LLM reply — OR any call failure (a real OpenRouter
+    429/5xx/timeout that outlived the client's bounded retry, FINDING 2) — degrades to a safe filler so
+    the caller always gets a non-empty turn instead of a crash.
     """
     messages = _build_messages(
         decision, belief, config, retrieved_facts,
         own_last_lines=own_last_lines, grounding_retry=grounding_retry,
+        repetition_retry=repetition_retry,
     )
     try:
         text = await llm_client.complete(messages)
