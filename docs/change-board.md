@@ -163,6 +163,15 @@
 - **Constraints checked:** buy-gate purity untouched; phone sha256-only (R42) preserved; consent gate unchanged; R37 brain-parity unaffected; no gates.py changes needed.
 - **Follow-ups / known gaps:** CB-87 tests injected a custom hook that read `last_close_tier` directly from `**kw` (bypassing `_default_live_upsert`), masking this gap. Future CB-87-style tests that cover the default wiring should use `live_upsert_hook=None` + `live_rag=True` + patch `persist_call_live`.
 
+### CB-91 — CRITICAL: never-deny (memory_check) not on the live LLM path → gaslighting returned
+- **Type / Surface / Size:** bug · `core` (`dst`) · S · CRITICAL
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `src/core/dst.py` (live-path memory_check override in `update()`, mirroring CB-89's social_aside override), `tests/unit/test_cb8990_adversarial.py` (+2 regressions).
+- **What changed:** CB-76's never-deny rule fires when `last_user_act=="memory_check"`, but `_MEMORY_CHECK_RE` was only in the regex fallback `_classify_intent` — the live LLM never returns 'memory_check', so on a real call `_NEVER_DENY_NOTE` never injected and the agent denied: QA11 caught "did I already tell you when works for me?" → "No, you haven't yet" (the exact gaslighting CB-76 meant to kill). Fix: after the LLM result, if `_MEMORY_CHECK_RE` matches and the LLM returned a weak intent (question/statement/None), override to memory_check — same deterministic-override pattern as CB-89. Now the never-deny note fires live.
+- **Verification:** spot-checked — "did I already tell you…"/"have I mentioned…" → memory_check; normal questions untouched; cb76/89/90 suites 132; full suite 842p. (Live re-confirmation rides the next replay.)
+- **Constraints checked:** R37; the override is gated to weak LLM acts (won't steal objections/human_requests); normal questions unaffected.
+- **Follow-ups / known gaps:** same live-path-vs-LLM-vocabulary class as CB-89 — audit done for memory_check + social_aside; any future regex intent needs the override too.
+
 ### CB-79 — One-time reset of the dev DB's polluted champion (user-authorized DB write)
 - **Type / Surface / Size:** chore · `db` (dev only) · S
 - **Completed:** 2026-06-08 (user-authorized)

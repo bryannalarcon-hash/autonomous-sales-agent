@@ -507,3 +507,16 @@ def test_cb90a_guarantee_question_fp_guard_holds():
     # tight pattern: no grade/result token -> stays a question even though "guarantee" appears
     assert _intent("Can you guarantee a tutor will be free Thursday?", "question") == ("question", None)
     assert _intent("What do I get for the money?", "question") == ("question", None)
+
+
+# CB-91 (live never-deny): "did I already tell you …?" must classify as memory_check on the LIVE
+# LLM path too (CB-76 only wired the regex fallback), so _NEVER_DENY_NOTE injects and the agent
+# can't deny the caller said something they did. The gaslighting bug, found live again in QA11.
+def test_cb91_memory_check_on_live_path():
+    assert _intent("Wait — did I already tell you when works for me?", "question")[0] == "memory_check"
+    assert _intent("Have I mentioned my availability yet?", "statement")[0] == "memory_check"
+
+
+def test_cb91_normal_question_not_memory_check():
+    assert _intent("What do I get for the money?", "question")[0] == "question"
+    assert _intent("Can you tell me the price?", "question")[0] == "question"

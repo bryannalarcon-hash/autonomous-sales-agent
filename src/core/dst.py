@@ -1290,6 +1290,24 @@ async def update(
             if open_question is None:
                 open_question = _norm_utt[:300]
 
+        # CB-91: LIVE-PATH memory_check override — the SAME gap CB-89 fixed for social_aside, now for
+        # the never-deny rule. _MEMORY_CHECK_RE ("did I already tell you …?") lives only in the regex
+        # fallback `_classify_intent`; the live LLM never returns 'memory_check', so last_user_act was
+        # never 'memory_check' on a real call → NLG's _NEVER_DENY_NOTE never injected → the agent could
+        # DENY the caller said something they did ("No, you haven't yet" — the gaslighting CB-76 meant
+        # to kill, found live again in QA11). Fix: after the LLM result, if the text matches
+        # _MEMORY_CHECK_RE and the LLM returned a weak intent (question/statement/None — a "did I tell
+        # you" is a question), override to 'memory_check' so the never-deny note fires live. Runs AFTER
+        # social_aside (a memory check is never a weather aside) and is mutually exclusive in practice.
+        _MEMORY_CHECK_WEAK_ACTS = frozenset({"question", "statement", None})
+        if (
+            classified_act in _MEMORY_CHECK_WEAK_ACTS
+            and _MEMORY_CHECK_RE.search(_norm_utt)
+        ):
+            classified_act = "memory_check"
+            if open_question is None:
+                open_question = _norm_utt[:300]
+
         # CB-90 (a) round-2: LIVE-PATH guarantee/efficacy upgrade — SCOPED to a guarantee-of-outcome
         # DEMAND ONLY. The ONLY documented live-path failure is a guarantee demand ("Guarantee me a
         # B or it's free") the LLM mislabels as 'statement' so the objection is silently dropped.
