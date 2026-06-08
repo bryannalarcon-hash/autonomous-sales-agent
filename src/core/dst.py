@@ -60,6 +60,17 @@
 #   - (d) Contact acknowledgment: when a turn captures name/phone/email the meta flag
 #     'contact_just_captured' is set TRUE; the NLG _CONTACT_ACK_NOTE instruction then requires a
 #     one-clause ack on ANY act ("Got it, Dana — I'll use this number.") so it rides every act.
+# CB-85 (a) — Social-aside / non-sequitur detection: an off-topic social question (weather, sports,
+#   casual chit-chat) that carries no product/scheduling/objection content routes as
+#   'social_aside' so: (1) advance_to_close NEVER fires on it (the "storm" → "Sounds good — let
+#   me get you scheduled" failure mode is blocked at the gate); (2) NLG's _SOCIAL_ASIDE_NOTE
+#   instructs a brief one-clause human ack then a redirect, and explicitly forbids treating the
+#   utterance as scheduling consent. Detection: a question matching _SOCIAL_ASIDE_CUES_RE topics AND
+#   NOT matching _PRODUCT_KEYWORDS_RE (the AND-guard exemption: scheduling/policy/transaction terms
+#   like reschedule/cancel/policy/refund/appointment/booking/cost) — so "what's the weather policy
+#   if we need to reschedule?" stays a real product question, not small talk. Checked in
+#   _classify_intent AFTER all priority intents (human_request/confirm_request/memory_check) and
+#   BEFORE the generic "question" branch.
 from __future__ import annotations
 
 import os
@@ -598,6 +609,37 @@ _AFFORDABILITY_REFUSAL_RE = re.compile(
 )
 # A bare price/cost question (not necessarily an objection) -> opens price talk via the gate.
 _PRICE_INQUIRY_RE = re.compile(r"\b(how much|what(?:'s| is| does it) cost|price|pricing|per (month|hour|session)|monthly|fees?|rates?)\b", re.I)
+# CB-85 (a): off-topic social / small-talk cues — weather, sports, news, weekend, general chit-chat.
+# A question matching these AND NOT containing any product/scheduling keyword is a social aside that
+# must NEVER be mistaken for scheduling consent or a product question.
+_SOCIAL_ASIDE_CUES_RE = re.compile(
+    r"\b(?:"
+    r"storm|weather|rain|snow|hurricane|tornado|flood|temperature|forecast|"
+    r"game|team|score|sports?|football|basketball|baseball|soccer|playoff|"
+    r"news|election|politics?|weekend|holiday|vacation|traffic|commute|"
+    r"movie|show|dinner|restaurant|party|kids?\s+school\b|"
+    r"how\s+(?:are\s+you|is\s+(?:your|the)\s+day|have\s+you\s+been)|"
+    r"did\s+you\s+(?:hear|see|watch|catch|follow)"
+    r")\b",
+    re.I,
+)
+# Anchors that confirm a social aside is actually a product/scheduling/transaction question — if ANY
+# of these are in the utterance too, we do NOT classify it as social_aside (the question is product-
+# related). MUST cover scheduling/policy/transaction terms: a "weather POLICY if we need to
+# RESCHEDULE?" question carries a social cue ("weather") but is a real product question — the
+# reschedule/policy keyword exempts it. Prefixes are written to catch their inflections (reschedul →
+# reschedule/rescheduling; appoint → appointment; book → booking; cancel → cancellation) since the
+# trailing \b otherwise blocks "appoint" from matching "appointment".
+_PRODUCT_KEYWORDS_RE = re.compile(
+    r"\b(?:"
+    r"reschedul(?:e|ing)|schedul(?:e|ing)|cancel(?:lation|led|ing)?|polic(?:y|ies)|refund|"
+    r"appoint(?:ment)?|book(?:ing)?|callback|call back|enroll|sign\s*up|start|"
+    r"tutor(?:ing)?|session|consult|trial|lesson|subject|grade|slot|"
+    r"cost|price|pricing|fee|pay(?:ment)?|monthly|hour(?:ly)?|"
+    r"available|availabilit|meet(?:ing)?"
+    r")\b",
+    re.I,
+)
 # An explicit ask for a human — routes to escalate via the escalation gate. Two shapes: (1) a
 # "speak/talk/connect me to/with a <human>" verb phrase, and (2) a "want/need/get me/give me/put me
 # on with a <human>" desire phrase ("I want a human now", "get me a real person", "let me talk to
@@ -772,8 +814,11 @@ def _classify_intent(utterance: str) -> tuple[Optional[str], Optional[str], Opti
     efficacy_doubt / diy_free / timing / decision_maker) when an objection cue fires. `open_question`
     carries the trimmed utterance when the prospect asked something (so NLG knows WHAT to answer and
     the price_gate's substring check can fire). `last_user_act` is the coarse intent the gates read:
-    human_request > confirm_request > objection > price_inquiry > question > statement (None when
-    nothing fires).
+    human_request > confirm_request > memory_check > social_aside > objection > price_inquiry >
+    question > statement (None when nothing fires).
+
+    CB-85 (a): 'social_aside' is an off-topic social/weather/sports question with no product keyword.
+    It sets open_question so NLG can acknowledge it, but advance_to_close is blocked (never consent).
 
     CB-61: detect 'confirm_request' (highest priority after human_request) — the prospect explicitly
     asking the agent to confirm a fact they already stated, typically the callback time ("please
@@ -805,6 +850,17 @@ def _classify_intent(utterance: str) -> tuple[Optional[str], Optional[str], Opti
     # the NLG guard triggers; treat the text as an open_question so NLG can reference it.
     if _MEMORY_CHECK_RE.search(text):
         return "memory_check", None, text[:300]
+
+    # CB-85 (a): social aside / non-sequitur — an off-topic social question (weather, sports,
+    # chit-chat) with NO product/scheduling keyword. Routes as 'social_aside' so that:
+    #   (1) advance_to_close is BLOCKED (a social question is NOT scheduling consent);
+    #   (2) open_question is set to None so address_direct_input cannot mistake it for a product
+    #       question that demands answer_via_kb (the agent acknowledges and redirects instead).
+    # Checked AFTER all priority intents and BEFORE the generic question/objection paths.
+    # Conservative: requires BOTH a social cue AND the absence of any product keyword — a product
+    # question that incidentally mentions the weather is NOT classified as a social aside.
+    if is_question and _SOCIAL_ASIDE_CUES_RE.search(text) and not _PRODUCT_KEYWORDS_RE.search(text):
+        return "social_aside", None, text[:300]
 
     objection: Optional[str] = None
     for pat, key in _OBJECTION_PATTERNS:

@@ -57,6 +57,12 @@
 # number.") regardless of the gated act. The DST sets this flag one-shot (cleared on the next turn).
 # CB-77 (f): _BUDGET_CONCERN_NOTE is STRENGTHENED to demand the floor–ceiling numeric range from the
 # FACTS BLOCK when available. "a few hundred" is no longer acceptable when the facts carry "$X–$Y".
+# CB-85 (a) SOCIAL ASIDE NOTE: when last_user_act == 'social_aside', _SOCIAL_ASIDE_NOTE is injected —
+# the agent MUST briefly acknowledge the off-topic remark in ≤6 words then redirect to the sales goal;
+# and must NEVER interpret the aside as consent or agreement to a close/callback/schedule.
+# CB-85 (b) PRICE HONESTY NOTE: _BUDGET_CONCERN_NOTE is further strengthened with an explicit ban on
+# "I don't have access to / I don't have the pricing" language when facts contain a price range —
+# the agent must NEVER claim it lacks pricing it can ground from the facts block.
 from __future__ import annotations
 
 import re
@@ -255,9 +261,27 @@ _BUDGET_CONCERN_NOTE = (
     "(e.g. '$40–80 per hour' or '$300–$600 per month' — use the EXACT numbers from the facts); "
     "do NOT use vague language like 'a few hundred' or 'it varies' when the facts carry real numbers; "
     "frame it as 'most families land around $X–$Y depending on the plan and goals'. "
+    "CRITICAL: if the facts below contain a price range, you MUST state it — do NOT say "
+    "'I don't have access to the exact pricing' or 'I don't have that number' or 'pricing is not "
+    "available to me'; those claims are FALSE when facts are present. The range is in the facts. "
     "Step 3 — offer the free consultation as the place to get an exact personalized quote. "
     "If the facts do NOT include a price range, say plainly that price varies and the exact quote "
     "comes from the free consultation — do NOT invent a number."
+)
+
+# CB-85 (a) SOCIAL ASIDE NOTE: injected when last_user_act == 'social_aside'. The agent must give a
+# brief human acknowledgment (≤6 words) of the off-topic remark FIRST, then redirect warmly to the
+# goal — and must NEVER interpret the remark as agreement, consent, or scheduling intent. A question
+# about the weather / a sports score / weekend plans is NOT a "yes" to anything. This prevents the
+# live defect: "you guys see the storm coming tonight?" → "Sounds good — let me get you scheduled."
+_SOCIAL_ASIDE_NOTE = (
+    "SOCIAL ASIDE RULE (do not break): the caller just made an off-topic social remark (weather, "
+    "sports, chit-chat, or similar). "
+    "Step 1 — briefly acknowledge it in ≤6 words (e.g. 'Ha, yes — quite a storm out there!' "
+    "or 'Sounds like a busy day!') — one short human touch only. "
+    "Step 2 — smoothly redirect back to the goal. "
+    "NEVER interpret the off-topic remark as agreement, scheduling consent, or a 'yes' to anything. "
+    "Do NOT say 'Sounds good — let me get you scheduled' or any equivalent after an off-topic aside."
 )
 
 # CB-76 (c) NEVER-DENY RULE: injected when last_user_act == 'memory_check'. The agent must NEVER
@@ -404,7 +428,13 @@ def _build_messages(
     never assert the caller did not say something; confirm from KNOWN_SO_FAR or hedge honestly.
 
     CB-76 (d): when belief.meta['contact_just_captured'] is True, _CONTACT_ACK_NOTE is injected so
-    the reply opens with a warm one-clause contact acknowledgment, regardless of the gated act."""
+    the reply opens with a warm one-clause contact acknowledgment, regardless of the gated act.
+
+    CB-85 (a): when last_user_act == 'social_aside', _SOCIAL_ASIDE_NOTE is injected — the agent must
+    give a brief ≤6-word human acknowledgment then redirect; NEVER interpret the aside as consent.
+
+    CB-85 (b): _BUDGET_CONCERN_NOTE explicitly bans "I don't have access to pricing" when facts carry
+    a range — the agent must state the KB-grounded numbers, never claim it lacks them."""
     guidance = _ACT_GUIDANCE.get(decision.act, "Respond helpfully and warmly.")
     if decision.act == "attempt_close" and decision.tier in _TIER_GUIDANCE:
         guidance = f"{guidance} {_TIER_GUIDANCE[decision.tier]}"
@@ -443,8 +473,14 @@ def _build_messages(
     # can fire on the same turn without conflicting (grounding checks facts; repetition checks phrasing).
     repetition_block = _REPETITION_RETRY_RULE if repetition_retry else ""
 
-    # CB-76 (c): NEVER-DENY RULE — inject when the caller asked if they already told us something.
+    # CB-85 (a): SOCIAL ASIDE RULE — inject when the caller's turn is an off-topic social remark.
+    # The instruction enforces the acknowledge-then-redirect shape and explicitly forbids treating the
+    # aside as scheduling consent. Runs on ANY act (including attempt_close, which the DST-level gate
+    # already blocks, but the NLG guard is a second layer).
     last_act = getattr(belief, "last_user_act", None)
+    social_aside_block = _SOCIAL_ASIDE_NOTE if last_act == "social_aside" else ""
+
+    # CB-76 (c): NEVER-DENY RULE — inject when the caller asked if they already told us something.
     never_deny_block = _NEVER_DENY_NOTE if last_act == "memory_check" else ""
 
     # CB-76 (d): CONTACT ACK — inject when the DST flagged that this turn captured contact info.
@@ -468,6 +504,8 @@ def _build_messages(
         f"ACTIVE_OBJECTION: {belief.active_objection}" if belief.active_objection else "",
         # CB-62: budget-concern ack instruction (only on a direct price question — empty otherwise).
         budget_concern_block,
+        # CB-85 (a): social aside rule (only on a social_aside turn — empty otherwise).
+        social_aside_block,
         # CB-76 (c): never-deny rule (only on a memory_check turn — empty otherwise).
         never_deny_block,
         # CB-76 (d): contact acknowledgment instruction (only when contact was just captured).

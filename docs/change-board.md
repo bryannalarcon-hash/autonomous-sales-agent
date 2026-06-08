@@ -61,16 +61,6 @@
 > ```
 
 
-### CB-85 — Non-sequitur false-pivot + price persistence for the combative persona (brain quality)
-- **Type / Surface / Size:** bug · `core` (`gates`/`nlg`) · M · MEDIUM
-- **Prereqs:** —
-- **Current (QA10-chat):** (a) "you guys see the storm coming tonight?" → "Sounds good — let me get you scheduled" (ignored + misread as scheduling consent — no brief human ack then pivot); (b) the COMBATIVE dad's terse price re-asks ("Price. Just the number.") still got deflection + a FALSE "I don't have access to the exact pricing tiers right now" (the cooperative mom got "$300–600" on first ask) — CB-77's terse-recurrence didn't fire for this persona / the agent claimed no access to data it has.
-- **Desired:** a non-sequitur gets a one-clause ack before the pivot, never misread as consent; CB-77 terse-price forcing fires regardless of adversarial tone; the agent never claims it lacks pricing it can ground.
-- **Acceptance:** scripted replay of the storm turn + the 3× terse dad asks; price range surfaces by ask 2; no "I don't have access" when KB carries the range.
-- **Refs:** QA10-chat SEV-2 (non-sequitur), SEV-3 (price determinism); builds on CB-62/77.
-
-
-
 ### CB-86 — Checkpoint-persist the lead at contact-capture (not only at /end)
 - **Type / Surface / Size:** change · `api` (`demo_routes` live_upsert + persistence) · M
 - **Prereqs:** CB-82 (done — booked closes now finalize via /end)
@@ -158,6 +148,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-85 — Non-sequitur false-pivot + price honesty under pressure
+- **Type / Surface / Size:** bug · `core` (`dst`/`gates`/`nlg`) · M · MEDIUM
+- **Completed:** 2026-06-08 (+ a false-positive follow-up round)
+- **Files changed (actual):** `src/core/dst.py` (`_SOCIAL_ASIDE_CUES_RE` + `_PRODUCT_KEYWORDS_RE`; `_classify_intent` routes a social question with NO product keyword as `social_aside`), `src/core/gates.py` (`advance_to_close` returns unchanged when `last_user_act=="social_aside"` — the invariant: a social aside is never scheduling consent), `src/core/nlg.py` (`_SOCIAL_ASIDE_NOTE` ≤6-word ack-then-redirect; `_BUDGET_CONCERN_NOTE` bans "I don't have access to pricing" when facts carry a range), `tests/unit/test_cb85.py` (52 tests).
+- **What changed:** (a) "you guys see the storm coming tonight?" can no longer be misread as scheduling consent — `advance_to_close` is gated, and NLG acknowledges briefly then redirects; (b) the combative dad's terse price re-asks already routed to answer_via_kb (CB-77 is tone-independent) — the false "I don't have access" was an NLG slip, now explicitly forbidden when the KB range is present. Follow-up round fixed a false positive ("weather policy if we need to reschedule?" was misrouted as social_aside — `_PRODUCT_KEYWORDS_RE` widened with reschedule/cancel/policy/refund/payment + inflections).
+- **Verification:** 52 tests incl. 14 false-positive guards; spot-checked by orchestrator (storm/day-going → social_aside; reschedule-policy/schedule-Thursday/cost → not); full suite 1035p/5s (.venv); invariant set 235; zero regressions.
+- **Constraints checked:** R37; buy-gate purity; no hardcoded prices (grounding guard still enforces); advance_to_close still fires normally on non-aside closeable turns.
+- **Follow-ups / known gaps:** real-model ack phrasing + the dad price sequence → paid replay (QA round 4).
 
 ### CB-82 — Conversion/lead loss: only enrollment closes finalize (callback/consult/trial vanish)
 - **Type / Surface / Size:** bug · `api` (`demo_routes` done-condition + persistence) · M · HIGH

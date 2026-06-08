@@ -53,6 +53,8 @@
 #                         instead of answering questions forever (the can't-close fix). CB-48: it will
 #                         NOT take close-initiative over a RECURRING unanswered question (don't re-
 #                         convert address_direct_input's answer back into a close on a warm prospect).
+#                         CB-85 (a): NEVER fires on a social_aside turn (off-topic chit-chat is never
+#                         consent — "storm tonight?" must NEVER become "Sounds good, let me schedule").
 #                         Shares its close-readiness/tier test (_closeable_tier) with the loop-breaker.
 #   break_no_progress_loop— SAFEGUARD 1 (the ONE general loop-breaker): if the last K gated acts were
 #                         all REACTIVE (ask/confirm_known/pitch/answer_via_kb/handle_objection) AND
@@ -796,8 +798,17 @@ def advance_to_close(
     trust is the reliable warmth signal (purchase_intent in the agent's belief barely moves). The
     prospect's HONEST buy-gate still decides acceptance; NLG still has the open_question so the close
     acknowledges what they asked (not a dodge). Runs BEFORE pushiness_cap (which can veto an over-
-    aggressive close) and offer_low_commitment_on_budget."""
+    aggressive close) and offer_low_commitment_on_budget.
+
+    CB-85 (a): a social_aside turn (off-topic chit-chat, e.g. "you guys see the storm coming tonight?")
+    MUST NOT trigger advance_to_close — the aside is never scheduling consent. This guard is the
+    INVARIANT: a non-sequitur utterance cannot let advance_to_close/attempt_close fire as if the
+    caller agreed to anything."""
     if int(belief.turn_count) < int(_threshold(config, "min_turns_before_close")):
+        return decision
+    # CB-85 (a): NEVER advance to a close on a social/off-topic aside. A social aside is not consent
+    # to schedule or enroll — the agent must acknowledge and redirect, not interpret it as a yes.
+    if getattr(belief, "last_user_act", None) == "social_aside":
         return decision
     # CB-48: never take close-initiative OVER a RECURRING unanswered question (the prospect re-asking
     # the same challenge). address_direct_input already routes such a turn to answer_via_kb; without
