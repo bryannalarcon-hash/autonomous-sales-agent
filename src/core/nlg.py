@@ -31,6 +31,10 @@
 # the first-line rule only — a streamed token can't be un-spoken, so respond_stream NEVER regenerates
 # mid-stream (an ungrounded streamed reply is flagged in decision.meta by respond_stream for
 # observability, not rewritten). realize + realize_stream still build the SAME prompt (lock-step).
+# CB-61 (confirm-echo): when the gated decision is confirm_known targeting callback_window (or any
+# other CB-61 slot), _build_messages surfaces the slot value in KNOWN_SO_FAR so the LLM has the exact
+# time to echo. The confirm_known guidance was also made time-echo-aware: when TARGET_SLOT is
+# callback_window, the guidance explicitly says to echo the booked time back verbatim.
 from __future__ import annotations
 
 from typing import Any, AsyncIterator, Optional, Sequence
@@ -46,7 +50,11 @@ _SAFE_FILLER = "Let me make sure I'm helping you the right way here."
 # Per-act realization guidance: what the spoken turn should accomplish for each gated act. Keeps NLG
 # faithful to the policy's decision while leaving phrasing to the LLM (persona-consistent).
 _ACT_GUIDANCE: dict[str, str] = {
-    "confirm_known": "Briefly confirm what we already know (don't re-ask it) and move forward warmly.",
+    "confirm_known": (
+        "Briefly confirm what we already know (don't re-ask it) and move forward warmly. "
+        "CB-61: if TARGET_SLOT is 'callback_window', echo the exact booked day/time from KNOWN_SO_FAR "
+        "verbatim — say it back explicitly (e.g. 'Thursday after 3pm — noted, our team will call you then')."
+    ),
     "ask": "Ask ONE discovery question (the target slot), conversationally — never interrogate.",
     "answer_via_kb": "Answer their question using ONLY the provided facts; if none cover it, say you'll follow up rather than guess.",
     "pitch": "Re-anchor on value: connect our approach to their stated goal/pain. Do NOT quote price.",

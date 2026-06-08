@@ -10,7 +10,9 @@
 #                         (belief.meta["asked_slots"]); never re-ask the same question a 3rd time.
 #   establish_who_first — CB-34: a learner-specific ask first establishes WHO the tutoring is for
 #                         (belief.meta["learner_established"]/["learner_denied"]) — never presume a learner.
-#   skip_known          — never ask a slot already filled at/above lock confidence.
+#   skip_known          — never ask a slot already filled at/above lock confidence; CB-61 extension:
+#                         on a confirm_request, any deferrable act for a known slot is also converted
+#                         to confirm_known so the echo path fires.
 #   no_authority_prefers_callback— CB-50: a proposed `escalate` driven SOLELY by the no-authority
 #                         gatekeeper read (belief.active_objection == "decision_maker", no genuine
 #                         escalation trigger) is down-tiered to attempt_close@callback — book a
@@ -33,6 +35,11 @@
 #                         close — so the agent stops evading the core concern; AND a discovery ask/
 #                         confirm under HIGH bail_risk is suppressed (answer/advance, never slot-fill a
 #                         hot, impatient prospect).
+#                         CB-61: a confirm_request (explicit "please confirm <X>") routes a deferrable
+#                         act to confirm_known targeting the most relevant known slot, so the NLG path
+#                         echoes the stated time instead of replying vaguely.
+#                         CB-61 adversarial (Defect 3): active_objection check runs BEFORE the
+#                         confirm_request branch — a live objection always wins over a confirm echo.
 #   must_clear_objection— forbid pivot-to-close while active_objection is set (-> handle_objection).
 #   price_gate          — don't open price/budget before a trust event (prospect asked unprompted
 #                         OR a value-ack/trust threshold OR required discovery slots filled).
@@ -577,6 +584,12 @@ def address_direct_input(
         is at/above the pushiness cap (a hot, impatient prospect — "no fluff") is redirected to answer
         their open question if any, else a value pitch. We do NOT slot-fill someone about to walk.
 
+    CB-61 (confirm-echo):
+      • A confirm_request (explicit "please confirm <X>") routes a deferrable act to confirm_known
+        targeting the most relevant known slot, so NLG echoes the stated time rather than replying
+        vaguely. The best target is the callback_window slot (the typical confirm target for a just-
+        stated time); fallback to the open_question itself surfacing in KNOWN_SO_FAR.
+
     Acts that already address the prospect (answer_via_kb/handle_objection) or escalate/disqualify are
     left to the close-path + escalation gates."""
     recurring_q = (
@@ -599,6 +612,12 @@ def address_direct_input(
 
     if decision.act not in _DEFERRABLE_ACTS:
         return decision
+
+    # CB-61 adversarial fix (Defect 3): a LIVE objection ALWAYS wins over a confirm_request.
+    # The original order put confirm_request BEFORE active_objection, so "just confirm Thursday —
+    # also it's really too expensive" converted to confirm_known and the price objection was never
+    # addressed. A prospect who raises an objection in the same turn as a confirm request must have
+    # the objection handled first; the confirm echo can ride along after the objection clears.
     if belief.active_objection:
         out = decision.copy()
         out.act = "handle_objection"
@@ -606,7 +625,27 @@ def address_direct_input(
         out.tier = None
         out.rationale = (
             f"address_direct_input: prospect raised '{belief.active_objection}'; "
-            "handling it before any more discovery"
+            "handling it before any more discovery or confirm echo"
+        )
+        return out
+
+    # CB-61: an explicit confirm-request ("please confirm they'll call Thursday after 3pm") — route
+    # any deferrable act to confirm_known so the agent echoes the stated time back. The target is the
+    # most useful known slot for the echo; callback_window is the primary target (contains the exact
+    # time the prospect just proposed); fallback to no target_slot (NLG will echo from open_question).
+    # Only fires when there is NO live objection (objection check above takes priority).
+    if belief.last_user_act == "confirm_request":
+        out = decision.copy()
+        out.act = "confirm_known"
+        out.tier = None
+        # Use callback_window if it's filled (likely the thing they want confirmed); else no target.
+        if belief.slot_confidence("callback_window") >= _LOCK_CONFIDENCE:
+            out.target_slot = "callback_window"
+        else:
+            out.target_slot = None
+        out.rationale = (
+            "address_direct_input: prospect asked for an explicit confirmation; routing to "
+            "confirm_known so the agent echoes the stated time (CB-61 confirm-echo)"
         )
         return out
     if belief.open_question and belief.last_user_act in ("question", "price_inquiry"):

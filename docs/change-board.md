@@ -97,15 +97,6 @@
 - **Acceptance:** counts cross-check script (calls==list totals; cohort subtotals sum; every escalation's call findable from the UI); vA/vB self-consistency; stub rows visibly badged; n=1 views show the small-n warning instead of 100% claims.
 - **Refs:** QA6 qa-operate HIGH #1–4, MEDIUM #10, LOW #16.
 
-### CB-61 — The agent doesn't LISTEN: DST drops caller-stated slots (deadline, callback time)
-- **Type / Surface / Size:** bug · `core` (`dst`, gates' skip_known inputs) · M–L
-- **Prereqs:** —
-- **Important files (candidates):** `src/core/dst.py` (timeline/schedule extraction), `src/core/gates.py` (`skip_known`/`no_repeat_discovery` only help if the slot is FILLED), eval persona scripts for regression.
-- **Current (QA6 conv 1):** caller said "big test in about three weeks" → next turn agent asked "is it keeping up day-to-day, preparing for a test?"; caller said "Thursday after 3pm" → agent asked "What day works for you?"; caller explicitly asked to confirm Thursday → agent answered "they'll be in touch soon" without ever acknowledging the time. The close survives on caller patience, not agent competence. Same root as the measured qualification-accuracy gap (~0.29 vs 0.75–0.80 ladder).
-- **Desired:** stated deadline/timeline and proposed callback windows are captured as slots, never re-asked, and explicitly confirmed on request ("Thursday after 3pm — noted").
-- **Acceptance:** scripted regression replaying QA6 conv 1: zero re-asks of volunteered facts; the confirm request gets an explicit echo of the time; qual-acc on the eval set moves up measurably.
-- **Refs:** QA6 qa-chat HIGH #4 + transcript (verbatim in report).
-
 ### CB-62 — Price-question policy: offer the KB-grounded ballpark instead of pure deflection
 - **Type / Surface / Size:** change · `core` (`gates.price_gate`, NLG) · `kb` · S–M
 - **Prereqs:** —
@@ -202,6 +193,15 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-61 — The agent doesn't LISTEN: DST drops caller-stated slots (deadline, callback time)
+- **Type / Surface / Size:** bug · `core` (`dst`, `gates`, `nlg`) · M–L
+- **Completed:** 2026-06-07 (2 coder rounds + adversarial verifier)
+- **Files changed (actual):** `src/core/dst.py` (widened `_TIMELINE_RE` + hedge softening; NEW `callback_window` slot/extractor with `_DEADLINE_CONTEXT_RE` guard + `_CALLBACK_HEDGE_RE`; tightened agent-directed `_CONFIRM_REQUEST_RE` with "confirm with <person>" exclusion; `confirm_request` intent), `src/core/gates.py` (`address_direct_input`: live objection wins over confirm-routing; confirm_request → `confirm_known` targeting callback_window), `src/core/nlg.py` (`confirm_known` guidance echoes the exact booked day/time), `tests/unit/test_cb61_listening.py` (NEW, 32), `tests/unit/test_cb61_adversarial.py` (NEW, 17 — verifier's spec).
+- **What changed:** volunteered facts ("test in about three weeks", "Thursday after 3pm") now extract as slots → `skip_known`/`no_repeat_discovery` block re-asks; explicit confirm requests echo the time. Round-1 cut had 3 BLOCKING defects caught by the verifier (deadline-day captured as callback window at 0.9; "confirm with my wife" hijacking the decision_maker objection past the CB-50 guard; confirm-routing pre-empting live objections) — all fixed in round 2 without editing the spec.
+- **Verification:** adversarial 17/17, listening 32/32; loop-breaker 14, grounding 8, CB-50 guard 7, CB-48 directness 13, R37 parity 37; FULL suites 535p/5s (.venv) + 549p (system python), zero regressions; no LiveKit imports in src/core.
+- **Constraints checked:** R37 parity, buy-gate purity untouched, CB-50 third-party logic proven unmasked.
+- **Follow-ups / known gaps:** real-model behaviors deferred to the paid replay (NLG actually echoing the time; DST-LLM agreement on unusual phrasings; "can you confirm a human will call" reaches confirm_request not human_request — documented tolerable gap).
 
 ### CB-58 — Untangle rejection vs guardrail messaging on experiment cards
 - **Type / Surface / Size:** bug · `api` (`improve`) · `loop` · `web` · S–M

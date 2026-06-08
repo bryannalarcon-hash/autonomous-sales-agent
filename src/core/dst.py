@@ -27,6 +27,22 @@
 #   - disclosure + active_objection='concern': an emotional disclosure/complaint must be acknowledged
 #     before any pitch (CB-36);
 #   - hostility: a profane/abusive turn -> de-escalate, never pitch/re-ask (CB-37). Sticky for the call.
+# CB-61 — the agent doesn't LISTEN: added two new deterministic slot extractors:
+#   - _extract_timeline: widened to catch "in about N weeks/months" (was only "in N weeks"); covers the
+#     QA6 "big test in about three weeks" miss where the agent re-asked the deadline it just heard.
+#   - _extract_callback_window: new slot that captures a proposed callback day/time ("Thursday after
+#     3pm") so skip_known/no_repeat_discovery protect it from re-asking. Also detects confirm requests
+#     ("please confirm they'll call Thursday after 3pm") and routes them via _classify_intent ->
+#     last_user_act='confirm_request' so the NLG path echoes the time instead of replying vaguely.
+# CB-61 adversarial fixes (round 2):
+#   - Defect 1: _extract_callback_window named-day branch now checks _DEADLINE_CONTEXT_RE — a day that
+#     appears in a deadline context (test/exam/quiz) is NOT captured as a callback window. "her test is
+#     on Thursday" / "the exam is Thursday morning" return None.
+#   - Defect 2: _CONFIRM_REQUEST_RE tightened to require an agent-directed prefix (please/can you/just)
+#     and explicitly excludes "confirm/double-check WITH my <person>" (a decision_maker deferral, not
+#     an agent-directed confirmation request).
+#   - Defect 4: _extract_callback_window applies _CALLBACK_HEDGE_RE to soften hedged windows below
+#     the lock threshold (0.7 < 0.8) so "maybe Thursday could work?" stays re-confirmable.
 from __future__ import annotations
 
 import os
@@ -151,13 +167,93 @@ _BUDGET_BARE_RE = re.compile(r"\b(\d{1,3}(?:,\d{3})*|\d{2,})\b")
 _BUDGET_CONTEXT_RE = re.compile(r"\b(budget|afford|spend|pay|cost|price)\b|\$", re.I)
 
 # Timeline: a test/term date or a relative window.
+# CB-61: expanded to capture "in about N weeks/months" (was only bare "in N weeks") — the QA6 miss
+# was "big test in about three weeks" which the original regex silently dropped.  A hedge word
+# ("about", "roughly", "approximately", "around") before the count drops confidence from 0.85 to
+# 0.7 so the slot stays SOFT and can be confirmed, but it is at least captured (not dropped silently).
 _TIMELINE_RE = re.compile(
     r"\b(?:by\s+)?("
     r"next\s+(?:week|month|year|spring|fall|summer|semester|term)|"
-    r"in\s+\d+\s+(?:weeks?|months?)|"
+    r"in\s+(?:about|roughly|approximately|around|just\s+(?:over|under))?\s*\d+\s+(?:weeks?|months?)|"
+    r"in\s+(?:about|roughly|approximately|around)?\s*"
+    r"(?:a\s+(?:couple(?:\s+of)?|few)|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:weeks?|months?)|"
     r"(?:january|february|march|april|may|june|july|august|september|october|november|december)"
     r"|spring|fall|summer|finals|midterms"
     r")\b",
+    re.I,
+)
+# The hedge words that should soften a timeline confidence below lock level.
+_TIMELINE_HEDGE_RE = re.compile(
+    r"\b(?:about|roughly|approximately|around|maybe|probably|i\s+think|not\s+sure|"
+    r"somewhere|give\s+or\s+take|or\s+so|ish)\b",
+    re.I,
+)
+
+# CB-61: Callback window — the prospect proposing a day/time for the callback ("Thursday after 3pm",
+# "Monday morning works for me"). Captured as callback_window so skip_known/no_repeat_discovery can
+# protect it from re-asking, and so NLG can echo it on a confirm-request turn.
+# Tight: requires a named day or a time expression + a scheduling cue to avoid false positives.
+_DAY_NAMES = (
+    r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"mon|tue|wed|thu|fri|sat|sun)"
+)
+_TIME_OF_DAY = (
+    r"(?:"
+    r"(?:after|before|around|at|by)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)|"
+    r"(?:morning|afternoon|evening|night|noon)"
+    r")"
+)
+# A day name (with optional time) OR a bare "after/before <time>" with no day (lower confidence).
+_CALLBACK_WINDOW_RE = re.compile(
+    # Full: a named day, optionally followed by time qualifiers.
+    r"\b(" + _DAY_NAMES + r"(?:\s*(?:morning|afternoon|evening|night|noon))?"
+    r"(?:\s+(?:after|before|around|at)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm))?)\b"
+    r"|\b(" + _TIME_OF_DAY + r")\b",
+    re.I,
+)
+# A scheduling-intent cue required when there is NO named day — prevents capturing "after 3pm"
+# in a completely unrelated context.
+_SCHEDULING_CUES_RE = re.compile(
+    r"\b(work[s]?(?:\s+for\s+(?:me|us))?|call|reach|callback|schedule|contact|"
+    r"reach\s+(?:me|us)|call\s+(?:me|us)|available|confirm|please\s+confirm)\b",
+    re.I,
+)
+# CB-61 adversarial fix (Defect 1): deadline-context words that, when found near a day name,
+# indicate an EXAM/TEST DEADLINE rather than a scheduling offer. "her test is on Thursday" and
+# "the exam is Thursday morning" must NOT become callback_window. Named-day branch requires a
+# scheduling-intent cue OR the absence of deadline context; deadline context wins (blocks the
+# named-day branch even when a scheduling cue is present in the same utterance).
+_DEADLINE_CONTEXT_RE = re.compile(
+    r"\b(test|exam|quiz|due|deadline|assignment|homework|midterm|finals?|"
+    r"presentation|project\s+due|appointment\s+for|school|class)\b",
+    re.I,
+)
+# CB-61 adversarial fix (Defect 4): hedge words that soften a callback_window extraction below the
+# lock threshold (0.8), mirroring the timeline hedge discipline. "maybe Thursday could work?" is
+# not a firm commitment and must remain re-confirmable.
+_CALLBACK_HEDGE_RE = re.compile(
+    r"\b(?:maybe|perhaps|possibly|might|could\s+work|not\s+sure|i\s+think|"
+    r"i\s+guess|probably|sort\s+of|kind\s+of|roughly|around|or\s+so|ish)\b",
+    re.I,
+)
+
+# CB-61: Confirm-request detection — the prospect explicitly asking the AGENT to confirm a fact
+# (typically the callback time) they already stated. "please confirm they'll call Thursday after 3pm",
+# "can you confirm <X>?". Deliberately tight: requires an explicit confirm/verify verb directed AT
+# the agent, so a general question is NOT mislabeled as a confirm_request.
+# CB-61 adversarial fix (Defect 2): "confirm/check WITH my wife/husband/partner" is a
+# DECISION_MAKER DEFERRAL (the person is consulting a third party), NOT an agent-directed confirm.
+# The verb "confirm/check with <person>" means "consult", not "please verify this for me".
+# We exclude forms where the confirm/double-check/verify verb is immediately followed by "with my/
+# our/his/her" (a third-party consultation phrase). Only agent-directed forms survive.
+_CONFIRM_REQUEST_RE = re.compile(
+    # Agent-directed forms: "please confirm", "can you confirm", "just to confirm",
+    # "just confirm", "verify", "make sure" — but NOT followed by "with <person>".
+    r"(?:"
+    r"(?:please\s+|can\s+you\s+|could\s+you\s+|just\s+to\s+|just\s+)"
+    r"(?:confirm|verify|double.?check|make\s+sure)"
+    r")"
+    r"(?!\s+with\s+(?:my|our|his|her|the|a)\b)",
     re.I,
 )
 
@@ -257,9 +353,57 @@ def _extract_budget(text: str) -> Optional[tuple[Any, float]]:
 
 
 def _extract_timeline(text: str) -> Optional[tuple[Any, float]]:
+    """Extract a deadline or relative test-prep timeline (CB-61 widened).
+
+    A hedged expression ("in about three weeks") extracts at 0.7 — below the lock threshold — so
+    the slot is soft and can be re-confirmed, but is at least captured (the QA6 miss: the original
+    regex silently dropped "in about three weeks" and then re-asked the same question)."""
     m = _TIMELINE_RE.search(text)
     if m:
-        return m.group(1).lower(), 0.85
+        value = m.group(1).lower()
+        # Apply hedge softening: if the utterance contains uncertainty words, lower confidence so
+        # the slot stays soft (re-confirmable) instead of locking an uncertain timeline.
+        conf = 0.7 if _TIMELINE_HEDGE_RE.search(text) else 0.85
+        return value, conf
+    return None
+
+
+def _extract_callback_window(text: str) -> Optional[tuple[Any, float]]:
+    """Extract a proposed callback day/time into the callback_window slot (CB-61 new slot).
+
+    High confidence (0.9) when a named day is present — the caller is committing a specific slot.
+    Lower confidence (0.75) for a bare time-of-day with no day name but a scheduling cue present.
+    Returns None when neither pattern matches or scheduling cues are absent for a bare time match.
+
+    CB-61 adversarial fix (Defect 1): the named-day branch now requires a scheduling-intent cue
+    OR the absence of deadline-context words. A deadline word (test/exam/quiz/due/deadline) in the
+    same utterance marks the day as an academic deadline, not a proposed callback slot — e.g.
+    "the exam is Thursday morning" and "she has a quiz on Friday morning" must NOT extract.
+
+    CB-61 adversarial fix (Defect 4): hedge words ("maybe Thursday could work?", "perhaps Friday")
+    lower the confidence to 0.7 — below the 0.8 lock threshold — so a tentative window stays SOFT
+    and can be re-confirmed, mirroring the timeline hedge discipline."""
+    text_norm = _normalize_punct(text or "")
+    m = _CALLBACK_WINDOW_RE.search(text_norm)
+    if not m:
+        return None
+    day_match = m.group(1)  # named-day branch
+    time_match = m.group(2)  # bare time-of-day branch
+    if day_match:
+        # CB-61 adversarial (Defect 1): if deadline-context words are present, the day is an
+        # academic deadline (test/exam/quiz), NOT a proposed callback window — return None.
+        if _DEADLINE_CONTEXT_RE.search(text_norm):
+            return None
+        # The named-day branch also requires either a scheduling cue OR the absence of
+        # any conflicting context (i.e. is a genuine scheduling statement). We accept the
+        # named-day if no deadline context blocks it (checked above).
+        # CB-61 adversarial (Defect 4): hedge softening — a tentative window must stay below lock.
+        conf = 0.7 if _CALLBACK_HEDGE_RE.search(text_norm) else 0.9
+        return day_match.lower().strip(), conf
+    # Bare time-of-day: only capture when a scheduling cue is nearby (avoids false positives).
+    if time_match and _SCHEDULING_CUES_RE.search(text_norm):
+        conf = 0.7 if _CALLBACK_HEDGE_RE.search(text_norm) else 0.75
+        return time_match.lower().strip(), conf
     return None
 
 
@@ -269,6 +413,7 @@ _EXTRACTORS = {
     "subject": _extract_subject,
     "budget": _extract_budget,
     "timeline": _extract_timeline,
+    "callback_window": _extract_callback_window,  # CB-61: proposed callback day/time
 }
 
 
@@ -456,7 +601,14 @@ def _classify_intent(utterance: str) -> tuple[Optional[str], Optional[str], Opti
     efficacy_doubt / diy_free / timing / decision_maker) when an objection cue fires. `open_question`
     carries the trimmed utterance when the prospect asked something (so NLG knows WHAT to answer and
     the price_gate's substring check can fire). `last_user_act` is the coarse intent the gates read:
-    human_request > objection > price_inquiry > question > statement (None when nothing fires)."""
+    human_request > confirm_request > objection > price_inquiry > question > statement (None when
+    nothing fires).
+
+    CB-61: detect 'confirm_request' (highest priority after human_request) — the prospect explicitly
+    asking the agent to confirm a fact they already stated, typically the callback time ("please
+    confirm they'll call Thursday after 3pm"). This routes through skip_known -> confirm_known so
+    the NLG path echoes the stated time instead of replying vaguely. The confirm verb ("please
+    confirm / verify / double-check") must be present; a general question is NOT a confirm_request."""
     text = _normalize_punct((utterance or "").strip())
     if not text:
         return None, None, None
@@ -465,6 +617,10 @@ def _classify_intent(utterance: str) -> tuple[Optional[str], Optional[str], Opti
 
     if _HUMAN_REQUEST_RE.search(text):
         return "human_request", None, open_question
+
+    # CB-61: explicit confirm/verify request — routes to confirm_known so the time is echoed.
+    if _CONFIRM_REQUEST_RE.search(text):
+        return "confirm_request", None, text[:300]
 
     objection: Optional[str] = None
     for pat, key in _OBJECTION_PATTERNS:
