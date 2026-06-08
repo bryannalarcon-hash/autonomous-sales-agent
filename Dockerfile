@@ -17,9 +17,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# 1) torch CPU first, PINNED to the version that works locally (unpinned/CPU-index torch resolved
-#    older than transformers expected → "module 'torch' has no attribute 'float8_e8m0fnu'").
-RUN pip install --index-url https://download.pytorch.org/whl/cpu torch==2.12.0
+# 1) torch CPU first, PINNED to the locally-verified version. Use the `+cpu` local tag so torch comes
+#    ONLY from the pytorch CPU index, but add PyPI as an extra index so torch's own deps (typing-
+#    extensions, sympy, …) resolve from PyPI — the CPU-index-only mode chokes on the pytorch index's
+#    `typing_extensions` wheel name normalization. Upgrade pip first (older pip is stricter on that).
+RUN pip install --upgrade pip && \
+    pip install "torch==2.12.0+cpu" \
+      --index-url https://download.pytorch.org/whl/cpu \
+      --extra-index-url https://pypi.org/simple
 
 # 2) project (base deps) + the ML stack PINNED to the locally-verified set so the version skew can't
 #    recur. torch is already satisfied (2.12.0), so these don't re-pull it.
