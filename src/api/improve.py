@@ -905,15 +905,23 @@ def create_improve_router(
     async def list_experiments_ep(state: Optional[str] = None, limit: int = 200) -> dict[str, Any]:
         """The lab list (P6): the before/after fields + declared diff + state per experiment. The
         discovery-sequencing experiment's before/after is queryable end-to-end here (the demo
-        artifact). Optional `state` filter; otherwise all, newest-first."""
+        artifact). Optional `state` filter; otherwise all, newest-first.
+
+        CB-73: also returns `store_champion_version` — the version currently marked is_champion in
+        the version_lineage table. This differs from an experiment's `champion_version` (the version
+        that was champion WHEN the experiment ran) whenever a test run or rollback changed the live
+        champion after the experiment was recorded. The lab drawer uses this to render a one-line
+        baseline-mismatch explanation when the two values diverge."""
         exps = await store.list_experiments(state=state, limit=limit)
         rows = [experiment_to_dict(e) for e in exps]
         active = [r for r in rows if r["state"] in _ACTIVE_STATES]
         past = [r for r in rows if r["state"] not in _ACTIVE_STATES]
+        champ = await store.get_champion()
         return {
             "experiments": rows,
             "count": len(rows),
             "counts": {"active": len(active), "past": len(past)},
+            "store_champion_version": champ.version if champ else None,
         }
 
     async def _run_ab_background(

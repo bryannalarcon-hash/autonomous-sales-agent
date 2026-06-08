@@ -50,6 +50,10 @@ export interface ExperimentListResponse {
   experiments: Experiment[];
   count: number;
   counts: { active: number; past: number };
+  /** CB-73: the version currently marked is_champion in version_lineage. May differ from an
+   *  experiment's champion_version if the live champion changed after the experiment ran (e.g.
+   *  a test-DB run demoted the real champion row). The drawer uses this to explain the mismatch. */
+  store_champion_version?: string | null;
 }
 
 /** One {metric, new value} row of a multi-metric experiment (CB-27). `dimension` is the same supported

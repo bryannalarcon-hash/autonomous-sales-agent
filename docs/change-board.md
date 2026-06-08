@@ -69,12 +69,6 @@
 - **Acceptance:** replay turn-6 shape: either no trailing question on the terminal line, or the caller's number is captured into the lead before the session closes; no session ends on an unanswered direct question from the agent.
 - **Refs:** CB-61 replay transcript /tmp/qa7/cb61_replay_transcript.txt (turn 6); CB-68 Done entry.
 
-### CB-73 — Integration tests must stop polluting the dev DB's lineage/episodes (the v0-vs-v1 header confusion)
-- **Type / Surface / Size:** bug · `tests` (integration fixtures) · `web` (baseline-mismatch copy) · M
-- **Current (QA9 Sev-2 #4 + orchestrator diagnosis):** the header says "Champion v1" while experiments honestly baseline champion_v0 (CB-59 fallback). The v1 lineage rows are TEST-SEEDED — DB-gated integration tests write version lineage + episodes into the shared dev Postgres on every suite run (hash churns per run; pre-existing, flagged during CB-59). An operator cannot resolve the mismatch.
-- **Desired:** integration tests write lineage/episodes to an isolated target (dedicated test DB/schema or guaranteed teardown) so the dev header reflects reality; AND when an experiment's baseline ≠ the store champion, the drawer says why in one plain sentence ("baseline v0 — the promoted champion isn't materialized; see Versions").
-- **Acceptance:** full suite run leaves version_lineage/episode rows unchanged in the dev DB; mismatch copy renders when applicable.
-- **Refs:** QA9 lab Sev-2 #4; CB-59 Done entry follow-ups.
 
 ### CB-74 — KPI page must never default into an empty population
 - **Type / Surface / Size:** bug · `web` (KPI) · S–M
@@ -120,6 +114,14 @@
 - **Verification:** 5 reuse tests (same-loop reuse, new-loop rebuild, closed-client replace, fake-client tolerance); llm suite + full suites 615p/5s + system green.
 - **Constraints checked:** retry/backoff/cost-capture paths unchanged (same client, just reused); R37 stream parity intact.
 - **Follow-ups / known gaps:** real first-token latency improvement to be confirmed in QA round 3 (the handshake/pool tax is removed; embedder first-load is already warmed). Mid-stream Send is already a no-op client-side (canSend gating); no code change needed there.
+
+### CB-79 — One-time reset of the dev DB's polluted champion (needs user authorization — DB write)
+- **Type / Surface / Size:** chore · `db` (dev only) · S
+- **Prereqs:** CB-73 (done — stops further pollution)
+- **Current:** the dev DB's champion is a TEST CHALLENGER `champion_v0__playbooks_discovery_sequence__7` (left by DB-gated tests BEFORE CB-73's teardown landed); ~758 lineage rows, ~4900 episodes accumulated. CB-73 froze the counts going forward but a fix may not mutate existing rows without authorization. CB-73's drawer mismatch line currently fires on 9 real experiments because of this.
+- **Desired (USER DECISION):** authorize a one-time dev-DB cleanup — reset is_champion to a real version (or re-promote champion_v0 cleanly) and optionally prune the test lineage rows + orphan episodes. Dry-run first; destructive → explicit go required.
+- **Acceptance:** dev champion is a real version; the CB-73 mismatch line stops firing on legitimate records; counts sane.
+- **Refs:** CB-73 Done entry; orchestrator DB query 2026-06-08.
 
 ### CB-01 — Active-calls queue with per-call take-over
 - **Type / Surface / Size:** feature · `/operate/live` · `api` · `voice-worker` · L
@@ -182,6 +184,32 @@
 > - **Constraints checked:** <project invariants verified, or N/A>
 > - **Follow-ups / known gaps:** <or none>
 > ```
+
+### CB-75 — Operate polish round 2 (label dup, hint→affordance, counts, sort, leaks)
+- **Type / Surface / Size:** bug · `web` (operate) · M
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `web/components/cadence/DashboardShell.tsx` (drop the literal "Champion " prefix that doubled `versionLabel`; badge listens for an escalation-count event so it can't disagree with the queue), `web/app/operate/escalations/page.tsx` (cohort hint → `<Link href="/operate/calls?cohort=all">`; dispatches the count event), `web/app/operate/calls/page.tsx` (reads `?cohort=all`; `StaticTh` for non-sortable cols; sort glyph contrast; `shortId()` + copy-full-id affordance for CALL ID), `web/app/operate/live/page.tsx` (`humanizeRationale` on the belief panel), `web/lib/labels.ts` (`establish_who_first`/`no_repeat_discovery` gate labels), `tests/e2e/qa9fix_ops.py` (NEW).
+- **What changed:** the eight QA9-ops items — two verified as already-correct (75-vs-76 count is one array; empty-filter already shows the no-match card) with tests pinning them, six fixed.
+- **WAIVED with evidence:** "review pages 404 on direct URL" — disproven live by the orchestrator (200 + render for real and bogus ids; agent artifact).
+- **Verification:** 44 passed / 1 self-skip (fallback path needs an empty champion); qa7 regressions 31 green.
+- **Follow-ups / known gaps:** none.
+
+### CB-74 — KPI page never defaults into an empty population
+- **Type / Surface / Size:** bug · `web` (KPI) · S–M
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `web/app/operate/kpi/page.tsx` (auto-select the live champion only when `count>0`; else fall back to the most-populated version + render "The live champion (X) has no recorded calls yet — showing Y."; explicit empty selections gain a "try another version/cohort" hint).
+- **What changed:** the CRITICAL — a fresh /operate/kpi load no longer shows an unexplained "No episodes match v1" empty page when the live champion has zero matching episodes (the CB-73 hash-churn symptom).
+- **Verification:** qa9fix_ops.py (the empty-champion hint test self-skips when the live champion has episodes — exercised via a seeded fake in unit coverage); suite green.
+- **Follow-ups / known gaps:** once CB-79 cleans the polluted champion, the live champion will have episodes and the happy path renders directly.
+
+### CB-73 — Integration tests stop polluting the dev DB (lineage/episodes frozen)
+- **Type / Surface / Size:** bug · `tests` (conftest) · `api`+`web` (baseline-mismatch copy) · M
+- **Completed:** 2026-06-08
+- **Files changed (actual):** `tests/conftest.py` (snapshot/restore teardown via `_force_fresh_pool()` replacing the four `close_pool()` calls — guaranteed cleanup of rows DB-gated tests create, chosen over schema isolation to avoid touching production store code), `src/api/improve.py` (`store_champion_version` on GET /api/experiments), `web/lib/improve-types.ts` + `web/app/improve/lab/page.tsx` (drawer renders a one-line baseline-mismatch note when an experiment's champion ≠ the store champion).
+- **What changed:** DB-gated integration tests no longer accrete lineage/episode rows into shared dev Postgres — PROVEN: two back-to-back full integration runs left version_lineage at 758 and the champion row unchanged (orchestrator-verified). The lab drawer now explains a baseline mismatch in plain English.
+- **Verification:** integration 159p/5s twice with identical before/after DB counts; full suite 680p/5s.
+- **Constraints checked:** fix introduces NO destructive mutation of existing rows (only prevents new pollution; test_persistence's +3 live rows are intentional and isolated).
+- **Follow-ups / known gaps:** the EXISTING polluted champion (a test challenger) predates this fix → CB-79 (needs user auth for the DB write).
 
 ### CB-72 — Lab UX clarity batch (cost estimate, disabled-button hint, toast, tooltips, small-n)
 - **Type / Surface / Size:** change · `web` (lab) · S–M
