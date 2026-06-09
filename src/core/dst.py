@@ -837,14 +837,29 @@ _LEARNER_DENIAL_RE = re.compile(
 # noun (`(?:[\w'-]+\s+){0,3}`), so "for my three-year-old kid", "my 8 year old son", "my little
 # grandson" establish the learner. Previously "my" had to be IMMEDIATELY followed by the noun, so an
 # age/adjective slipped through -> who_for stayed unset and the agent RE-ASKED who it's for.
-_REL_NOUN = r"(?:[\w'-]+\s+){0,3}(son|daughter|child|kid|grandson|granddaughter|grandchild|niece|nephew|student)"
+# REGRESSION (live voice ep-01f96fba): an AGE-AS-CHILD or child-stage word names the learner with NO
+# explicit relative noun — "it's for my three-year-old", "my 8 year old", "my toddler/preschooler".
+# Added to _CHILD_REF so who_for fires on these too (the noun list alone missed bare age answers).
+# Generic relative nouns ("son", "kid") need CONTEXT (a verb, or "for my"/"it's for my") to establish a
+# learner — kept conservative so a stray "my son" elsewhere doesn't false-fire. Child-STAGE / age terms
+# ("toddler", "three-year-old") are UNAMBIGUOUS child references, so they also establish the learner
+# BARE ("my toddler" with no verb) — the common short answer to "who is it for?".
+_REL_NOUN_WORDS = r"son|daughter|child|kid|grandson|granddaughter|grandchild|niece|nephew|student"
+_CHILD_STAGE = (
+    r"toddler|preschooler|kindergart(?:e?ner)|kiddo|little one|baby"
+    r"|(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|"
+    r"fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)[\s-]?year[\s-]?olds?"
+)
+_CHILD_REF = _REL_NOUN_WORDS + r"|" + _CHILD_STAGE
+_REL_NOUN = r"(?:[\w'-]+\s+){0,3}(?:" + _CHILD_REF + r")"
 _LEARNER_ESTABLISH_RE = re.compile(
     r"\b((it'?s|this is|i'?m asking) (for|about) (me|myself)|"
     r"i'?m the (one|student|learner)|(for|about) myself|"
     r"(it'?s|this is) for my " + _REL_NOUN + r"|"
     r"my " + _REL_NOUN + r" "
     r"(needs?|is|wants?|could use|has)|"
-    r"(for|helping|tutoring) my " + _REL_NOUN + r")\b",
+    r"(for|helping|tutoring) my " + _REL_NOUN + r"|"
+    r"my (?:[\w'-]+\s+){0,2}(?:" + _CHILD_STAGE + r"))\b",   # bare "my toddler" / "my three-year-old"
     re.I,
 )
 

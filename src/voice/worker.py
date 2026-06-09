@@ -187,7 +187,12 @@ _STREAM_WORDS_PER_CHUNK = max(1, int(os.environ.get("VOICE_STREAM_WORDS_PER_CHUN
 # first token arrives first, the filler is CANCELLED/SKIPPED (no double-speak) — so a fast turn gets
 # no awkward filler and a slow turn is masked within <1s. R37-safe: the filler is audio ONLY — it
 # never touches the streamed tokens, the committed reply text, or the CB-44 timing stamps.
-_VOICE_FILLER_ENABLED = os.environ.get("VOICE_FILLER_ENABLED", "1").strip().lower() not in (
+# DEFAULT OFF (CB-47 follow-up, live call ep-01f96fba): the "no double-speak" guarantee only holds when
+# the first token lands NEAR the 700ms delay, but the measured first-token latency is ~4.8s — so the
+# filler ALWAYS fires and is never cancelled in time, speaking an acknowledgment ("Got it,") before
+# EVERY reply (which itself usually opens with one) => a jarring doubled acknowledgment per turn. Off
+# until the brain's first-token latency drops near the filler delay; re-enable with VOICE_FILLER_ENABLED=1.
+_VOICE_FILLER_ENABLED = os.environ.get("VOICE_FILLER_ENABLED", "0").strip().lower() not in (
     "0", "false", "no", "off",
 )
 # How long to wait for the first NLG token before speaking a filler (perceived-latency budget). 700ms

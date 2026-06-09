@@ -291,6 +291,24 @@ async def test_cb34_who_for_with_age_adjective_between_my_and_child():
         assert nb.meta.get("learner_established") is True, f"learner not established for: {utter!r}"
 
 
+async def test_cb34_who_for_with_bare_age_or_child_stage_no_relative_noun():
+    """REGRESSION (live voice call ep-01f96fba): "It's for my three-year-old" — an AGE-AS-CHILD with
+    NO 'kid'/'son'/'daughter' — left who_for unset, so the agent re-asked "who would the tutoring be
+    for?" and only moved on after hitting the max-asks cap. A bare age ("my 8 year old") or a
+    child-stage word ("my toddler/preschooler") must establish the learner on its own."""
+    flat = MockLLMClient([_flat_deltas()])
+    for utter in (
+        "It's for my three-year-old.",
+        "for my 8 year old",
+        "my toddler",
+        "it's for my preschooler",
+        "my five-year-old needs help",
+    ):
+        nb = await update(BeliefState.fresh(), "ask", utter, flat)
+        assert nb.meta.get("who_for") is True, f"who_for not set for: {utter!r}"
+        assert nb.meta.get("learner_established") is True, f"learner not established for: {utter!r}"
+
+
 def test_cb34_establish_who_first_redirects_learner_ask():
     """A learner-specific ask with NO learner established is redirected to a who-is-this-for step."""
     cfg = make_config()
