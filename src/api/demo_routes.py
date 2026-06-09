@@ -908,7 +908,12 @@ def create_demo_router(
         # along — only consent facts (R33/R41/R42). The builder applies it via the LiveKit token's
         # room-config metadata, which LiveKit stamps on the room the worker reads.
         room_metadata = _consent_room_metadata(sess.gate, phone_hash_value=sess.phone_hash)
-        token = build_token(api_key, api_secret, req.identity, room, room_metadata=room_metadata)
+        # VOICE_AGENT_NAME (set on the deployed API, unset locally) pins the room to the worker
+        # registered under that name — so the DEPLOYED Railway worker answers, not a local one.
+        token = build_token(
+            api_key, api_secret, req.identity, room,
+            room_metadata=room_metadata, agent_name=os.environ.get("VOICE_AGENT_NAME", ""),
+        )
         return TokenResponse(token=token, url=url, room=room)
 
     # --- POST /api/session/{session_id}/end (persist the finished call + evict) -----------------

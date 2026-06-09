@@ -347,8 +347,9 @@ def test_livekit_token_minted_with_creds(monkeypatch):
     seen: dict[str, str] = {}
 
     def fake_builder(api_key: str, api_secret: str, identity: str, room: str,
-                     room_metadata: Optional[str] = None) -> str:
-        seen.update(api_key=api_key, api_secret=api_secret, identity=identity, room=room)
+                     room_metadata: Optional[str] = None, agent_name: str = "") -> str:
+        seen.update(api_key=api_key, api_secret=api_secret, identity=identity, room=room,
+                    agent_name=agent_name)
         return "fake.jwt.token"  # never embeds the secret
 
     app = create_app(
@@ -412,7 +413,7 @@ def test_livekit_token_carries_consent_metadata_into_room(monkeypatch):
 
     seen: dict[str, Any] = {}
 
-    def fake_builder(api_key, api_secret, identity, room, room_metadata=None):
+    def fake_builder(api_key, api_secret, identity, room, room_metadata=None, agent_name=""):
         seen.update(room=room, room_metadata=room_metadata)
         return "fake.jwt.token"
 
@@ -449,7 +450,7 @@ def test_livekit_token_metadata_reflects_recording_refusal(monkeypatch):
 
     seen: dict[str, Any] = {}
 
-    def fake_builder(api_key, api_secret, identity, room, room_metadata=None):
+    def fake_builder(api_key, api_secret, identity, room, room_metadata=None, agent_name=""):
         seen["room_metadata"] = room_metadata
         return "fake.jwt.token"
 

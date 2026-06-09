@@ -1416,12 +1416,17 @@ def prewarm(proc: Any) -> None:  # pragma: no cover - runs once per job subproce
 def _worker_options() -> Any:  # pragma: no cover - requires livekit installed + a live registration
     """Build WorkerOptions from env. ws_url/api_key/api_secret default to LIVEKIT_* from the env when
     unset (livekit-agents reads them); we pass them explicitly so a misconfig is a clear error, not a
-    silent localhost attempt. agent_name is left empty -> DEFAULT auto-dispatch: the worker joins
-    every room (incl. the token's demo-<session_id> room), which is what the /demo flow needs.
-    prewarm_fnc loads the embedder before any call so RAG never stalls mid-call."""
+    silent localhost attempt. agent_name = VOICE_AGENT_NAME: EMPTY (local default) -> auto-dispatch,
+    the worker joins every room (incl. the token's demo-<session_id> room). SET (e.g. cadence-prod on
+    the deployed worker) -> the worker only receives rooms whose token explicitly dispatches to that
+    name, so the DEPLOYED agent is the one that answers /demo calls even if a local worker is also
+    registered ("prioritize the deployed version"). The deployed API stamps the matching name on the
+    token via VOICE_AGENT_NAME. prewarm_fnc loads the embedder before any call so RAG never stalls."""
     load_dotenv()
     return WorkerOptions(
         entrypoint_fnc=entrypoint,
+        # Named dispatch target (see docstring). Empty -> auto-dispatch (local parity).
+        agent_name=os.environ.get("VOICE_AGENT_NAME", ""),
         # prewarm_fnc loads the embedder + VAD in the job subprocess BEFORE the entrypoint/first turn,
         # so RAG never triggers a model load mid-conversation and call setup is fast.
         prewarm_fnc=prewarm,

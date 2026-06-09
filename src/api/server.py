@@ -305,7 +305,7 @@ def create_app(
 
 
 def _build_livekit_token(api_key: str, api_secret: str, identity: str, room: str,
-                         room_metadata: Optional[str] = None) -> str:
+                         room_metadata: Optional[str] = None, agent_name: str = "") -> str:
     """Build a LiveKit access token from creds (never logged / printed). Imports livekit.api lazily so
     the API module imports cleanly even when livekit is not installed (the token path is the only place
     that needs it, and it is already guarded by the 503 in the demo router when creds are absent).
@@ -314,7 +314,13 @@ def _build_livekit_token(api_key: str, api_secret: str, identity: str, room: str
     from — never secrets), it is attached via the token's room-config metadata (RoomConfiguration):
     LiveKit stamps that metadata onto the room when the room is created from this token, so the worker
     reads it off ctx.room.metadata and opens its ConsentGate (the U13 deadlock fix). A None metadata
-    keeps the prior plain-token behavior."""
+    keeps the prior plain-token behavior.
+
+    When `agent_name` is given (e.g. VOICE_AGENT_NAME=cadence-prod on the deployed API), the room is
+    pinned to EXPLICIT dispatch: LiveKit routes it ONLY to a worker registered under that exact name
+    (the deployed Railway worker), instead of auto-dispatching to any registered worker. This makes
+    the deployed agent answer the call even if a local auto-dispatch worker is also up ("prioritize
+    the deployed version"). Empty agent_name keeps default auto-dispatch (local parity)."""
     from livekit import api as lk_api
 
     grants = lk_api.VideoGrants(room_join=True, room=room)
@@ -324,9 +330,18 @@ def _build_livekit_token(api_key: str, api_secret: str, identity: str, room: str
         .with_name(identity)
         .with_grants(grants)
     )
+    # Build a room config when we must carry consent metadata and/or pin a specific dispatch target.
+    room_cfg_kwargs: dict = {}
     if room_metadata:
         # Carry consent on the room config so it lands on ctx.room.metadata for the worker to seed.
-        token = token.with_room_config(lk_api.RoomConfiguration(metadata=room_metadata))
+        room_cfg_kwargs["metadata"] = room_metadata
+    if agent_name:
+        # Explicit named dispatch -> only the worker registered as `agent_name` is dispatched here.
+        room_cfg_kwargs["agents"] = [
+            lk_api.RoomAgentDispatch(agent_name=agent_name, metadata=room_metadata or "")
+        ]
+    if room_cfg_kwargs:
+        token = token.with_room_config(lk_api.RoomConfiguration(**room_cfg_kwargs))
     return token.to_jwt()
 
 
