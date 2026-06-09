@@ -12,10 +12,13 @@
 # COMPLIANCE (U13/R33/R40/R41): the entrypoint builds a ConsentGate (jurisdiction from room metadata,
 # RefusalPolicy from env), threads it into the VoiceSession via build_voice_agent (so every turn is
 # gated by VoiceSession._require_consent EXACTLY like /api/chat), and SPEAKS the AI+recording
-# disclosure. It SEEDS that gate from the consent the BROWSER already captured + carried on the room
-# metadata (_seed_gate_from_metadata): recording granted -> ready, refused-but-proceeding ->
-# unrecorded, unresolved minor -> stays blocked — so can_converse is True from the first turn and the
-# brain answers (the U13 deadlock fix).
+# disclosure. It SEEDS that gate from the consent the BROWSER already captured + carried on the call
+# metadata — read by _room_metadata as the UNION of ctx.room.metadata AND ctx.job.metadata (named
+# agent dispatch delivers consent reliably on the JOB metadata; LiveKit does NOT reliably copy
+# RoomConfiguration.metadata onto the room, which left calls seeded=False -> pending -> no reply).
+# _seed_gate_from_metadata: recording granted -> ready, refused-but-proceeding -> unrecorded,
+# unresolved minor -> stays blocked — so can_converse is True from the first turn and the brain answers
+# (the U13 deadlock fix).
 # SIP / PHONE path (no browser to click consent): when _seed_gate_from_metadata returns False AND a
 # remote participant is a SIP caller (_is_sip_call -> ParticipantKind.SIP), the worker arms an
 # IVR-style SPOKEN consent (WorkerVoiceAgent.arm_spoken_consent): the FIRST user turn(s) are
@@ -888,19 +891,30 @@ def _build_brain(config: AgentConfig, *, consent_gate: ConsentGate,
 
 
 def _room_metadata(ctx: Any) -> dict[str, Any]:
-    """Best-effort parse of the room's metadata JSON into a dict (empty on missing/garbage).
-
-    The /demo flow stamps the room metadata (or a SIP trunk carries it) with the call's jurisdiction
-    and caller phone. We tolerate None / non-JSON / non-dict metadata so a malformed stamp never
-    crashes the worker — it degrades to the sane defaults (gated recording, anonymous caller)."""
-    raw = getattr(getattr(ctx, "room", None), "metadata", None)
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-    except (ValueError, TypeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    """Best-effort parse of the call's metadata JSON into a dict (empty on missing/garbage), MERGING
+    two sources: the ROOM metadata (ctx.room.metadata, applied at room creation) and the explicit
+    agent-dispatch JOB metadata (ctx.job.metadata). The /api/livekit/token route stamps the SAME
+    consent JSON on BOTH; with NAMED dispatch (VOICE_AGENT_NAME) LiveKit reliably delivers
+    ctx.job.metadata but does NOT reliably copy RoomConfiguration.metadata onto the room — so reading
+    only the room left consent seeding flaky: ep-e9741935 came through seeded=False -> gate pending ->
+    ConsentError every turn -> the agent NEVER replied. Reading the union makes it deterministic. Room
+    is the base; job overrides (the per-job channel). The /demo flow (and a SIP trunk) also carry the
+    call's jurisdiction + caller phone here. Tolerates None / non-JSON / non-dict on either source so a
+    malformed stamp degrades to sane defaults (gated recording, anonymous caller) instead of crashing."""
+    out: dict[str, Any] = {}
+    for raw in (
+        getattr(getattr(ctx, "room", None), "metadata", None),
+        getattr(getattr(ctx, "job", None), "metadata", None),
+    ):
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict):
+            out.update(data)
+    return out
 
 
 def _room_jurisdiction(ctx: Any) -> str:

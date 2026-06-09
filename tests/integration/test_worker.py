@@ -570,9 +570,16 @@ class _StubRoom:
         self.remote_participants = remote_participants or {}
 
 
+class _StubJob:
+    """A LiveKit agent Job stub carrying the explicit-dispatch metadata (ctx.job.metadata)."""
+    def __init__(self, metadata: Optional[str] = None) -> None:
+        self.metadata = metadata
+
+
 class _StubCtx:
-    def __init__(self, room: _StubRoom) -> None:
+    def __init__(self, room: _StubRoom, job: Optional[_StubJob] = None) -> None:
         self.room = room
+        self.job = job
 
 
 def test_room_jurisdiction_from_metadata_else_default():
@@ -676,6 +683,25 @@ def test_seed_gate_from_metadata_absent_keeps_fail_closed():
     g2 = ConsentGate(jurisdiction="ca")
     assert w._seed_gate_from_metadata(g2, _StubCtx(_StubRoom(metadata=None))) is False
     assert g2.can_converse is False
+
+
+def test_seed_gate_from_metadata_reads_named_dispatch_job_metadata():
+    """REGRESSION (named-dispatch live call ep-e9741935): with EXPLICIT agent dispatch the consent
+    arrives on the JOB metadata (ctx.job.metadata), and LiveKit does NOT reliably copy
+    RoomConfiguration.metadata onto the room. Reading ONLY room.metadata left seeded=False -> gate
+    pending -> ConsentError on every user turn -> the agent never replied. The worker must seed from
+    the dispatch job metadata when the room metadata is empty."""
+    from src.voice import worker as w
+
+    gate = ConsentGate(jurisdiction="ca", refusal_policy=RefusalPolicy.PROCEED_UNRECORDED)
+    # Room metadata EMPTY (as observed live), consent carried on the dispatch's job metadata.
+    ctx = _StubCtx(_StubRoom(metadata=None), job=_StubJob(metadata=_consent_meta()))
+    seeded = w._seed_gate_from_metadata(gate, ctx)
+    assert seeded is True
+    assert gate.can_converse is True
+    assert gate.can_record is True
+    # And jurisdiction is read from the same merged source.
+    assert w._room_jurisdiction(ctx) == "ca"
 
 
 async def test_seeded_gate_lets_worker_turn_proceed_and_records():
