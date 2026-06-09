@@ -833,13 +833,18 @@ _LEARNER_DENIAL_RE = re.compile(
 # either case a learner now EXISTS, so learner-specific discovery is legitimate. This must NOT be
 # lumped with a denial: "it's for me" answers (not refuses) the who-is-this-for question. Sets
 # belief.meta["learner_established"] = True and clears learner_denied.
+# REGRESSION (live voice ep-858666a5): allow up to 3 adjective/age words BETWEEN "my" and the relative
+# noun (`(?:[\w'-]+\s+){0,3}`), so "for my three-year-old kid", "my 8 year old son", "my little
+# grandson" establish the learner. Previously "my" had to be IMMEDIATELY followed by the noun, so an
+# age/adjective slipped through -> who_for stayed unset and the agent RE-ASKED who it's for.
+_REL_NOUN = r"(?:[\w'-]+\s+){0,3}(son|daughter|child|kid|grandson|granddaughter|grandchild|niece|nephew|student)"
 _LEARNER_ESTABLISH_RE = re.compile(
     r"\b((it'?s|this is|i'?m asking) (for|about) (me|myself)|"
     r"i'?m the (one|student|learner)|(for|about) myself|"
-    r"(it'?s|this is) for my (son|daughter|child|kid|grandson|granddaughter|grandchild|niece|nephew|student)|"
-    r"my (son|daughter|child|kid|grandson|granddaughter|grandchild|niece|nephew|student) "
+    r"(it'?s|this is) for my " + _REL_NOUN + r"|"
+    r"my " + _REL_NOUN + r" "
     r"(needs?|is|wants?|could use|has)|"
-    r"(for|helping|tutoring) my (son|daughter|child|kid|grandson|granddaughter|grandchild|niece|nephew|student))\b",
+    r"(for|helping|tutoring) my " + _REL_NOUN + r")\b",
     re.I,
 )
 

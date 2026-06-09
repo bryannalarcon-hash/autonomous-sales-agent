@@ -1,15 +1,18 @@
 // VoiceRoom — the LiveKit room internals, rendered ONLY after a token is fetched and a Room is
 // connected by the parent (VoiceCall). Uses @livekit/components-react's RoomContext so hooks like
 // useConnectionState / useTracks work, and renders the live transcript from the agent's published
-// transcription segments. Exposes mute + disconnect controls. This component assumes a connected
-// Room is passed in; it never fetches tokens or holds secrets (the parent does that).
-// Styled in the dark "Cadence" design system (rendered inside the page's `.cadence` scope): token
-// status dot, .btn-ghost/.btn-danger controls, a surface transcript panel — not raw light Tailwind.
+// transcription segments — LABELED "You" (local mic STT) vs "Advisor" (remote agent TTS) off each
+// segment's participant. Plays the agent's audio via <RoomAudioRenderer/> (robust: handles tracks
+// subscribed before mount + autoplay resume — the old manual track.attach left the call SILENT).
+// Exposes mute + disconnect controls. Assumes a connected Room is passed in; never fetches tokens or
+// holds secrets (the parent does that). Styled in the dark "Cadence" design system (rendered inside
+// the page's `.cadence` scope): status dot, .btn-ghost/.btn-danger controls, a surface transcript.
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { Room, RoomEvent, Track, TranscriptionSegment } from 'livekit-client';
+import { Participant, Room, RoomEvent, TranscriptionSegment } from 'livekit-client';
 import {
+  RoomAudioRenderer,
   RoomContext,
   useConnectionState,
   useLocalParticipant,
@@ -60,14 +63,20 @@ function RoomInner({ onDisconnect }: { onDisconnect: () => void }) {
 }
 
 export default function VoiceRoom({ room, onDisconnect }: VoiceRoomProps) {
-  // Live transcript: accumulate transcription segments (deduped by id) as they arrive.
-  const [segments, setSegments] = useState<Map<string, TranscriptionSegment>>(new Map());
+  // Live transcript: accumulate transcription segments (deduped by id) as they arrive, tagging each
+  // with whether it came from the LOCAL participant (the caller's mic STT) or a REMOTE one (the
+  // agent's TTS) so the panel can label "You" vs "Advisor".
+  const [segments, setSegments] = useState<Map<string, { seg: TranscriptionSegment; isLocal: boolean }>>(
+    new Map(),
+  );
 
   useEffect(() => {
-    function onTranscription(received: TranscriptionSegment[]) {
+    // LiveKit attributes each segment to the participant it came from; isLocal => the caller.
+    function onTranscription(received: TranscriptionSegment[], participant?: Participant) {
+      const isLocal = !!participant?.isLocal;
       setSegments((prev) => {
         const next = new Map(prev);
-        for (const seg of received) next.set(seg.id, seg);
+        for (const seg of received) next.set(seg.id, { seg, isLocal });
         return next;
       });
     }
@@ -77,25 +86,10 @@ export default function VoiceRoom({ room, onDisconnect }: VoiceRoomProps) {
     };
   }, [room]);
 
-  // Auto-attach any subscribed audio track so the agent's TTS plays.
-  useEffect(() => {
-    function onTrackSubscribed(track: Track) {
-      if (track.kind === Track.Kind.Audio) {
-        const el = track.attach();
-        el.style.display = 'none';
-        document.body.appendChild(el);
-      }
-    }
-    room.on(RoomEvent.TrackSubscribed, onTrackSubscribed);
-    return () => {
-      room.off(RoomEvent.TrackSubscribed, onTrackSubscribed);
-    };
-  }, [room]);
-
   const orderedSegments = useMemo(
     () =>
       [...segments.values()].sort(
-        (a, b) => (a.firstReceivedTime ?? 0) - (b.firstReceivedTime ?? 0),
+        (a, b) => (a.seg.firstReceivedTime ?? 0) - (b.seg.firstReceivedTime ?? 0),
       ),
     [segments],
   );
@@ -103,6 +97,10 @@ export default function VoiceRoom({ room, onDisconnect }: VoiceRoomProps) {
   return (
     <RoomContext.Provider value={room}>
       <RoomInner onDisconnect={onDisconnect} />
+      {/* Plays every subscribed audio track (the agent's TTS) — handles tracks already subscribed
+          before this mounts + browser autoplay resumption, which the prior manual track.attach()
+          missed, leaving the call silent. */}
+      <RoomAudioRenderer />
 
       <div
         style={{
@@ -129,9 +127,22 @@ export default function VoiceRoom({ room, onDisconnect }: VoiceRoomProps) {
           <p className="faint" style={{ fontSize: 13 }}>Transcript will appear here as you talk.</p>
         ) : (
           <ul className="col gap6" style={{ fontSize: 13, listStyle: 'none', margin: 0, padding: 0 }}>
-            {orderedSegments.map((seg) => (
-              <li key={seg.id} style={{ color: 'var(--text-2)' }}>
-                {seg.text}
+            {orderedSegments.map(({ seg, isLocal }) => (
+              <li key={seg.id} style={{ color: 'var(--text-2)', display: 'flex', gap: 8 }}>
+                <span
+                  style={{
+                    flexShrink: 0,
+                    minWidth: 52,
+                    fontSize: 10.5,
+                    fontWeight: 700,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.04em',
+                    color: isLocal ? 'var(--accent)' : 'var(--ok)',
+                  }}
+                >
+                  {isLocal ? 'You' : 'Advisor'}
+                </span>
+                <span>{seg.text}</span>
               </li>
             ))}
           </ul>

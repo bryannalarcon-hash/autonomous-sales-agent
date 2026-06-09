@@ -273,6 +273,24 @@ async def test_cb34_dst_establishes_learner_when_caller_says_who():
     assert nb3.meta.get("learner_denied") is False
 
 
+async def test_cb34_who_for_with_age_adjective_between_my_and_child():
+    """REGRESSION (live voice call ep-858666a5): "The tutoring is for my three-year-old kid" left
+    who_for UNSET because the learner-establish regex required `my` to be IMMEDIATELY followed by the
+    relative noun — an age/adjective in between ("my three-year-old kid", "my 8 year old son") slipped
+    through, so the agent RE-ASKED "who is the tutoring for?". An adjective gap before the noun must
+    still establish the learner + set who_for so discovery advances instead of looping."""
+    flat = MockLLMClient([_flat_deltas()])
+    for utter in (
+        "The tutoring is for my three-year-old kid.",
+        "It's for my 8 year old son.",
+        "I'm helping my little grandson.",
+        "my younger daughter needs help with reading",
+    ):
+        nb = await update(BeliefState.fresh(), "ask", utter, flat)
+        assert nb.meta.get("who_for") is True, f"who_for not set for: {utter!r}"
+        assert nb.meta.get("learner_established") is True, f"learner not established for: {utter!r}"
+
+
 def test_cb34_establish_who_first_redirects_learner_ask():
     """A learner-specific ask with NO learner established is redirected to a who-is-this-for step."""
     cfg = make_config()
